@@ -995,6 +995,46 @@ function bm25Search(corpus, query, limit) {
 
 const UNSUPPORTED_EMBED = new Set(['webllm', 'koboldcpp']);
 
+// ST's vector settings default to text-embedding-005, which only exists on Vertex AI.
+// AI Studio rejects it (and the retired text-embedding-004 / embedding-001), so those
+// requests fail every time. Map them to the model each service actually serves.
+const AI_STUDIO_RETIRED = new Set(['', 'text-embedding-005', 'text-embedding-004', 'embedding-001', 'textembedding-gecko']);
+
+function googleEmbedModel(source, model) {
+    const m = String(model || '').trim().replace(/^models\//, '');
+    if (source === 'palm') return AI_STUDIO_RETIRED.has(m) ? 'gemini-embedding-001' : m;
+    return m || 'text-embedding-005';
+}
+
+// Vertex serves gemini-embedding-* one text per request; ST's server batches 10 texts
+// per call, so those inserts must be sent one item at a time.
+function insertBatchSize(body) {
+    if (body.source === 'vertexai' && /^gemini-embedding/.test(body.model || '')) return 1;
+    if (body.source === 'palm' || body.source === 'vertexai') return 10;
+    return 50;
+}
+
+function isRemoteEmbed(source) {
+    return !['transformers', 'ollama', 'llamacpp', 'vllm', 'extras'].includes(source);
+}
+
+const EMBED_LABEL = (source) => EMBED_SOURCES[source] || source;
+
+function vectorHint(body, status) {
+    const src = body?.source;
+    const model = body?.model ? ` (${body.model})` : '';
+    if (status === 400) return '요청 형식이 맞지 않았어요. 임베딩 소스와 모델 이름을 확인해주세요.';
+    if (status === 404) return 'SillyTavern에 벡터 기능이 없어요. ST를 최신 버전으로 업데이트해주세요.';
+    if (status === 401 || status === 403) return 'ST에 다시 로그인하거나 페이지를 새로고침해주세요.';
+    switch (src) {
+        case 'palm': return `Google AI Studio${model} 임베딩이 실패했어요. ① ST의 API 연결 → Chat Completion → Google AI Studio에 키가 저장돼 있는지 ② 무료 키라면 분당·하루 한도를 넘었을 수 있어요(잠시 뒤 자동으로 이어서 색인해요).`;
+        case 'vertexai': return `Vertex AI${model} 임베딩이 실패했어요. ST의 API 연결 → Vertex AI에서 인증(Express 키 또는 서비스 계정), 지역, 프로젝트 ID가 맞는지 확인해주세요. 지역은 us-central1을 추천해요.`;
+        case 'transformers': return '로컬 임베딩 모델을 처음 내려받는 중이거나 실패했어요. ST 서버 콘솔을 확인하고 잠시 뒤 다시 시도해주세요.';
+        case 'ollama': case 'llamacpp': case 'vllm': return `${EMBED_LABEL(src)} 서버가 켜져 있는지, 주소와 임베딩 모델 이름${model}이 맞는지 확인해주세요.`;
+        default: return `${EMBED_LABEL(src)}${model} 임베딩이 실패했어요. ST의 API 연결 화면에 그 서비스 키가 저장돼 있는지, 모델 이름이 맞는지 확인해주세요.`;
+    }
+}
+
 function collectionId() {
     return `longmem_${hashString(String(ctx().getCurrentChatId()))}`;
 }
@@ -1023,6 +1063,7 @@ function vectorBody(extra = {}) {
         workers_ai: 'workers_ai_model',
     };
     if (modelKeys[source]) body.model = override || vs[modelKeys[source]] || undefined;
+    if (source === 'palm' || source === 'vertexai') body.model = googleEmbedModel(source, body.model);
     if (['ollama', 'llamacpp', 'vllm'].includes(source)) {
         body.apiUrl = s.embedApiUrl.trim()
             || (vs.use_alt_endpoint ? vs.alt_endpoint_url : c.textCompletionSettings?.server_urls?.[source]);
@@ -1048,16 +1089,95 @@ function vectorBody(extra = {}) {
     return body;
 }
 
-async function vectorRequest(path, body, signal = null) {
-    const response = await fetch(`/api/vector/${path}`, {
-        method: 'POST',
-        headers: ctx().getRequestHeaders(),
-        body: JSON.stringify(body),
-        signal,
-    });
-    if (!response.ok) throw new Error(`벡터 요청 실패 (${path}, HTTP ${response.status})`);
-    if (path === 'list' || path === 'query') return response.json();
-    return null;
+class VectorError extends Error {
+    constructor(path, status, body) {
+        super(`벡터 ${path} 실패 (HTTP ${status})`);
+        this.status = status;
+        this.hint = vectorHint(body, status);
+    }
+}
+
+
+async function vectorRequest(path, body, signal = null, { retries = 0, shouldStop = null } = {}) {
+    let lastErr = null;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        if (attempt) {
+            // Free embedding keys hit per-minute limits; back off before trying again.
+            const wait = [4000, 12000, 30000][attempt - 1] ?? 30000;
+            for (let t = 0; t < wait; t += 500) {
+                if (shouldStop?.()) throw new Error('aborted');
+                await sleep(500);
+            }
+        }
+        try {
+            const response = await fetch(`/api/vector/${path}`, {
+                method: 'POST',
+                headers: ctx().getRequestHeaders(),
+                body: JSON.stringify(body),
+                signal,
+            });
+            if (!response.ok) {
+                lastErr = new VectorError(path, response.status, body);
+                if (response.status >= 400 && response.status < 500) break;
+                continue;
+            }
+            if (path === 'list' || path === 'query') return response.json();
+            return null;
+        } catch (err) {
+            if (signal?.aborted || String(err?.message) === 'aborted') throw err;
+            lastErr = err;
+        }
+    }
+    throw lastErr;
+}
+
+// After a failure, skip embedding calls for a while so replies are not slowed down and
+// free quotas recover. Keyword search keeps working in the meantime.
+const vectorHealth = { coolUntil: 0, failures: 0 };
+
+function vectorCooling() {
+    return Date.now() < vectorHealth.coolUntil;
+}
+
+function markVectorFailure() {
+    vectorHealth.failures++;
+    const minutes = Math.min(30, 2 ** Math.min(vectorHealth.failures, 5));
+    vectorHealth.coolUntil = Date.now() + minutes * 60 * 1000;
+}
+
+function markVectorOk() {
+    vectorHealth.failures = 0;
+    vectorHealth.coolUntil = 0;
+}
+
+function vectorErrorText(err) {
+    return err?.hint ? `${err.message} · ${err.hint}` : String(err?.message || err);
+}
+
+async function testEmbedding() {
+    const s = getSettings();
+    let body;
+    try {
+        body = vectorBody({ collectionId: 'longmem_probe', searchText: '코끼리는 잊지 않아요', topK: 1 });
+    } catch (err) {
+        return toastr.error(esc(err.message), '임베딩 테스트');
+    }
+    setProgress('임베딩 연결 확인 중…', { toast: false });
+    const started = Date.now();
+    try {
+        await vectorRequest('query', body);
+        const ms = Date.now() - started;
+        markVectorOk();
+        toastr.success(`${esc(EMBED_LABEL(body.source))}${body.model ? ` · ${esc(body.model)}` : ''} (${(ms / 1000).toFixed(1)}초)`, '임베딩 정상', { escapeHtml: false });
+        logActivity('index', `임베딩 연결 정상 · ${EMBED_LABEL(body.source)}${body.model ? ` ${body.model}` : ''}`);
+        if (s.vectorEnabled && s.recallEnabled && syncState.error) syncVectors({ notify: true });
+    } catch (err) {
+        toastr.error(`${esc(err.hint || '')}<br><small>${esc(err.message)}</small>`, '임베딩 실패', { timeOut: 20000, extendedTimeOut: 8000, escapeHtml: false });
+        logActivity('index', `임베딩 실패 · ${vectorErrorText(err)}`, 'err');
+    } finally {
+        vectorRequest('purge', { collectionId: 'longmem_probe' }).catch(() => {});
+        if (!busy) setProgress('');
+    }
 }
 
 let syncing = false;
@@ -1087,28 +1207,38 @@ async function syncVectors({ notify = false, full = false } = {}) {
         if (syncing) return toastr.info('이미 색인하는 중이에요.');
     }
     if (!s.vectorEnabled || !s.recallEnabled || syncing || !hasChat()) return;
+    if (!full && !notify && vectorCooling()) return;
     const memory = full ? getMemory(true) : getMemory(false);
     if (!memory) return;
     syncStop = false;
     const chatId = ctx().getCurrentChatId();
     syncing = true;
+    let inserted = 0;
+    let pendingTotal = 0;
     try {
         const corpus = buildCorpus(memory);
         const id = collectionId();
-        const saved = new Set((await vectorRequest('list', vectorBody({ collectionId: id }))).map(Number));
+        const base = vectorBody({ collectionId: id });
+        const saved = new Set((await vectorRequest('list', base, null, { retries: 1 })).map(Number));
         const wanted = new Set(corpus.map(x => x.hash));
         const toInsert = corpus.filter(x => !saved.has(x.hash));
         const toDelete = [...saved].filter(h => !wanted.has(h));
+        pendingTotal = toInsert.length;
         const loud = notify || toInsert.length > 100;
         if (loud) setProgress(`색인 준비 중 · 대상 ${corpus.length.toLocaleString()}개`);
-        for (let i = 0; i < toInsert.length; i += 50) {
+        const size = insertBatchSize(base);
+        const pace = isRemoteEmbed(base.source) ? 400 : 0;
+        for (let i = 0; i < toInsert.length; i += size) {
             if (!stillSameChat(chatId)) return;
             if (syncStop) throw new Error('aborted');
-            setProgress(`벡터 색인 중 ${Math.min(i + 50, toInsert.length).toLocaleString()}/${toInsert.length.toLocaleString()}`, { toast: loud });
-            const items = toInsert.slice(i, i + 50).map(x => ({ hash: x.hash, text: x.text, index: x.from ?? 0 }));
-            await vectorRequest('insert', vectorBody({ collectionId: id, items }));
+            setProgress(`벡터 색인 중 ${Math.min(i + size, toInsert.length).toLocaleString()}/${toInsert.length.toLocaleString()}`, { toast: loud });
+            const items = toInsert.slice(i, i + size).map(x => ({ hash: x.hash, text: x.text.slice(0, 6000), index: x.from ?? 0 }));
+            await vectorRequest('insert', { ...base, items }, null, { retries: 3, shouldStop: () => syncStop || !stillSameChat(chatId) });
+            inserted += items.length;
+            if (pace) await sleep(pace);
         }
-        if (toDelete.length) await vectorRequest('delete', vectorBody({ collectionId: id, hashes: toDelete }));
+        if (toDelete.length) await vectorRequest('delete', { ...base, hashes: toDelete }, null, { retries: 1 });
+        markVectorOk();
         Object.assign(syncState, { chatId, indexed: corpus.length, total: corpus.length, error: '' });
         const raw = corpus.filter(x => x.kind === 'raw').length;
         if (notify || toInsert.length || toDelete.length) {
@@ -1121,9 +1251,15 @@ async function syncVectors({ notify = false, full = false } = {}) {
             return;
         }
         console.error(LOG_PREFIX, 'vector sync failed', err);
-        Object.assign(syncState, { chatId, error: String(err?.message || err) });
-        if (notify) reportError('벡터 색인 실패', err);
-        else logActivity('index', `색인 실패: ${String(err?.message || err)}`, 'err');
+        markVectorFailure();
+        const left = pendingTotal - inserted;
+        const partial = inserted ? ` (${inserted.toLocaleString()}개는 저장됨, 남은 ${left.toLocaleString()}개는 나중에 이어서)` : '';
+        Object.assign(syncState, { chatId, error: vectorErrorText(err) + partial });
+        const minutes = Math.round((vectorHealth.coolUntil - Date.now()) / 60000);
+        logActivity('index', `색인 실패${partial} · ${minutes}분 동안 키워드 검색만 쓰고 다시 시도해요 · ${vectorErrorText(err)}`, 'err');
+        if (notify) {
+            toastr.error(`${esc(err?.hint || '')}${partial ? `<br>${esc(partial.trim())}` : ''}<br><small>${esc(String(err?.message || err))}</small>`, '벡터 색인 실패', { timeOut: 20000, extendedTimeOut: 8000, escapeHtml: false });
+        }
     } finally {
         syncing = false;
         if (!busy) setProgress('');
@@ -1183,7 +1319,7 @@ async function hybridRecall(memory, query, { useDense = true, topK = null, budge
     const lists = [];
     let dense = false;
     for (const q of queries) {
-        if (useDense && s.vectorEnabled) {
+        if (useDense && s.vectorEnabled && !vectorCooling()) {
             try {
                 const hashes = await denseSearch(q, pool);
                 const items = hashes.map(h => byHash.get(h)).filter(Boolean);
@@ -1191,6 +1327,10 @@ async function hybridRecall(memory, query, { useDense = true, topK = null, budge
                 dense = true;
             } catch (err) {
                 console.warn(LOG_PREFIX, 'dense search skipped', err);
+                if (!(err?.name === 'AbortError')) {
+                    markVectorFailure();
+                    logActivity('recall', `의미 검색 실패, 키워드 검색으로 대체 · ${vectorErrorText(err)}`, 'warn');
+                }
             }
         }
         lists.push(bm25Search(searchable, q, pool));
@@ -3357,9 +3497,10 @@ function settingsHtml() {
           ${checkRow('indexAllMessages', '숨긴 메시지까지 전부 색인', '요약 여부와 상관없이, 숨김 처리된 메시지까지 모든 원본 대사를 검색 대상에 넣어요 (최근 원본은 빼고)')}
           ${checkRow('queryExpansion', '돌려 말해도 찾기', '"그때 그 일" 같은 말을 구체적인 검색어로 바꿔요. 답변마다 짧은 호출이 1번 늘어요')}
           ${selectRow('embedSource', '임베딩 소스', selectOptions(EMBED_SOURCES, s.embedSource), s.embedSource, 'API 키는 ST의 API 연결 화면에 저장된 것을 써요')}
-          ${textRow('embedModel', '임베딩 모델', '비우면 ST 벡터 저장소 설정을 따라가요', '예: gemini-embedding-001')}
+          ${textRow('embedModel', '임베딩 모델', '비우면 ST 벡터 저장소 설정을 따라가요. Google AI Studio는 gemini-embedding-001, Vertex는 text-embedding-005가 안정적이에요', '예: gemini-embedding-001')}
           <div class="lm-actions lm-actions-inline">
             <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_reindex">${icon('db')}<span>전체 색인</span></button>
+            <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_embed_test">${icon('plug')}<span>임베딩 테스트</span></button>
             <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_search">${icon('search')}<span>검색 테스트</span></button>
           </div>
           ${advanced(`
@@ -3503,6 +3644,10 @@ function bindSettings(root) {
         if (!box) return;
         setAutoCompress(box.checked);
     });
+    root.querySelector('#lm_live').addEventListener('click', (event) => {
+        if (event.target.closest('[data-lm-embed-test]')) testEmbedding();
+    });
+    root.querySelector('#lm_btn_embed_test').addEventListener('click', () => testEmbedding());
     renderLoreList();
     root.querySelector('#lm_fold').addEventListener('toggle', renderLoreList);
     root.querySelector('#lm_lore_list').addEventListener('change', (event) => {
@@ -3551,7 +3696,7 @@ function setBusyUI(isBusy) {
     if (!root) return;
     root.classList.toggle('lm-busy', isBusy);
     root.querySelectorAll('.lm-btn, .lm-quickbtn').forEach(btn => {
-        if (['lm_btn_stop', 'lm_btn_manager', 'lm_btn_search', 'lm_btn_ask'].includes(btn.id)) return;
+        if (['lm_btn_stop', 'lm_btn_manager', 'lm_btn_search', 'lm_btn_ask', 'lm_btn_embed_test'].includes(btn.id)) return;
         btn.disabled = isBusy;
         btn.classList.toggle('lm-disabled', isBusy);
     });
@@ -3685,7 +3830,10 @@ function renderLive() {
         const ix = activity.last.index;
         if (syncing) rows.push(liveRow('busy', '색인', `맞추는 중 · ${scope}`));
         else if (!s.vectorEnabled) rows.push(liveRow('on', '색인', `키워드 검색 ${count.toLocaleString()}개 · ${scope}`));
-        else if (syncState.error && syncState.chatId === ctx().getCurrentChatId()) rows.push(liveRow('err', '색인', `벡터 오류 · 키워드 검색으로 대체 중 <span class="lm-live-sub" title="${esc(syncState.error)}">${esc(syncState.error.slice(0, 60))}</span>`));
+        else if (syncState.error && syncState.chatId === ctx().getCurrentChatId()) {
+            const wait = vectorCooling() ? ` · ${Math.max(1, Math.round((vectorHealth.coolUntil - Date.now()) / 60000))}분 뒤 다시 시도` : '';
+            rows.push(liveRow('err', '색인', `벡터 오류 · 키워드 검색으로 대체 중${wait}<span class="lm-live-sub">${esc(syncState.error)}</span><button type="button" class="lm-link-btn lm-live-fix" data-lm-embed-test>${icon('plug')}임베딩 테스트</button>`));
+        }
         else if (syncState.chatId !== ctx().getCurrentChatId()) rows.push(liveRow('idle', '색인', `확인 전 · 대상 ${count.toLocaleString()}개 · ${scope}`));
         else rows.push(liveRow('on', '색인', `벡터 ${syncState.indexed.toLocaleString()}개 · ${scope}`, ix?.t));
     }

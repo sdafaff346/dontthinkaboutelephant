@@ -1318,6 +1318,8 @@
 .lm-live-time { color: color-mix(in srgb, var(--lm-muted) 75%, transparent); white-space: nowrap; }
 .lm-live-sub { display: block; font-size: 11.5px; opacity: 0.8; }
 .lm-live > .lm-hint { padding: 14px; }
+.lm-live-err .lm-live-sub { margin-top: 3px; color: var(--lm-muted); line-height: 1.5; }
+.lm-root .lm-live-fix { margin-top: 4px; margin-left: -8px; color: var(--lm-accent-ink); }
 
 .lm-dot {
     display: block;
