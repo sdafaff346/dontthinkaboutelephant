@@ -1082,7 +1082,7 @@ async function syncVectors({ notify = false } = {}) {
     } catch (err) {
         console.error(LOG_PREFIX, 'vector sync failed', err);
         Object.assign(syncState, { chatId, error: String(err?.message || err) });
-        if (notify) toastr.error(`벡터 색인 실패: ${err?.message || err}`);
+        if (notify) reportError('벡터 색인 실패', err);
     } finally {
         syncing = false;
         if (!busy) setProgress('');
@@ -1351,6 +1351,59 @@ function baseArchivistRules() {
 function extraRules() {
     const extra = getSettings().extraRules.trim();
     return extra ? `\n\nAdditional rules from the user:\n${extra}` : '';
+}
+
+// ---------------------------------------------------------------- error reporting
+// ST wraps failed requests as "API request failed"; the real reason sits in err.cause.
+
+function errorDetail(err) {
+    const parts = [];
+    let e = err;
+    for (let depth = 0; e && depth < 6; depth++) {
+        const msg = String(e?.message ?? e).trim();
+        if (msg && !parts.includes(msg)) parts.push(msg);
+        e = e?.cause;
+    }
+    return parts.join(' → ') || '알 수 없는 오류';
+}
+
+function errorHint(detail) {
+    const d = detail.toLowerCase();
+    if (d.includes('could not find profile')) return '선택한 연결 프로필을 찾지 못했어요. 설정 → 요약 탭에서 요약 모델을 다시 골라주세요.';
+    if (d.includes('connection manager is not available')) return 'ST 확장 목록에서 Connection Manager를 켜주세요.';
+    if (d.includes('not supported') || d.includes('has an api')) return '이 프로필의 API 종류는 쓸 수 없어요. Chat Completion이나 Text Completion 프로필을 골라주세요.';
+    if (/\b(401|403)\b|unauthori|permission|api key|api_key|invalid.*key|forbidden|credential/.test(d)) return 'API 키가 없거나 맞지 않아요. API 연결 화면에서 이 프로필이 쓰는 소스의 키를 확인해주세요.';
+    if (/\b429\b|quota|rate.?limit|resource.?exhausted|too many requests/.test(d)) return '사용량 한도에 걸렸어요. 잠시 뒤에 다시 하거나 다른 모델이나 키를 써주세요.';
+    if (/safety|blocked|prohibited|content.?filter|moderation|policy/.test(d)) return '모델의 안전 필터가 이 내용을 막았어요. 요약 모델을 다른 모델로 바꿔보세요.';
+    if (/context|too long|maximum.*token|token.*(limit|exceed)|length/.test(d)) return '보낸 내용이 모델 한도보다 길어요. 범위 탭의 "한 구간 최대 토큰"을 줄여보세요.';
+    if (/\b404\b|not found|no such model|unknown model/.test(d)) return '모델이나 주소를 찾지 못했어요. 프로필에 저장된 모델 이름을 확인해주세요.';
+    if (d.includes('빈 응답')) return '모델이 빈 답을 보냈어요. 생각(추론) 모델이라면 요약 탭의 "응답 최대 토큰"을 8000 이상으로 늘려보세요.';
+    if (/response not ok|\b50[0-4]\b|overloaded|unavailable|internal/.test(d)) return 'API 쪽에서 오류를 돌려줬어요. 자세한 이유는 SillyTavern 서버 창(검은 콘솔 창)에 찍혀 있어요. 잠시 뒤 다시 하거나 다른 모델을 써보세요.';
+    if (/failed to fetch|network|timeout|econn/.test(d)) return '연결이 끊겼어요. SillyTavern 서버가 켜져 있는지, 인터넷이 되는지 확인해주세요.';
+    return '';
+}
+
+function reportError(title, err) {
+    if (String(err?.message) === 'aborted') return;
+    console.error(LOG_PREFIX, title, err);
+    const detail = errorDetail(err);
+    const hint = errorHint(detail);
+    toastr.error(`${hint ? `${hint}<br><small>${esc(detail)}</small>` : esc(detail)}`, title, { timeOut: 15000, extendedTimeOut: 8000, escapeHtml: false });
+}
+
+async function testConnection() {
+    const s = getSettings();
+    const started = Date.now();
+    setProgress('요약 모델에 연결해 보는 중…');
+    try {
+        const reply = await callModel('You are a connection test.', 'Reply with exactly: OK', { retries: 0 });
+        const ms = Date.now() - started;
+        toastr.success(`응답이 왔어요 (${(ms / 1000).toFixed(1)}초): "${esc(reply.slice(0, 40))}"`, `${s.profileId ? '연결 프로필' : '현재 연결'} 정상`, { escapeHtml: false });
+    } catch (err) {
+        reportError('요약 모델 연결 실패', err);
+    } finally {
+        if (!busy) setProgress('');
+    }
 }
 
 // ---------------------------------------------------------------- summarize a batch
@@ -1695,8 +1748,7 @@ async function runCompress({ all = false, auto = false } = {}) {
     } catch (err) {
         if (String(err?.message) === 'aborted') toastr.info(`중지했습니다. (${done}개 구간 완료)`);
         else {
-            console.error(LOG_PREFIX, err);
-            toastr.error(`압축 실패: ${err?.message || err}${err?.cause ? ` (${err.cause.message || err.cause})` : ''}`);
+            reportError('압축 실패', err);
         }
     } finally {
         busy = false;
@@ -1804,7 +1856,7 @@ async function resummarizeNode(nodeId) {
         syncAfter();
     } catch (err) {
         if (String(err?.message) === 'aborted') toastr.info('중지했습니다.');
-        else toastr.error(`다시 요약 실패: ${err?.message || err}`);
+        else reportError('다시 요약 실패', err);
     } finally {
         busy = false;
         abortController = null;
@@ -2425,7 +2477,9 @@ function bindAskPanel(root, onJump) {
             pending.outerHTML = askAnswerHtml({ q: question, a: result.answer, sources: result.sources });
             input.value = '';
         } catch (err) {
-            pending.innerHTML = `<p class="lm-answer-q">${esc(question)}</p><p class="lm-warn">답을 만들지 못했어요: ${esc(err?.message || err)}</p>`;
+            const detail = errorDetail(err);
+            const hint = errorHint(detail);
+            pending.innerHTML = `<p class="lm-answer-q">${esc(question)}</p><p class="lm-warn">답을 만들지 못했어요. ${esc(hint)}</p><p class="lm-hint">${esc(detail)}</p>`;
         } finally {
             askBusy = false;
             btn.disabled = false;
@@ -2564,7 +2618,7 @@ Do not invent facts. Leave out an entry if the notes say nothing meaningful abou
         toastr.success(`위키 문서 ${made}개를 정리했어요.`, APP_NAME);
     } catch (err) {
         if (String(err?.message) === 'aborted') toastr.info(`중지했어요. (${made}개 정리됨)`);
-        else toastr.error(`위키 만들기 실패: ${err?.message || err}`);
+        else reportError('위키 만들기 실패', err);
     } finally {
         busy = false;
         abortController = null;
@@ -2850,8 +2904,7 @@ async function runCompact() {
     } catch (err) {
         if (String(err?.message) === 'aborted') toastr.info('중지했습니다.');
         else {
-            console.error(LOG_PREFIX, err);
-            toastr.error(`정리 실패: ${err?.message || err}`);
+            reportError('정리 실패', err);
         }
     } finally {
         busy = false;
@@ -3174,6 +3227,7 @@ function settingsHtml() {
 
       <section class="lm-pane active" data-lm-pane="summary" role="tabpanel">
         ${selectRow('', '요약 모델', profileOptions(s.profileId), s.profileId, 'Connection Manager에 저장한 프로필. 비우면 지금 쓰는 API', 'lm_profile')}
+        <div class="lm-preset-row lm-test-row"><span class="lm-hint">요약 모델이 제대로 응답하는지 짧게 확인해요.</span><button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_test">${icon('plug')}<span>연결 테스트</span></button></div>
         ${selectRow('language', '요약 언어', selectOptions(LANGUAGES, s.language), s.language, 'English가 토큰을 가장 적게 씁니다')}
         ${selectRow('detail', '상세도', selectOptions({ concise: '간결', standard: '보통', detailed: '상세' }, s.detail), s.detail, '상세할수록 오래 기억하지만 토큰이 늘어요')}
         ${numberRow('maxOutputTokens', '응답 최대 토큰', 256, 131072, '요약 한 번에 받을 최대 길이')}
@@ -3365,6 +3419,7 @@ function bindSettings(root) {
     });
     root.querySelector('#lm_apply_preset').addEventListener('click', () => applyPreset(presetSelect.value));
     root.querySelector('#lm_btn_search').addEventListener('click', () => openSearchTest());
+    root.querySelector('#lm_btn_test').addEventListener('click', () => testConnection());
 }
 
 function renderLoreList() {
