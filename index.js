@@ -143,6 +143,7 @@ const defaultSettings = Object.freeze({
     backupKeep: 5,
     injectPreset: 'stable',
     indexAllMessages: true,
+    autoIndex: true,
     loreEnabled: true,
     loreUseCharacter: true,
     loreUseChat: true,
@@ -1170,7 +1171,7 @@ async function testEmbedding() {
         markVectorOk();
         toastr.success(`${esc(EMBED_LABEL(body.source))}${body.model ? ` · ${esc(body.model)}` : ''} (${(ms / 1000).toFixed(1)}초)`, '임베딩 정상', { escapeHtml: false });
         logActivity('index', `임베딩 연결 정상 · ${EMBED_LABEL(body.source)}${body.model ? ` ${body.model}` : ''}`);
-        if (s.vectorEnabled && s.recallEnabled && syncState.error) syncVectors({ notify: true });
+        if (s.vectorEnabled && s.recallEnabled && s.autoIndex && syncState.error) syncVectors({ notify: true });
     } catch (err) {
         toastr.error(`${esc(err.hint || '')}<br><small>${esc(err.message)}</small>`, '임베딩 실패', { timeOut: 20000, extendedTimeOut: 8000, escapeHtml: false });
         logActivity('index', `임베딩 실패 · ${vectorErrorText(err)}`, 'err');
@@ -3177,6 +3178,7 @@ async function runReset() {
 
 function syncAfter() {
     // Runs in the background once the current job has released the busy flag.
+    if (!getSettings().autoIndex) return;
     setTimeout(() => syncVectors(), 0);
 }
 
@@ -3494,6 +3496,7 @@ function settingsHtml() {
         <section class="lm-pane" data-lm-pane="recall" role="tabpanel">
           ${checkRow('recallEnabled', '회상 사용', '답변 직전에 지금 장면과 관련된 과거를 찾아 넣어요')}
           ${checkRow('vectorEnabled', '의미 검색', '끄면 키워드 검색만 해요')}
+          ${checkRow('autoIndex', '자동 색인', '압축하거나 기억이 바뀔 때마다 알아서 색인을 맞춰요. 끄면 "전체 색인" 버튼을 누를 때만 색인해요 (이미 만든 색인으로 검색은 계속돼요)')}
           ${checkRow('indexAllMessages', '숨긴 메시지까지 전부 색인', '요약 여부와 상관없이, 숨김 처리된 메시지까지 모든 원본 대사를 검색 대상에 넣어요 (최근 원본은 빼고)')}
           ${checkRow('queryExpansion', '돌려 말해도 찾기', '"그때 그 일" 같은 말을 구체적인 검색어로 바꿔요. 답변마다 짧은 호출이 1번 늘어요')}
           ${selectRow('embedSource', '임베딩 소스', selectOptions(EMBED_SOURCES, s.embedSource), s.embedSource, 'API 키는 ST의 API 연결 화면에 저장된 것을 써요')}
@@ -3642,7 +3645,8 @@ function bindSettings(root) {
     root.querySelector('#lm_live').addEventListener('change', (event) => {
         const box = event.target.closest('[data-lm-live-toggle]');
         if (!box) return;
-        setAutoCompress(box.checked);
+        if (box.dataset.lmLiveToggle === 'autoIndex') setAutoIndex(box.checked);
+        else setAutoCompress(box.checked);
     });
     root.querySelector('#lm_live').addEventListener('click', (event) => {
         if (event.target.closest('[data-lm-embed-test]')) testEmbedding();
@@ -3828,14 +3832,20 @@ function renderLive() {
         const rc = activity.last.recall;
         rows.push(liveRow(rc?.level === 'err' ? 'err' : 'on', '회상', rc ? esc(rc.text) : '다음 답변 때 관련된 과거를 찾아요', rc?.t));
         const ix = activity.last.index;
-        if (syncing) rows.push(liveRow('busy', '색인', `맞추는 중 · ${scope}`));
+        const autoNote = s.autoIndex ? '' : ' · 자동 색인 꺼짐';
+        if (syncing) rows.push(liveRow('busy', '색인', `맞추는 중 · ${scope}`, null, 'autoIndex'));
+        else if (s.vectorEnabled && !s.autoIndex && !(syncState.error && syncState.chatId === ctx().getCurrentChatId())) {
+            rows.push(liveRow('off', '색인', syncState.chatId === ctx().getCurrentChatId()
+                ? `자동 색인 꺼짐 · 벡터 ${syncState.indexed.toLocaleString()}개로 검색 중`
+                : `자동 색인 꺼짐 · 회상 탭의 전체 색인 버튼으로 색인해요`, ix?.t, 'autoIndex'));
+        }
         else if (!s.vectorEnabled) rows.push(liveRow('on', '색인', `키워드 검색 ${count.toLocaleString()}개 · ${scope}`));
         else if (syncState.error && syncState.chatId === ctx().getCurrentChatId()) {
             const wait = vectorCooling() ? ` · ${Math.max(1, Math.round((vectorHealth.coolUntil - Date.now()) / 60000))}분 뒤 다시 시도` : '';
-            rows.push(liveRow('err', '색인', `벡터 오류 · 키워드 검색으로 대체 중${wait}<span class="lm-live-sub">${esc(syncState.error)}</span><button type="button" class="lm-link-btn lm-live-fix" data-lm-embed-test>${icon('plug')}임베딩 테스트</button>`));
+            rows.push(liveRow('err', '색인', `벡터 오류 · 키워드 검색으로 대체 중${s.autoIndex ? wait : autoNote}<span class="lm-live-sub">${esc(syncState.error)}</span><button type="button" class="lm-link-btn lm-live-fix" data-lm-embed-test>${icon('plug')}임베딩 테스트</button>`, null, 'autoIndex'));
         }
-        else if (syncState.chatId !== ctx().getCurrentChatId()) rows.push(liveRow('idle', '색인', `확인 전 · 대상 ${count.toLocaleString()}개 · ${scope}`));
-        else rows.push(liveRow('on', '색인', `벡터 ${syncState.indexed.toLocaleString()}개 · ${scope}`, ix?.t));
+        else if (syncState.chatId !== ctx().getCurrentChatId()) rows.push(liveRow('idle', '색인', `확인 전 · 대상 ${count.toLocaleString()}개 · ${scope}`, null, 'autoIndex'));
+        else rows.push(liveRow('on', '색인', `벡터 ${syncState.indexed.toLocaleString()}개 · ${scope}`, ix?.t, 'autoIndex'));
     }
 
     const pending = unsummarizedRange().count;
@@ -4684,6 +4694,19 @@ function registerCommands() {
         helpString: '<div>코끼리를 생각하지마: 기억을 위키로 정리합니다.</div>',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lm-autoindex',
+        callback: (_args, value) => {
+            const s = getSettings();
+            const v = String(value || '').trim().toLowerCase();
+            setAutoIndex(v === 'on' ? true : v === 'off' ? false : !s.autoIndex);
+            return s.autoIndex ? 'on' : 'off';
+        },
+        unnamedArgumentList: [
+            SlashCommandArgument.fromProps({ description: 'on, off, or empty to toggle', typeList: [ARGUMENT_TYPE.STRING], isRequired: false, enumList: ['on', 'off'] }),
+        ],
+        helpString: '<div>코끼리를 생각하지마: 자동 색인을 켜거나 끕니다. 예: <code>/lm-autoindex off</code></div>',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lm-auto',
         callback: (_args, value) => {
             const s = getSettings();
@@ -4732,6 +4755,18 @@ function setAutoCompress(on) {
     renderLive();
     toastr.info(`자동 압축을 ${s.autoCompress ? `켰어요. 미요약이 ${s.autoCompressAt}개 쌓이면 알아서 압축해요` : '껐어요'}.`, APP_NAME);
     if (s.autoCompress) maybeAutoCompress();
+}
+
+function setAutoIndex(on) {
+    const s = getSettings();
+    s.autoIndex = !!on;
+    ctx().saveSettingsDebounced();
+    syncSettingInputs();
+    renderLive();
+    toastr.info(s.autoIndex
+        ? '자동 색인을 켰어요. 기억이 바뀔 때마다 알아서 색인을 맞춰요.'
+        : '자동 색인을 껐어요. 회상 탭의 "전체 색인"을 누를 때만 색인해요. 이미 만든 색인으로 검색은 계속돼요.', APP_NAME);
+    if (s.autoIndex && hasChat()) syncAfter();
 }
 
 function addWandMenu() {
