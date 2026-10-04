@@ -1,0 +1,12 @@
+{
+    "display_name": "코끼리를 생각하지마",
+    "loading_order": 100,
+    "dependencies": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "KKANG000",
+    "version": "1.4.0",
+    "homePage": "",
+    "auto_update": false,
+    "generate_interceptor": "longMemoryInterceptor"
+}
