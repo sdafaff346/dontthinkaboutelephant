@@ -142,6 +142,7 @@ const defaultSettings = Object.freeze({
     autoBackupEvery: 10,
     backupKeep: 5,
     injectPreset: 'stable',
+    indexAllMessages: true,
     loreEnabled: true,
     loreUseCharacter: true,
     loreUseChat: true,
@@ -511,6 +512,7 @@ async function reconcileAfterDeletion() {
     memory.hiddenRanges = listToRanges(hidden);
     await ctx().saveMetadata();
     if (removed) toastr.info(`삭제된 메시지에 대한 기억 ${removed}개를 지웠어요.`, APP_NAME);
+    if (removed || staled) logActivity('forget', `지운 기억 ${removed} · 다시 요약 표시 ${staled}`, staled ? 'warn' : 'ok');
     if (staled) toastr.info(`메시지가 일부 지워진 기억 ${staled}개에 "다시 요약" 표시를 했어요.`, APP_NAME);
     refreshInjection();
     updateStatus();
@@ -902,8 +904,10 @@ function buildCorpus(memory) {
         const text = `${a.title}: ${a.text}${a.keywords?.length ? ` | Keywords: ${a.keywords.join(', ')}` : ''}`;
         items.push({ hash: hashString(`ar|${a.id}|${text}`), kind: 'archive', text, display: `${a.title}: ${a.text}`, importance: a.importance || 3, from: a.from, to: a.to });
     }
-    if (s.indexRawMessages && memory.cursor >= 0) {
-        const { chat } = ctx();
+    const { chat } = ctx();
+    const allMode = s.indexAllMessages;
+    const rawEnd = allMode ? chat.length - 1 - s.keepRecent : Math.min(memory.cursor, chat.length - 1);
+    if ((allMode || s.indexRawMessages) && rawEnd >= 0) {
         const hidden = new Set(rangesToList(memory.hiddenRanges));
         let group = [];
         const flush = () => {
@@ -912,9 +916,12 @@ function buildCorpus(memory) {
             items.push({ hash: hashString(`raw|${group[0].i}|${text}`), kind: 'raw', text, display: text, importance: 3, from: group[0].i, to: group[group.length - 1].i });
             group = [];
         };
-        for (let i = 0; i <= Math.min(memory.cursor, chat.length - 1); i++) {
+        for (let i = 0; i <= rawEnd; i++) {
             const msg = chat[i];
-            if (!msg || !(hidden.has(i) || isSummarizable(msg))) continue;
+            if (!msg) continue;
+            // All mode: every message with text, including ones hidden by us, by /hide or by other extensions.
+            if (!allMode && !(hidden.has(i) || isSummarizable(msg))) continue;
+            if (allMode && msg.extra?.isSmallSys) continue;
             const line = messageLine(msg, i);
             if (line.length < 8) continue;
             group.push({ i, line });
@@ -1056,11 +1063,33 @@ async function vectorRequest(path, body, signal = null) {
 let syncing = false;
 const syncState = { chatId: null, indexed: 0, total: 0, error: '' };
 
-async function syncVectors({ notify = false } = {}) {
+let syncStop = false;
+
+async function syncVectors({ notify = false, full = false } = {}) {
     const s = getSettings();
+    if (full) {
+        if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+        if (!s.indexAllMessages) {
+            const ok = await ctx().Popup.show.confirm('전체 색인', '숨긴 메시지까지 모든 원본 대사를 검색 대상에 넣을까요? (회상 탭의 "숨긴 메시지까지 전부 색인"이 켜져요)');
+            if (ok) {
+                s.indexAllMessages = true;
+                ctx().saveSettingsDebounced();
+                syncSettingInputs();
+            }
+        }
+        if (!s.recallEnabled) return toastr.info('회상이 꺼져 있어요. 회상 탭에서 켜주세요.');
+        const memory = getMemory(true);
+        if (!s.vectorEnabled) {
+            const n = buildCorpus(memory).length;
+            logActivity('index', `키워드 검색 대상 ${n.toLocaleString()}개`);
+            return toastr.info(`의미 검색이 꺼져 있어 키워드 검색으로 ${n.toLocaleString()}개를 찾아요. 벡터 색인은 필요 없어요.`, APP_NAME);
+        }
+        if (syncing) return toastr.info('이미 색인하는 중이에요.');
+    }
     if (!s.vectorEnabled || !s.recallEnabled || syncing || !hasChat()) return;
-    const memory = getMemory(false);
+    const memory = full ? getMemory(true) : getMemory(false);
     if (!memory) return;
+    syncStop = false;
     const chatId = ctx().getCurrentChatId();
     syncing = true;
     try {
@@ -1070,19 +1099,31 @@ async function syncVectors({ notify = false } = {}) {
         const wanted = new Set(corpus.map(x => x.hash));
         const toInsert = corpus.filter(x => !saved.has(x.hash));
         const toDelete = [...saved].filter(h => !wanted.has(h));
+        const loud = notify || toInsert.length > 100;
+        if (loud) setProgress(`색인 준비 중 · 대상 ${corpus.length.toLocaleString()}개`);
         for (let i = 0; i < toInsert.length; i += 50) {
             if (!stillSameChat(chatId)) return;
-            setProgress(`벡터 색인 중 ${Math.min(i + 50, toInsert.length)}/${toInsert.length}`);
+            if (syncStop) throw new Error('aborted');
+            setProgress(`벡터 색인 중 ${Math.min(i + 50, toInsert.length).toLocaleString()}/${toInsert.length.toLocaleString()}`, { toast: loud });
             const items = toInsert.slice(i, i + 50).map(x => ({ hash: x.hash, text: x.text, index: x.from ?? 0 }));
             await vectorRequest('insert', vectorBody({ collectionId: id, items }));
         }
         if (toDelete.length) await vectorRequest('delete', vectorBody({ collectionId: id, hashes: toDelete }));
         Object.assign(syncState, { chatId, indexed: corpus.length, total: corpus.length, error: '' });
-        if (notify) toastr.success(`벡터 색인 완료: ${corpus.length}개 (새로 ${toInsert.length}개)`);
+        const raw = corpus.filter(x => x.kind === 'raw').length;
+        if (notify || toInsert.length || toDelete.length) {
+            logActivity('index', `벡터 ${corpus.length.toLocaleString()}개 (원본 묶음 ${raw.toLocaleString()}) · 새로 ${toInsert.length} · 정리 ${toDelete.length}`);
+        }
+        if (notify) toastr.success(`총 ${corpus.length.toLocaleString()}개 (새로 ${toInsert.length.toLocaleString()}개)${s.indexAllMessages ? ' · 숨긴 메시지 포함' : ''}`, '색인 완료');
     } catch (err) {
+        if (String(err?.message) === 'aborted') {
+            logActivity('index', '색인을 중지했어요', 'warn');
+            return;
+        }
         console.error(LOG_PREFIX, 'vector sync failed', err);
         Object.assign(syncState, { chatId, error: String(err?.message || err) });
         if (notify) reportError('벡터 색인 실패', err);
+        else logActivity('index', `색인 실패: ${String(err?.message || err)}`, 'err');
     } finally {
         syncing = false;
         if (!busy) setProgress('');
@@ -1134,7 +1175,11 @@ async function hybridRecall(memory, query, { useDense = true, topK = null, budge
     const queries = (Array.isArray(query) ? query : [query]).map(q => String(q || '').trim()).filter(Boolean);
     if (!corpus.length || !queries.length) return { results: [], dense: false };
     const pool = Math.max(maxItems * 4, 20);
-    const byHash = new Map(corpus.map(x => [x.hash, x]));
+    const chatNow = ctx().chat || [];
+    const visibleRaw = (x) => x.kind === 'raw' && x.from > memory.cursor
+        && rangeIndices(x.from, x.to).every(i => chatNow[i] && !chatNow[i].is_system);
+    const searchable = corpus.filter(x => !visibleRaw(x));
+    const byHash = new Map(searchable.map(x => [x.hash, x]));
     const lists = [];
     let dense = false;
     for (const q of queries) {
@@ -1148,7 +1193,7 @@ async function hybridRecall(memory, query, { useDense = true, topK = null, budge
                 console.warn(LOG_PREFIX, 'dense search skipped', err);
             }
         }
-        lists.push(bm25Search(corpus, q, pool));
+        lists.push(bm25Search(searchable, q, pool));
     }
 
     // Reciprocal rank fusion, then rerank by relevance, importance and recency.
@@ -1263,18 +1308,29 @@ async function refreshRecall(recentChat) {
         } catch (err) {
             console.warn(LOG_PREFIX, 'query expansion skipped', err);
         }
-        const { results } = await hybridRecall(memory, queries);
+        const { results, dense } = await hybridRecall(memory, queries);
         lastRecall = results;
         text = recallText(results);
+        const raw = results.filter(r => r.item?.kind === 'raw').length;
+        logActivity('recall', results.length
+            ? `${results.length}개 찾아 넣음${raw ? ` (원본 대사 ${raw})` : ''} · ${dense ? '의미+키워드' : '키워드'}${queries.length > 1 ? ` · 검색어 ${queries.length}개` : ''}`
+            : '관련된 과거를 찾지 못했어요');
     }
     setExtensionPrompt(PROMPT_KEY_RECALL, text, POSITIONS.in_chat, s.recallDepth, false, ROLES.system);
+    return text;
 }
 
 globalThis.longMemoryInterceptor = async function (chat, _contextSize, _abort, type) {
     if (type === 'quiet') return;
     try {
         refreshInjection();
-        await refreshRecall(chat);
+        const recalled = await refreshRecall(chat);
+        const s = getSettings();
+        const memory = s.enabled ? getMemory(false) : null;
+        if (memory) {
+            const tokens = estTokens(buildMemoryText(memory)) + estTokens(recalled || '');
+            if (tokens) logActivity('inject', `답변에 기억 약 ${tokens.toLocaleString()}토큰을 넣음`);
+        }
     } catch (err) {
         console.error(LOG_PREFIX, 'interceptor failed', err);
     }
@@ -1389,6 +1445,7 @@ function reportError(title, err) {
     const detail = errorDetail(err);
     const hint = errorHint(detail);
     toastr.error(`${hint ? `${hint}<br><small>${esc(detail)}</small>` : esc(detail)}`, title, { timeOut: 15000, extendedTimeOut: 8000, escapeHtml: false });
+    logActivity('error', `${title}: ${hint || detail}`, 'err');
 }
 
 async function testConnection() {
@@ -1399,6 +1456,7 @@ async function testConnection() {
         const reply = await callModel('You are a connection test.', 'Reply with exactly: OK', { retries: 0 });
         const ms = Date.now() - started;
         toastr.success(`응답이 왔어요 (${(ms / 1000).toFixed(1)}초): "${esc(reply.slice(0, 40))}"`, `${s.profileId ? '연결 프로필' : '현재 연결'} 정상`, { escapeHtml: false });
+        logActivity('model', `연결 정상 (${(ms / 1000).toFixed(1)}초)`);
     } catch (err) {
         reportError('요약 모델 연결 실패', err);
     } finally {
@@ -1742,11 +1800,18 @@ async function runCompress({ all = false, auto = false } = {}) {
             updateStatus();
             if (s.autoCompact) await compactInternal(chatId, { force: false });
         }
-        if (done) toastr.success(auto ? `자동 압축: ${done}개 구간을 기억했어요.` : `${done}개 구간을 기억에 저장했습니다.`, auto ? APP_NAME : undefined);
+        if (done) {
+            toastr.success(auto ? `자동 압축: ${done}개 구간을 기억했어요.` : `${done}개 구간을 기억에 저장했습니다.`, auto ? APP_NAME : undefined);
+            const last = batches[done - 1];
+            logActivity(auto ? 'auto' : 'compress', `#${batches[0].from}~#${last.to} · ${done}개 구간 기억함`);
+        }
         if (done) await maybeAutoBackup(done);
         if (done && stillSameChat(chatId)) syncAfter();
     } catch (err) {
-        if (String(err?.message) === 'aborted') toastr.info(`중지했습니다. (${done}개 구간 완료)`);
+        if (String(err?.message) === 'aborted') {
+            toastr.info(`중지했습니다. (${done}개 구간 완료)`);
+            logActivity(auto ? 'auto' : 'compress', `중지 (${done}개 구간 완료)`, 'warn');
+        }
         else {
             reportError('압축 실패', err);
         }
@@ -1906,6 +1971,9 @@ async function afterTurn(messageId) {
     if (!msg || msg.is_user || msg.is_system) return;
     const chatId = ctx().getCurrentChatId();
     turnBusy = true;
+    renderLive();
+    const turnNotes = [];
+    let turnLevel = 'ok';
     try {
         const recent = [];
         for (let i = Math.max(0, messageId - 6); i < messageId; i++) {
@@ -1931,6 +1999,8 @@ async function afterTurn(messageId) {
             decorateMessage(messageId);
             await ctx().saveChat();
             if (issues.length) toastr.warning(`기억과 다른 부분 ${issues.length}개를 찾았어요. 메시지 이름 옆 ⚠ 표시를 눌러 확인하세요.`, APP_NAME);
+            turnNotes.push(issues.length ? `#${messageId} 모순 ${issues.length}개` : `#${messageId} 모순 없음`);
+            if (issues.length) turnLevel = 'warn';
         }
         if (doState) {
             const ops = (parseJsonLenient(extractTag(out, 'ledger') || '') || []).filter(op => {
@@ -1939,15 +2009,20 @@ async function afterTurn(messageId) {
                 return ['set', 'close'].includes(kind) && ['character', 'relation', 'thread', 'item'].includes(String(op.cat || '').toLowerCase());
             });
             if (applyLedgerOps(memory, ops, messageId)) {
+                turnNotes.push(`상태 ${ops.length}건 갱신`);
                 await ctx().saveMetadata();
                 refreshInjection();
                 updateStatus();
             }
         }
+        if (doState && !turnNotes.some(n => n.startsWith('상태'))) turnNotes.push('상태 변화 없음');
+        logActivity('check', turnNotes.join(' · '), turnLevel);
     } catch (err) {
         console.warn(LOG_PREFIX, 'after-turn review failed', err);
+        logActivity('check', `점검 실패: ${errorDetail(err)}`, 'err');
     } finally {
         turnBusy = false;
+        renderLive();
     }
 }
 
@@ -2881,6 +2956,7 @@ async function compactInternal(chatId, { force }) {
         }
         if (!stillSameChat(chatId)) break;
         didAnything = true;
+        if (!force) logActivity('compact', `기억 예산에 맞춰 정리 (${({ prune: '사소한 기록 보관', chapter: '챕터로 합침', saga: '이야기로 합침', condense: '덜 중요한 것 줄임' })[step]})`);
         await ctx().saveChat();
         await ctx().saveMetadata();
         refreshInjection();
@@ -2901,6 +2977,7 @@ async function runCompact() {
         const did = await compactInternal(chatId, { force: true });
         if (did) syncAfter();
         toastr[did ? 'success' : 'info'](did ? '덜 중요한 기억을 압축했습니다.' : '더 압축할 기억이 없습니다.');
+        if (did) logActivity('compact', '덜 중요한 기억을 줄였어요');
     } catch (err) {
         if (String(err?.message) === 'aborted') toastr.info('중지했습니다.');
         else {
@@ -2964,6 +3041,7 @@ function syncAfter() {
 }
 
 function runStop() {
+    if (syncing) syncStop = true;
     if (abortController) {
         abortController.abort();
         toastr.info('중지 요청을 보냈습니다.');
@@ -3166,6 +3244,14 @@ function ledgerGroups(memory) {
     }).join('');
 }
 
+function advanced(content, label = '고급 설정') {
+    return `<details class="lm-more"><summary>${label}</summary>${content}</details>`;
+}
+
+function resetFoot() {
+    return `<div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane">${icon('rotate')}이 탭 기본값으로</button></div>`;
+}
+
 function settingsHtml() {
     const s = getSettings();
     return `
@@ -3179,155 +3265,163 @@ function settingsHtml() {
       <div class="lm-head">
         <div class="lm-mascot">${ELEPHANT_SVG}</div>
         <div class="lm-head-title">
-          <span class="lm-head-name">코끼리를 생각하지마</span>
-          <span class="lm-head-sub">코끼리는 잊지 않아요. 지난 이야기를 압축해 계속 기억합니다</span>
+          <span class="lm-head-name">이 채팅의 기억</span>
+          <span class="lm-head-sub" id="lm_head_sub">코끼리는 잊지 않아요</span>
         </div>
-        <label class="lm-switch lm-switch-lg" title="기억을 AI 프롬프트에 넣기">
+        <label class="lm-switch lm-switch-lg" title="기억을 AI에게 보내기 (끄면 아무것도 넣지 않아요)">
           <input type="checkbox" data-lm-setting="enabled" aria-label="기억 사용">
           <span class="lm-switch-track" aria-hidden="true"></span>
         </label>
       </div>
 
       <div id="lm_status" class="lm-status" aria-live="polite"></div>
+      <div id="lm_progress" class="lm-progress" aria-live="polite"></div>
 
       <div class="lm-actions">
-        <button type="button" class="menu_button lm-btn lm-btn-primary" id="lm_btn_compress" title="미요약 메시지에서 한 구간을 요약합니다">
+        <button type="button" class="menu_button lm-btn lm-btn-primary" id="lm_btn_compress" title="미요약 메시지에서 한 구간을 요약해요">
           ${icon('compress')}<span>압축</span><span class="lm-badge" id="lm_badge" hidden></span>
         </button>
-        <button type="button" class="menu_button lm-btn" id="lm_btn_all" title="남은 미요약 메시지를 처음부터 전부 요약합니다">
+        <button type="button" class="menu_button lm-btn" id="lm_btn_all" title="남은 미요약 메시지를 처음부터 전부 요약해요">
           ${icon('layers')}<span>전체 압축</span>
         </button>
-        <button type="button" class="menu_button lm-btn lm-btn-stop" id="lm_btn_stop" title="진행 중인 작업을 멈춥니다">
+        <button type="button" class="menu_button lm-btn lm-btn-stop" id="lm_btn_stop" title="진행 중인 작업을 멈춰요">
           ${icon('stop')}<span>중지</span>
         </button>
       </div>
-      <div class="lm-actions lm-actions-sub">
-        <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_manager">${icon('book')}<span>기억장</span></button>
-        <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_compact" title="덜 중요한 기억부터 줄이고 오래된 것을 합칩니다">${icon('sparkle')}<span>정리</span></button>
-        <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_undo">${icon('undo')}<span>되돌리기</span></button>
+      <div class="lm-quick">
+        <button type="button" class="lm-quickbtn" id="lm_btn_manager">${icon('book')}<span>기억장</span></button>
+        <button type="button" class="lm-quickbtn" id="lm_btn_ask">${icon('ask')}<span>묻기</span></button>
+        <button type="button" class="lm-quickbtn" id="lm_btn_compact" title="덜 중요한 기억부터 줄이고 오래된 것을 합쳐요">${icon('sparkle')}<span>정리</span></button>
+        <button type="button" class="lm-quickbtn" id="lm_btn_undo">${icon('undo')}<span>되돌리기</span></button>
       </div>
-      <label class="lm-auto-row" title="AI 답변이 끝날 때마다 확인해서, 미요약이 기준만큼 쌓이면 한 구간을 자동으로 압축해요">
-        <span class="lm-switch"><input type="checkbox" data-lm-setting="autoCompress" aria-label="자동 압축"><span class="lm-switch-track" aria-hidden="true"></span></span>
-        <span class="lm-auto-text"><b>자동 압축</b><span class="lm-hint">미요약이</span></span>
-        <span class="lm-num-wrap"><input type="number" class="text_pole lm-num lm-num-sm" data-lm-setting="autoCompressAt" min="5" max="100000" step="1" aria-label="자동 압축 기준"><span class="lm-unit">개 쌓이면</span></span>
-      </label>
-      <div id="lm_progress" class="lm-progress" aria-live="polite"></div>
+
+      <div class="lm-live-wrap">
+        <div class="lm-live-head">
+          <span class="lm-live-title">작동 상태</span>
+          <button type="button" class="lm-link-btn" id="lm_btn_peek" title="다음 답변 때 AI에게 실제로 들어가는 내용을 보여줘요">${icon('search')}AI에게 가는 내용</button>
+          <button type="button" class="lm-link-btn" id="lm_btn_log">${icon('timeline')}활동 기록</button>
+        </div>
+        <div id="lm_live" class="lm-live"></div>
+      </div>
 
       <details class="lm-fold" id="lm_fold">
         <summary class="lm-fold-head">${icon('sliders')}<span>설정</span><span class="lm-fold-chev">${icon('chevron')}</span></summary>
-      <div class="lm-tabs lm-tabs-pill" role="tablist">
-        <button type="button" class="lm-tab active" data-lm-tab="summary" role="tab">${icon('feather')}<span>요약</span></button>
-        <button type="button" class="lm-tab" data-lm-tab="range" role="tab">${icon('ruler')}<span>범위</span></button>
-        <button type="button" class="lm-tab" data-lm-tab="tidy" role="tab">${icon('sparkle')}<span>정리</span></button>
-        <button type="button" class="lm-tab" data-lm-tab="recall" role="tab">${icon('bulb')}<span>회상</span></button>
-        <button type="button" class="lm-tab" data-lm-tab="check" role="tab">${icon('shield')}<span>검사</span></button>
-        <button type="button" class="lm-tab" data-lm-tab="inject" role="tab">${icon('plug')}<span>주입</span></button>
-      </div>
-      <div class="lm-panes">
-
-      <section class="lm-pane active" data-lm-pane="summary" role="tabpanel">
-        ${selectRow('', '요약 모델', profileOptions(s.profileId), s.profileId, 'Connection Manager에 저장한 프로필. 비우면 지금 쓰는 API', 'lm_profile')}
-        <div class="lm-preset-row lm-test-row"><span class="lm-hint">요약 모델이 제대로 응답하는지 짧게 확인해요.</span><button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_test">${icon('plug')}<span>연결 테스트</span></button></div>
-        ${selectRow('language', '요약 언어', selectOptions(LANGUAGES, s.language), s.language, 'English가 토큰을 가장 적게 씁니다')}
-        ${selectRow('detail', '상세도', selectOptions({ concise: '간결', standard: '보통', detailed: '상세' }, s.detail), s.detail, '상세할수록 오래 기억하지만 토큰이 늘어요')}
-        ${numberRow('maxOutputTokens', '응답 최대 토큰', 256, 131072, '요약 한 번에 받을 최대 길이')}
-        ${numberRow('retries', '재시도 횟수', 0, 10, '요청이 실패하면 다시 시도')}
-        ${checkRow('previewBeforeSave', '저장 전에 요약 미리보기', '압축할 때마다 결과를 보여주고, 고치거나 다시 요약할 수 있어요. 자동 압축에는 적용되지 않아요')}
-        ${checkRow('includePreset', '프로필의 샘플링 설정 사용')}
-        ${checkRow('systemAsUser', '지시를 유저 메시지로 보내기', 'system 역할을 받지 않는 모델일 때만 켜세요')}
-        <div class="lm-subhead">로어북 참고</div>
-        ${checkRow('loreEnabled', '로어북 참고하기', '요약, 모순 검사, 위키, 질문 답변에서 관련된 로어북 항목을 함께 참고해 이름과 설정을 정확하게 맞춰요')}
-        ${checkRow('loreUseCharacter', '캐릭터 로어북 자동 포함')}
-        ${checkRow('loreUseChat', '채팅 로어북 자동 포함')}
-        <div class="lm-field lm-field-stack">
-          <div class="lm-field-text"><span class="lm-field-label">추가로 참고할 로어북</span><span class="lm-hint">전역 로어북 등 함께 볼 것을 골라주세요</span></div>
-          <div class="lm-lore-list" id="lm_lore_list"></div>
+        <div class="lm-tabs lm-tabs-pill" role="tablist">
+          <button type="button" class="lm-tab active" data-lm-tab="summary" role="tab">${icon('feather')}<span>요약</span></button>
+          <button type="button" class="lm-tab" data-lm-tab="auto" role="tab">${icon('rotate')}<span>자동</span></button>
+          <button type="button" class="lm-tab" data-lm-tab="recall" role="tab">${icon('bulb')}<span>회상</span></button>
+          <button type="button" class="lm-tab" data-lm-tab="lore" role="tab">${icon('wiki')}<span>로어북</span></button>
+          <button type="button" class="lm-tab" data-lm-tab="tidy" role="tab">${icon('archive')}<span>용량</span></button>
+          <button type="button" class="lm-tab" data-lm-tab="inject" role="tab">${icon('plug')}<span>주입</span></button>
         </div>
-        ${numberRow('loreTokenBudget', '로어북 참고 상한', 0, 100000, '한 번에 보낼 로어북 내용의 최대 크기')}
-        <div class="lm-field lm-field-stack">
-          <div class="lm-field-text"><span class="lm-field-label">추가 요약 규칙</span><span class="lm-hint">요약 AI에게 덧붙일 지시. 영어로 쓰면 가장 정확해요</span></div>
-          <textarea class="text_pole lm-textarea" data-lm-setting="extraRules" rows="3" placeholder="Always track the in-story date."></textarea>
+        <div class="lm-panes">
+
+        <section class="lm-pane active" data-lm-pane="summary" role="tabpanel">
+          ${selectRow('', '요약 모델', profileOptions(s.profileId), s.profileId, 'Connection Manager에 저장한 프로필. 비우면 지금 쓰는 API를 써요', 'lm_profile')}
+          <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_test">${icon('plug')}<span>연결 테스트</span></button><span class="lm-hint">요약 모델이 응답하는지 바로 확인해요</span></div>
+          ${selectRow('language', '요약 언어', selectOptions(LANGUAGES, s.language), s.language, 'English가 토큰을 가장 적게 써요')}
+          ${selectRow('detail', '상세도', selectOptions({ concise: '간결', standard: '보통', detailed: '상세' }, s.detail), s.detail, '상세할수록 오래 기억하지만 토큰이 늘어요')}
+          ${numberRow('keepRecent', '최근 원본 유지', 0, 5000, '이만큼의 최근 메시지는 요약하지 않고 그대로 둬요')}
+          ${checkRow('previewBeforeSave', '저장 전에 미리보기', '압축할 때마다 결과를 보고 고치거나 다시 요약해요')}
+          ${advanced(`
+            ${numberRow('batchTokens', '한 구간 최대 토큰', 1000, 2000000, '요약 모델이 감당하는 만큼 크게 잡으면 호출이 줄어요')}
+            ${numberRow('batchMessages', '한 구간 최대 메시지', 1, 5000)}
+            ${numberRow('maxOutputTokens', '응답 최대 토큰', 256, 131072, '생각(추론) 모델은 8000 이상을 추천해요')}
+            ${numberRow('retries', '재시도 횟수', 0, 10)}
+            ${checkRow('hideSummarized', '요약한 원본은 AI에게서 숨기기', '채팅창에는 흐리게 남고, 되돌리기로 복구돼요')}
+            ${checkRow('stripHtml', 'HTML과 상태창 태그 빼고 요약')}
+            ${checkRow('eventsEnabled', '사건도 따로 추출', '누가, 어디서, 무엇을, 왜. 회상 검색의 기본 단위가 돼요')}
+            ${checkRow('includePreset', '프로필의 샘플링 설정 사용')}
+            ${checkRow('systemAsUser', '지시를 유저 메시지로 보내기', 'system 역할을 받지 않는 모델일 때만 켜세요')}
+            <div class="lm-field lm-field-stack">
+              <div class="lm-field-text"><span class="lm-field-label">추가 요약 규칙</span><span class="lm-hint">요약 AI에게 덧붙일 지시. 영어로 쓰면 가장 정확해요</span></div>
+              <textarea class="text_pole lm-textarea" data-lm-setting="extraRules" rows="3" placeholder="Always track the in-story date."></textarea>
+            </div>`)}
+          ${resetFoot()}
+        </section>
+
+        <section class="lm-pane" data-lm-pane="auto" role="tabpanel">
+          ${checkRow('autoCompress', '자동 압축', '답변이 끝날 때 미요약이 기준만큼 쌓였으면 한 구간을 압축해요')}
+          ${numberRow('autoCompressAt', '자동 압축 기준', 5, 100000, '미요약 메시지가 이만큼 쌓이면')}
+          ${checkRow('checkContradictions', '모순 검사', '답변이 기억과 다르면 메시지 이름 옆에 ⚠ 표시를 해요')}
+          ${checkRow('liveStateUpdate', '현재 상태 실시간 갱신', '시간·장소·함께 있는 인물·약속을 답변마다 기록부에 반영해요')}
+          ${checkRow('autoForgetDeleted', '메시지를 지우면 그 기억도 지우기', '일부만 지우면 "다시 요약" 표시를 해요')}
+          <p class="lm-hint lm-note">모순 검사와 실시간 갱신은 둘 다 켜도 답변마다 요약 모델을 1번만 불러요. 요약 모델 프로필을 따로 지정하면 대화와 겹치지 않아요.</p>
+          ${advanced(`${numberRow('remindAt', '압축 알림 기준', 0, 100000, '미요약이 이만큼 쌓이면 알려줘요. 0이면 끔')}`)}
+          ${resetFoot()}
+        </section>
+
+        <section class="lm-pane" data-lm-pane="recall" role="tabpanel">
+          ${checkRow('recallEnabled', '회상 사용', '답변 직전에 지금 장면과 관련된 과거를 찾아 넣어요')}
+          ${checkRow('vectorEnabled', '의미 검색', '끄면 키워드 검색만 해요')}
+          ${checkRow('indexAllMessages', '숨긴 메시지까지 전부 색인', '요약 여부와 상관없이, 숨김 처리된 메시지까지 모든 원본 대사를 검색 대상에 넣어요 (최근 원본은 빼고)')}
+          ${checkRow('queryExpansion', '돌려 말해도 찾기', '"그때 그 일" 같은 말을 구체적인 검색어로 바꿔요. 답변마다 짧은 호출이 1번 늘어요')}
+          ${selectRow('embedSource', '임베딩 소스', selectOptions(EMBED_SOURCES, s.embedSource), s.embedSource, 'API 키는 ST의 API 연결 화면에 저장된 것을 써요')}
+          ${textRow('embedModel', '임베딩 모델', '비우면 ST 벡터 저장소 설정을 따라가요', '예: gemini-embedding-001')}
+          <div class="lm-actions lm-actions-inline">
+            <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_reindex">${icon('db')}<span>전체 색인</span></button>
+            <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_search">${icon('search')}<span>검색 테스트</span></button>
+          </div>
+          ${advanced(`
+            ${checkRow('indexRawMessages', '요약된 원본 대사 검색', '전부 색인을 끈 경우에만 의미가 있어요')}
+            ${textRow('embedApiUrl', '임베딩 서버 주소', 'Ollama, llama.cpp, vLLM만 해당. 비우면 ST 설정', 'http://127.0.0.1:11434')}
+            ${numberRow('recallTopK', '한 번에 회상할 항목', 0, 100)}
+            ${numberRow('recallTokenBudget', '회상 토큰 상한', 100, 200000)}
+            ${numberRow('recallScan', '검색에 쓸 최근 메시지', 1, 50)}
+            ${numberRow('vectorThreshold', '유사도 하한 (%)', 0, 100, '높이면 확실히 비슷한 것만 가져와요')}
+            ${numberRow('relevanceWeight', '정렬 가중치: 관련도', 0, 100)}
+            ${numberRow('importanceWeight', '정렬 가중치: 중요도', 0, 100)}
+            ${numberRow('recencyWeight', '정렬 가중치: 최근성', 0, 100)}
+            ${numberRow('rawChunkMessages', '원본 묶음 크기', 1, 20, '원본 대사를 몇 메시지씩 묶어 검색할지')}
+            ${numberRow('rawChunkChars', '원본 묶음 최대 글자', 200, 20000)}
+            ${numberRow('eventMax', '사건 최대 보관', 10, 1000000)}
+            ${numberRow('queryTimeoutMs', '검색 시간 제한', 500, 120000, '넘으면 키워드 검색 결과만 써요')}
+            ${numberRow('expansionTimeoutMs', '검색어 확장 시간 제한', 1000, 120000)}`)}
+          ${resetFoot()}
+        </section>
+
+        <section class="lm-pane" data-lm-pane="lore" role="tabpanel">
+          ${checkRow('loreEnabled', '로어북 참고', '요약, 모순 검사, 위키, 질문에서 관련 항목만 골라 함께 넘겨요')}
+          ${checkRow('loreUseCharacter', '캐릭터 로어북 자동 포함')}
+          ${checkRow('loreUseChat', '채팅 로어북 자동 포함')}
+          <div class="lm-field lm-field-stack">
+            <div class="lm-field-text"><span class="lm-field-label">추가로 참고할 로어북</span><span class="lm-hint">전역 로어북 등 함께 볼 것을 골라주세요</span></div>
+            <div class="lm-lore-list" id="lm_lore_list"></div>
+          </div>
+          ${advanced(`${numberRow('loreTokenBudget', '로어북 참고 상한', 0, 100000, '한 번에 보낼 로어북 내용의 최대 크기')}`)}
+          ${resetFoot()}
+        </section>
+
+        <section class="lm-pane" data-lm-pane="tidy" role="tabpanel">
+          ${numberRow('memoryBudget', '기억 예산', 500, 2000000, '넘으면 덜 중요한 기억부터 압축해요')}
+          ${checkRow('autoCompact', '예산을 넘으면 자동 정리')}
+          ${numberRow('autoBackupEvery', '자동 백업 간격', 0, 1000, '압축을 이만큼 할 때마다 백업해요. 0이면 끔')}
+          ${advanced(`
+            ${numberRow('protectRecent', '최신 에피소드 보호', 0, 1000, '가장 최근 에피소드는 줄이지 않아요')}
+            ${numberRow('maxEpisodes', '에피소드 최대 개수', 2, 10000, '넘으면 오래된 것부터 챕터로 합쳐요')}
+            ${numberRow('chapterSize', '챕터당 에피소드', 2, 100)}
+            ${numberRow('maxChapters', '챕터 최대 개수', 1, 10000, '넘으면 지금까지의 이야기로 합쳐요')}
+            ${numberRow('sagaMaxWords', '지금까지의 이야기 최대 단어', 200, 100000)}
+            ${numberRow('staleAfter', '오래된 사소한 기록 정리', 10, 1000000, '중요도 1인 기록이 이만큼 갱신되지 않으면 보관함으로')}
+            ${numberRow('archiveMax', '보관함 최대 항목', 0, 100000)}
+            ${numberRow('maxUndo', '되돌리기 기록', 0, 50)}
+            ${numberRow('backupKeep', '백업 보관 개수', 1, 50)}`)}
+          ${resetFoot()}
+        </section>
+
+        <section class="lm-pane" data-lm-pane="inject" role="tabpanel">
+          ${selectRow('injectPreset', '주입 프리셋', selectOptions(Object.fromEntries(Object.entries(INJECT_PRESETS).map(([k, v]) => [k, v.label])), s.injectPreset), s.injectPreset, '')}
+          <div class="lm-preset-row"><span class="lm-hint" id="lm_preset_desc">${esc(INJECT_PRESETS[s.injectPreset]?.desc || '')}</span><button type="button" class="lm-chipbtn" id="lm_apply_preset">${icon('check')}<span>적용</span></button></div>
+          ${checkRow('anchorEnabled', '현재 상태 리마인더', '최근 대화 근처에 짧게 넣어 긴 채팅에서도 흐름을 놓치지 않게 해요')}
+          ${advanced(`
+            ${selectRow('injectPosition', '기억 넣을 위치', selectOptions({ in_prompt: '캐릭터 설정 뒤', before_prompt: '프롬프트 맨 앞', in_chat: '채팅 안 (깊이 지정)' }, s.injectPosition), s.injectPosition, '대부분 캐릭터 설정 뒤가 가장 안정적이에요')}
+            ${numberRow('injectDepth', '채팅 안 깊이', 0, 10000, '위치가 채팅 안일 때만 써요')}
+            ${selectRow('injectRole', '역할', selectOptions({ system: 'system', user: 'user', assistant: 'assistant' }, s.injectRole), s.injectRole)}
+            ${numberRow('anchorDepth', '리마인더 깊이', 0, 10000)}
+            ${numberRow('recallDepth', '회상 넣을 깊이', 0, 10000, '0이면 마지막 메시지 바로 뒤')}`)}
+          ${resetFoot()}
+        </section>
         </div>
-        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane">${icon('rotate')}이 탭 기본값으로</button></div>
-      </section>
-
-      <section class="lm-pane" data-lm-pane="range" role="tabpanel">
-        ${numberRow('keepRecent', '최근 원본 유지', 0, 5000, '이만큼의 최근 메시지는 요약하지 않고 그대로 둡니다')}
-        ${numberRow('batchMessages', '한 구간 최대 메시지', 1, 5000, '압축 한 번에 묶을 메시지 수')}
-        ${numberRow('batchTokens', '한 구간 최대 토큰', 1000, 2000000, '요약 모델의 컨텍스트 안에서 크게 잡으면 호출이 줄어요')}
-        ${checkRow('hideSummarized', '요약한 원본은 AI에게서 숨기기', '채팅창에는 흐리게 남고, 되돌리기로 복구됩니다')}
-        ${checkRow('autoForgetDeleted', '메시지를 지우면 그 기억도 지우기', '요약된 메시지를 모두 지우면 해당 기억을 자동으로 지워요. 일부만 지우면 "다시 요약" 표시를 해요')}
-        ${checkRow('stripHtml', 'HTML과 상태창 태그 빼고 요약')}
-        ${numberRow('remindAt', '압축 알림 기준', 0, 100000, '미요약이 이만큼 쌓이면 알려줍니다. 0이면 끔')}
-        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane">${icon('rotate')}이 탭 기본값으로</button></div>
-      </section>
-
-      <section class="lm-pane" data-lm-pane="tidy" role="tabpanel">
-        ${numberRow('memoryBudget', '기억 예산 (토큰)', 500, 2000000, '넘으면 덜 중요한 기억부터 압축합니다')}
-        ${checkRow('autoCompact', '압축 후 예산을 넘으면 자동 정리')}
-        ${numberRow('protectRecent', '최신 에피소드 보호', 0, 1000, '가장 최근 에피소드는 줄이지 않아요')}
-        ${numberRow('maxEpisodes', '에피소드 최대 개수', 2, 10000, '넘으면 오래된 것부터 챕터로 합칩니다')}
-        ${numberRow('chapterSize', '챕터당 에피소드', 2, 100)}
-        ${numberRow('maxChapters', '챕터 최대 개수', 1, 10000, '넘으면 지금까지의 이야기로 합칩니다')}
-        ${numberRow('sagaMaxWords', '지금까지의 이야기 최대 단어', 200, 100000)}
-        ${numberRow('staleAfter', '오래된 사소한 기록 정리', 10, 1000000, '중요도 1인 기록이 이 메시지 수만큼 갱신되지 않으면 보관함으로')}
-        ${numberRow('archiveMax', '보관함 최대 항목', 0, 100000)}
-        ${numberRow('maxUndo', '되돌리기 기록', 0, 50)}
-        ${numberRow('autoBackupEvery', '자동 백업 간격', 0, 1000, '압축을 이만큼 할 때마다 브라우저에 백업해요. 0이면 끔')}
-        ${numberRow('backupKeep', '백업 보관 개수', 1, 50)}
-        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane">${icon('rotate')}이 탭 기본값으로</button></div>
-      </section>
-
-      <section class="lm-pane" data-lm-pane="recall" role="tabpanel">
-        ${checkRow('recallEnabled', '회상 사용', '응답 직전에 지금 장면과 관련된 과거를 찾아 넣습니다')}
-        ${checkRow('eventsEnabled', '요약할 때 사건도 따로 추출', '누가, 어디서, 무엇을, 왜 — 검색의 기본 단위가 됩니다')}
-        ${checkRow('vectorEnabled', '의미 검색 사용', '끄면 키워드 검색만 합니다')}
-        ${checkRow('indexRawMessages', '요약된 원본 대사도 검색', '정확한 대사를 그대로 떠올릴 수 있어요')}
-        ${checkRow('queryExpansion', '돌려 말해도 찾기', '"그때 그 일"처럼 애매한 말을 요약 모델이 구체적인 검색어로 바꿔서 찾아요. 답변마다 짧은 호출이 1번 늘고 응답 시작이 조금 늦어져요')}
-        ${selectRow('embedSource', '임베딩 소스', selectOptions(EMBED_SOURCES, s.embedSource), s.embedSource, 'API 키는 ST에 저장된 것을 씁니다')}
-        ${textRow('embedModel', '임베딩 모델', '비우면 ST 벡터 저장소 설정의 모델', '예: bge-m3')}
-        ${textRow('embedApiUrl', '임베딩 서버 주소', 'Ollama, llama.cpp, vLLM만 해당. 비우면 ST 설정', 'http://127.0.0.1:11434')}
-        <div class="lm-actions lm-actions-inline">
-          <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_reindex">${icon('db')}<span>색인 맞추기</span></button>
-          <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_search">${icon('search')}<span>검색 테스트</span></button>
-        </div>
-        <details class="lm-more">
-          <summary>세부 조정</summary>
-          ${numberRow('recallTopK', '한 번에 회상할 항목', 0, 100)}
-          ${numberRow('recallTokenBudget', '회상 토큰 상한', 100, 200000)}
-          ${numberRow('recallScan', '검색에 쓸 최근 메시지', 1, 50)}
-          ${numberRow('vectorThreshold', '유사도 하한 (%)', 0, 100, '높이면 확실히 비슷한 것만 가져와요')}
-          ${numberRow('relevanceWeight', '정렬 가중치: 관련도', 0, 100)}
-          ${numberRow('importanceWeight', '정렬 가중치: 중요도', 0, 100)}
-          ${numberRow('recencyWeight', '정렬 가중치: 최근성', 0, 100)}
-          ${numberRow('rawChunkMessages', '원본 묶음 크기', 1, 20, '원본 대사를 몇 메시지씩 묶어 검색할지')}
-          ${numberRow('rawChunkChars', '원본 묶음 최대 글자', 200, 20000)}
-          ${numberRow('eventMax', '사건 최대 보관', 10, 1000000)}
-          ${numberRow('queryTimeoutMs', '검색 시간 제한 (ms)', 500, 120000, '넘으면 키워드 검색 결과만 씁니다')}
-          ${numberRow('expansionTimeoutMs', '검색어 확장 시간 제한', 1000, 120000, '넘으면 확장 없이 바로 검색해요')}
-        </details>
-        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane">${icon('rotate')}이 탭 기본값으로</button></div>
-      </section>
-
-      <section class="lm-pane" data-lm-pane="check" role="tabpanel">
-        <div class="lm-field-text lm-pane-intro"><span class="lm-hint">AI 답변이 끝날 때마다 요약 모델이 한 번 살펴봐요. 둘 다 켜도 호출은 1번이에요. 요약 모델 프로필을 따로 지정해 두면 대화와 겹치지 않아요.</span></div>
-        ${checkRow('checkContradictions', '모순 검사', '죽은 인물이 등장하거나, 이름·관계·부상이 바뀌거나, 모르는 비밀을 아는 등 기억과 다른 부분을 찾아 메시지에 ⚠ 표시를 해요')}
-        ${checkRow('liveStateUpdate', '현재 상태 실시간 갱신', '압축 전이라도 시간·장소·함께 있는 인물·약속을 매 답변마다 기록부에 반영해요')}
-        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane">${icon('rotate')}이 탭 기본값으로</button></div>
-      </section>
-
-      <section class="lm-pane" data-lm-pane="inject" role="tabpanel">
-        ${selectRow('injectPreset', '주입 프리셋', selectOptions(Object.fromEntries(Object.entries(INJECT_PRESETS).map(([k, v]) => [k, v.label])), s.injectPreset), s.injectPreset, '')}
-        <div class="lm-preset-row"><span class="lm-hint" id="lm_preset_desc">${esc(INJECT_PRESETS[s.injectPreset]?.desc || '')}</span><button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_apply_preset">${icon('sparkle')}<span>적용</span></button></div>
-        ${selectRow('injectPosition', '기억 넣을 위치', selectOptions({ in_prompt: '캐릭터 설정 뒤', before_prompt: '프롬프트 맨 앞', in_chat: '채팅 안 (깊이 지정)' }, s.injectPosition), s.injectPosition, '대부분 캐릭터 설정 뒤가 가장 안정적이에요')}
-        ${numberRow('injectDepth', '채팅 안 깊이', 0, 10000, '위치가 채팅 안일 때만 사용')}
-        ${selectRow('injectRole', '역할', selectOptions({ system: 'system', user: 'user', assistant: 'assistant' }, s.injectRole), s.injectRole)}
-        ${checkRow('anchorEnabled', '현재 상태 리마인더', '최근 대화 근처에 짧게 넣어 긴 채팅에서도 흐름을 놓치지 않게 합니다')}
-        ${numberRow('anchorDepth', '리마인더 깊이', 0, 10000)}
-        ${numberRow('recallDepth', '회상 넣을 깊이', 0, 10000, '0이면 마지막 메시지 바로 뒤')}
-        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane">${icon('rotate')}이 탭 기본값으로</button></div>
-      </section>
-      </div>
       </details>
     </div>
   </div>
@@ -3400,7 +3494,15 @@ function bindSettings(root) {
     root.querySelector('#lm_btn_manager').addEventListener('click', () => openManager());
     root.querySelector('#lm_btn_undo').addEventListener('click', () => runUndo());
     root.querySelector('#lm_btn_stop').addEventListener('click', () => runStop());
-    root.querySelector('#lm_btn_reindex').addEventListener('click', () => syncVectors({ notify: true }));
+    root.querySelector('#lm_btn_reindex').addEventListener('click', () => syncVectors({ notify: true, full: true }));
+    root.querySelector('#lm_btn_ask').addEventListener('click', () => openAsk());
+    root.querySelector('#lm_btn_log').addEventListener('click', () => openActivityLog());
+    root.querySelector('#lm_btn_peek').addEventListener('click', () => openPeek());
+    root.querySelector('#lm_live').addEventListener('change', (event) => {
+        const box = event.target.closest('[data-lm-live-toggle]');
+        if (!box) return;
+        setAutoCompress(box.checked);
+    });
     renderLoreList();
     root.querySelector('#lm_fold').addEventListener('toggle', renderLoreList);
     root.querySelector('#lm_lore_list').addEventListener('change', (event) => {
@@ -3448,37 +3550,234 @@ function setBusyUI(isBusy) {
     const root = document.getElementById('lm_settings');
     if (!root) return;
     root.classList.toggle('lm-busy', isBusy);
-    root.querySelectorAll('.lm-btn').forEach(btn => {
-        if (btn.id === 'lm_btn_stop' || btn.id === 'lm_btn_manager' || btn.id === 'lm_btn_search') return;
+    root.querySelectorAll('.lm-btn, .lm-quickbtn').forEach(btn => {
+        if (['lm_btn_stop', 'lm_btn_manager', 'lm_btn_search', 'lm_btn_ask'].includes(btn.id)) return;
         btn.disabled = isBusy;
         btn.classList.toggle('lm-disabled', isBusy);
     });
 }
 
-function setProgress(text) {
+function setProgress(text, { toast = true } = {}) {
+    activity.progress = text || '';
     const el = document.getElementById('lm_progress');
+    if (el) {
+        el.textContent = text;
+        el.classList.toggle('active', !!text);
+    }
+    if (toast || !text) jobToast(text);
+    renderLive();
+}
+
+// ---------------------------------------------------------------- activity: shows what is actually running
+
+const activity = { log: [], last: {}, job: null, progress: '' };
+const ACT_LABELS = {
+    inject: '답변 생성', recall: '회상', index: '색인', compress: '압축', auto: '자동 압축', check: '답변 점검',
+    compact: '정리', model: '요약 모델', forget: '삭제 반영', wiki: '위키', ask: '질문', error: '오류',
+};
+
+function logActivity(kind, text, level = 'ok') {
+    let chatId = null;
+    try {
+        chatId = hasChat() ? ctx().getCurrentChatId() : null;
+    } catch {
+        chatId = null;
+    }
+    const entry = { t: Date.now(), kind, text: String(text), level, chatId };
+    activity.log.unshift(entry);
+    if (activity.log.length > 300) activity.log.length = 300;
+    activity.last[kind] = entry;
+    renderLive();
+}
+
+function timeAgo(t) {
+    const sec = Math.max(0, Math.round((Date.now() - t) / 1000));
+    if (sec < 10) return '방금';
+    if (sec < 60) return `${sec}초 전`;
+    if (sec < 3600) return `${Math.floor(sec / 60)}분 전`;
+    if (sec < 86400) return `${Math.floor(sec / 3600)}시간 전`;
+    return new Date(t).toLocaleDateString();
+}
+
+// Long jobs show ST's own stoppable loader toast, so progress is visible even with the panel closed.
+function jobToast(text) {
+    if (!text) {
+        if (activity.job) {
+            try {
+                activity.job.hide();
+            } catch { /* already gone */ }
+            activity.job = null;
+        }
+        return;
+    }
+    const loader = ctx().loader;
+    if (!loader?.show) return;
+    if (!activity.job) {
+        try {
+            activity.job = loader.show({
+                blocking: false,
+                toastMode: 'stoppable',
+                slug: 'lm-job',
+                title: APP_NAME,
+                message: text,
+                onStop: () => {
+                    activity.job = null;
+                    runStop();
+                },
+            });
+        } catch {
+            activity.job = null;
+        }
+        return;
+    }
+    const el = document.querySelector('.action-loader-toast[data-slug="lm-job"] .action-loader-message');
+    if (el) el.textContent = text;
+}
+
+const corpusCountCache = { key: '', count: 0 };
+
+function corpusCount(memory) {
+    const key = `${ctx().getCurrentChatId()}|${ctx().chat.length}|${memory.cursor}|${memory.events.length}|${memory.archive.length}|${getSettings().indexAllMessages}`;
+    if (corpusCountCache.key !== key) {
+        corpusCountCache.key = key;
+        corpusCountCache.count = buildCorpus(memory).length;
+    }
+    return corpusCountCache.count;
+}
+
+function liveRow(state, label, detail, when = null, toggleKey = null) {
+    const toggle = toggleKey
+        ? `<label class="lm-switch" title="켜기/끄기"><input type="checkbox" data-lm-live-toggle="${toggleKey}" ${getSettings()[toggleKey] ? 'checked' : ''} aria-label="${label}"><span class="lm-switch-track" aria-hidden="true"></span></label>`
+        : '';
+    return `<div class="lm-live-row lm-live-${state}">
+      <i class="lm-dot" aria-hidden="true"></i>
+      <span class="lm-live-label">${label}</span>
+      <span class="lm-live-detail">${detail}${when ? ` <span class="lm-live-time">· ${timeAgo(when)}</span>` : ''}</span>
+      ${toggle}
+    </div>`;
+}
+
+function renderLive() {
+    const el = document.getElementById('lm_live');
     if (!el) return;
-    el.textContent = text;
-    el.classList.toggle('active', !!text);
+    if (!hasChat()) {
+        el.innerHTML = '<div class="lm-hint">채팅을 열면 무엇이 작동 중인지 보여줘요.</div>';
+        return;
+    }
+    const s = getSettings();
+    const memory = getMemory(false);
+    const rows = [];
+
+    const tokens = memory ? estTokens(buildMemoryText(memory)) : 0;
+    const inj = activity.last.inject;
+    if (!s.enabled) rows.push(liveRow('off', '기억 주입', '꺼짐 · AI에게 아무것도 보내지 않아요'));
+    else if (!tokens) rows.push(liveRow('idle', '기억 주입', '아직 보낼 기억이 없어요. 압축을 눌러 시작하세요'));
+    else rows.push(liveRow('on', '기억 주입', inj ? esc(inj.text) : `답변마다 약 ${tokens.toLocaleString()}토큰을 넣어요`, inj?.t));
+
+    const indexAll = s.indexAllMessages;
+    const scope = indexAll ? '숨긴 메시지 포함 전체' : '요약된 부분만';
+    const count = memory ? corpusCount(memory) : 0;
+    if (!s.recallEnabled) {
+        rows.push(liveRow('off', '회상', '꺼짐'));
+    } else {
+        const rc = activity.last.recall;
+        rows.push(liveRow(rc?.level === 'err' ? 'err' : 'on', '회상', rc ? esc(rc.text) : '다음 답변 때 관련된 과거를 찾아요', rc?.t));
+        const ix = activity.last.index;
+        if (syncing) rows.push(liveRow('busy', '색인', `맞추는 중 · ${scope}`));
+        else if (!s.vectorEnabled) rows.push(liveRow('on', '색인', `키워드 검색 ${count.toLocaleString()}개 · ${scope}`));
+        else if (syncState.error && syncState.chatId === ctx().getCurrentChatId()) rows.push(liveRow('err', '색인', `벡터 오류 · 키워드 검색으로 대체 중 <span class="lm-live-sub" title="${esc(syncState.error)}">${esc(syncState.error.slice(0, 60))}</span>`));
+        else if (syncState.chatId !== ctx().getCurrentChatId()) rows.push(liveRow('idle', '색인', `확인 전 · 대상 ${count.toLocaleString()}개 · ${scope}`));
+        else rows.push(liveRow('on', '색인', `벡터 ${syncState.indexed.toLocaleString()}개 · ${scope}`, ix?.t));
+    }
+
+    const pending = unsummarizedRange().count;
+    if (!s.autoCompress) rows.push(liveRow('off', '자동 압축', `꺼짐 · 미요약 ${pending.toLocaleString()}개`, null, 'autoCompress'));
+    else {
+        const au = activity.last.auto;
+        rows.push(liveRow('on', '자동 압축', `미요약 ${pending.toLocaleString()} / ${s.autoCompressAt.toLocaleString()}${au ? ` · 최근 ${esc(au.text)}` : ''}`, au?.t, 'autoCompress'));
+    }
+
+    const checks = [s.checkContradictions && '모순 검사', s.liveStateUpdate && '상태 갱신'].filter(Boolean);
+    if (!checks.length) rows.push(liveRow('off', '답변 점검', '꺼짐'));
+    else {
+        const ck = activity.last.check;
+        const state = turnBusy ? 'busy' : ck?.level === 'warn' ? 'warn' : ck?.level === 'err' ? 'err' : 'on';
+        rows.push(liveRow(state, '답변 점검', turnBusy ? `${checks.join(' · ')} 하는 중` : ck ? esc(ck.text) : `${checks.join(' · ')} · 다음 답변 후 실행`, turnBusy ? null : ck?.t));
+    }
+
+    const err = activity.last.error;
+    if (err && Date.now() - err.t < 10 * 60 * 1000) rows.push(liveRow('err', '최근 오류', esc(err.text), err.t));
+    el.innerHTML = rows.join('');
+}
+
+async function openActivityLog() {
+    const c = ctx();
+    const chatId = hasChat() ? c.getCurrentChatId() : null;
+    const list = activity.log.filter(e => !e.chatId || e.chatId === chatId);
+    const body = list.length
+        ? list.map(e => `<li class="lm-log-item lm-live-${e.level === 'ok' ? 'on' : e.level}">
+            <i class="lm-dot" aria-hidden="true"></i>
+            <span class="lm-log-kind">${esc(ACT_LABELS[e.kind] || e.kind)}</span>
+            <span class="lm-log-text">${esc(e.text)}</span>
+            <time class="lm-log-time" title="${esc(new Date(e.t).toLocaleString())}">${new Date(e.t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</time>
+          </li>`).join('')
+        : '<li class="lm-empty">아직 기록이 없어요. 답변을 생성하거나 압축하면 여기에 남아요.</li>';
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>활동 기록</h3></div>
+      <p class="lm-hint lm-pane-intro">이번 접속 동안 이 채팅에서 코끼리가 한 일이에요. 새로고침하면 비워져요.</p>
+      <ul class="lm-log">${body}</ul></div>`;
+    applyThemeMode(wrap.firstElementChild);
+    await new c.Popup(wrap, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, allowVerticalScrolling: true, leftAlign: true }).show();
+}
+
+const POSITION_LABELS = { in_prompt: '캐릭터 설정 뒤', before_prompt: '프롬프트 맨 앞', in_chat: '채팅 안' };
+
+async function openPeek() {
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    const c = ctx();
+    const s = getSettings();
+    const memory = getMemory(false);
+    const main = s.enabled && memory ? buildMemoryText(memory) : '';
+    const anchor = s.enabled && s.anchorEnabled && main ? buildAnchorText(memory) : '';
+    let recall = '';
+    let recallNote = '';
+    if (s.enabled && s.recallEnabled && memory) {
+        try {
+            const { results, dense } = await hybridRecall(memory, recallQuery(c.chat));
+            recall = recallText(results);
+            recallNote = `지금 장면 기준 ${results.length}개 · ${dense ? '의미+키워드' : '키워드'} 검색${s.queryExpansion ? ' · 실제 답변 때는 검색어 확장도 더해져요' : ''}`;
+        } catch (err) {
+            recallNote = `미리보기 실패: ${errorDetail(err)}`;
+        }
+    }
+    const block = (title, where, text, note = '') => `
+      <section class="lm-peek">
+        <header><b>${title}</b><span class="lm-chip">${where}</span><span class="lm-chip">${text ? `약 ${estTokens(text).toLocaleString()}토큰` : '비어 있음'}</span></header>
+        ${note ? `<p class="lm-hint">${esc(note)}</p>` : ''}
+        ${text ? `<pre class="lm-peek-text">${esc(text)}</pre>` : '<p class="lm-hint">보내지 않아요.</p>'}
+      </section>`;
+    const pos = s.injectPosition === 'in_chat' ? `채팅 안 깊이 ${s.injectDepth}` : POSITION_LABELS[s.injectPosition] || s.injectPosition;
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>AI에게 가는 내용</h3></div>
+      <p class="lm-hint lm-pane-intro">${s.enabled ? '다음 답변을 만들 때 프롬프트에 이렇게 들어가요. 요약된 원본 메시지는 AI에게서 숨겨져 있어요.' : '기억 사용이 꺼져 있어 아무것도 보내지 않아요.'}</p>
+      ${block('기억', pos, main)}
+      ${block('현재 상태 리마인더', `채팅 안 깊이 ${s.anchorDepth}`, anchor)}
+      ${block('회상', `채팅 안 깊이 ${s.recallDepth}`, recall, recallNote)}
+    </div>`;
+    applyThemeMode(wrap.firstElementChild);
+    await new c.Popup(wrap, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, large: true, allowVerticalScrolling: true, leftAlign: true }).show();
 }
 
 let remindedFor = null;
-
-function vectorStatusText() {
-    const s = getSettings();
-    if (!s.recallEnabled) return '회상 꺼짐';
-    if (!s.vectorEnabled) return '키워드 검색만 사용';
-    if (syncing) return '색인 맞추는 중';
-    if (syncState.chatId !== ctx().getCurrentChatId()) return '색인 확인 전';
-    if (syncState.error) return `<span class="lm-warn" title="${esc(syncState.error)}">벡터 오류, 키워드 검색으로 대체 중</span>`;
-    return `벡터 색인 ${syncState.indexed.toLocaleString()}개`;
-}
 
 function updateStatus() {
     const el = document.getElementById('lm_status');
     if (!el) return;
     if (!hasChat()) {
         el.innerHTML = '<div class="lm-empty">채팅을 열면 코끼리가 이 채팅에서 기억한 것들을 보여줄게요.</div>';
+        const sub = document.getElementById('lm_head_sub');
+        if (sub) sub.textContent = '코끼리는 잊지 않아요';
+        renderLive();
         const badge = document.getElementById('lm_badge');
         if (badge) badge.hidden = true;
         return;
@@ -3530,8 +3829,10 @@ function updateStatus() {
         <span>보관 ${memory?.archive.length ?? 0}개</span>
         ${memory?.timeline.some(n => n.stale) ? `<span class="lm-warn">다시 요약 필요 ${memory.timeline.filter(n => n.stale).length}개</span>` : ''}
         ${memory?.timeline.some(n => n.from === -1) ? '<span>이전 채팅에서 이어받음</span>' : ''}
-        <span>${vectorStatusText()}</span>
       </div>`;
+    const sub = document.getElementById('lm_head_sub');
+    if (sub) sub.textContent = cursor >= 0 ? `메시지 ${total.toLocaleString()}개 중 #${cursor.toLocaleString()}까지 기억` : `메시지 ${total.toLocaleString()}개 · 아직 기억 없음`;
+    renderLive();
     const badge = document.getElementById('lm_badge');
     if (badge) {
         badge.hidden = count <= 0;
@@ -3588,14 +3889,16 @@ function nodeCard(node) {
       ${node.condensed ? `<span class="lm-range">${node.condensed}회 압축됨</span>` : ''}
       ${node.stale ? `<button type="button" class="lm-stale" data-resum="${esc(node.id)}" title="원본이 바뀌었어요. 눌러서 이 구간만 다시 요약해요">${icon('rotate')}다시 요약</button>` : ''}
       <span class="lm-spacer"></span>
-      ${impControl(node.importance)}
-      ${iconToggle('lm-pin', 'fa-thumbtack', '고정 (자동 압축에서 제외)', node.pinned)}
-      ${deleteButton()}
+      <span class="lm-ctl">
+        ${impControl(node.importance)}
+        ${iconToggle('lm-pin', 'fa-thumbtack', '고정 (자동 압축에서 제외)', node.pinned)}
+        ${deleteButton()}
+      </span>
     </div>
-    <input class="text_pole lm-title" value="${esc(node.title)}" aria-label="제목">
-    <input class="text_pole lm-when" value="${esc(node.when || '')}" placeholder="작중 시간 (예: 3일째 저녁)" aria-label="작중 시간">
-    <textarea class="text_pole lm-text" rows="4" aria-label="내용">${esc(node.text)}</textarea>
-    <input class="text_pole lm-kw" value="${esc((node.keywords || []).join(', '))}" placeholder="회상 키워드, 쉼표로 구분" aria-label="회상 키워드">
+    <input class="text_pole lm-title lm-quiet" value="${esc(node.title)}" placeholder="제목" aria-label="제목">
+    <label class="lm-quiet-row"><span class="lm-quiet-k">작중 시간</span><input class="text_pole lm-when lm-quiet" value="${esc(node.when || '')}" placeholder="예: 3일째 저녁" aria-label="작중 시간"></label>
+    <textarea class="text_pole lm-text lm-quiet" rows="4" aria-label="내용">${esc(node.text)}</textarea>
+    <label class="lm-quiet-row"><span class="lm-quiet-k">키워드</span><input class="text_pole lm-kw lm-quiet" value="${esc((node.keywords || []).join(', '))}" placeholder="회상용, 쉼표로 구분" aria-label="회상 키워드"></label>
   </div>
 </div>`;
 }
@@ -3605,16 +3908,18 @@ function entryRow(entry) {
 <div class="lm-entry lm-item" data-entry-id="${esc(entry.id)}">
   <div class="lm-entry-top">
     ${selBox()}
-    <input class="text_pole lm-key" value="${esc(entry.key)}" placeholder="이름 또는 항목" aria-label="항목">
-    <select class="text_pole lm-cat" aria-label="분류">${selectOptions(CATEGORIES, entry.cat)}</select>
-    ${impControl(entry.importance)}
-    ${iconToggle('lm-closed', 'fa-check', '해결됨', entry.status === 'closed')}
-    ${iconToggle('lm-pin', 'fa-thumbtack', '고정', entry.pinned)}
-    ${deleteButton()}
+    <input class="text_pole lm-key lm-quiet lm-title" value="${esc(entry.key)}" placeholder="이름 또는 항목" aria-label="항목">
+    <select class="text_pole lm-cat lm-quiet-select" aria-label="분류">${selectOptions(CATEGORIES, entry.cat)}</select>
+    <span class="lm-ctl">
+      ${impControl(entry.importance)}
+      ${iconToggle('lm-closed', 'fa-check', '해결됨', entry.status === 'closed')}
+      ${iconToggle('lm-pin', 'fa-thumbtack', '고정', entry.pinned)}
+      ${deleteButton()}
+    </span>
   </div>
-  <textarea class="text_pole lm-val" rows="2" placeholder="내용" aria-label="내용">${esc(entry.value)}</textarea>
-  ${['fact', 'note', 'item'].includes(entry.cat) ? `<input class="text_pole lm-known" value="${esc((entry.knownBy || []).join(', '))}" placeholder="이 사실을 아는 인물 (쉼표로 구분, 비우면 모두 앎)" aria-label="아는 인물">` : ''}
-  ${entry.cat === 'thread' ? `<input class="text_pole lm-due" value="${esc(entry.due || '')}" placeholder="작중 기한 (예: 보름달 밤까지)" aria-label="기한">` : ''}
+  <textarea class="text_pole lm-val lm-quiet" rows="2" placeholder="내용" aria-label="내용">${esc(entry.value)}</textarea>
+  ${['fact', 'note', 'item'].includes(entry.cat) ? `<input class="text_pole lm-known lm-quiet" value="${esc((entry.knownBy || []).join(', '))}" placeholder="아는 인물 · 쉼표로 구분, 비우면 모두 앎" aria-label="아는 인물">` : ''}
+  ${entry.cat === 'thread' ? `<input class="text_pole lm-due lm-quiet" value="${esc(entry.due || '')}" placeholder="작중 기한 (예: 보름달 밤까지)" aria-label="기한">` : ''}
 </div>`;
 }
 
@@ -3657,12 +3962,19 @@ function managerHtml(memory) {
   <div class="lm-manager-head">
     <h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>코끼리의 기억장</h3>
     <div class="lm-manager-tools">
-      ${tool('lm_export', 'export', '내보내기')}
-      ${tool('lm_import', 'import', '가져오기')}
       ${tool('lm_backups', 'backup', '백업')}
-      ${tool('lm_handoff_save', 'handoff', '새 채팅으로 이어가기', '', '이 기억을 저장해 두고, 같은 캐릭터로 새 채팅을 열 때 이어받아요')}
-      ${tool('lm_handoff_load', 'receive', '이어받기', '', '저장해 둔 이전 채팅의 기억을 이 채팅으로 가져와요')}
-      ${tool('lm_reset', 'reset', '초기화', 'lm-toolbtn-danger')}
+      <details class="lm-menu">
+        <summary class="lm-toolbtn" aria-label="더보기"><span class="lm-dots" aria-hidden="true">⋯</span><span>더보기</span></summary>
+        <div class="lm-menu-list" role="menu">
+          ${tool('lm_export', 'export', '내보내기')}
+          ${tool('lm_import', 'import', '가져오기')}
+          <hr>
+          ${tool('lm_handoff_save', 'handoff', '새 채팅으로 이어가기', '', '이 기억을 저장해 두고, 같은 캐릭터로 새 채팅을 열 때 이어받아요')}
+          ${tool('lm_handoff_load', 'receive', '이전 채팅 기억 이어받기', '', '저장해 둔 이전 채팅의 기억을 이 채팅으로 가져와요')}
+          <hr>
+          ${tool('lm_reset', 'reset', '이 채팅 기억 초기화', 'lm-toolbtn-danger')}
+        </div>
+      </details>
       <input type="file" id="lm_import_file" accept=".json,application/json" hidden>
     </div>
   </div>
@@ -3732,7 +4044,7 @@ function managerHtml(memory) {
   <section class="lm-pane" data-lm-pane="timeline" role="tabpanel">
     <div class="lm-saga">
       <div class="lm-field-text"><span class="lm-field-label">지금까지의 이야기</span><span class="lm-hint">오래된 챕터가 합쳐지면 여기에 쌓여요</span></div>
-      <textarea class="text_pole" id="lm_saga" rows="6" placeholder="아직 비어 있어요.">${esc(memory.saga.text)}</textarea>
+      <textarea class="text_pole" id="lm_saga" rows="${memory.saga.text ? 6 : 2}" placeholder="아직 비어 있어요.">${esc(memory.saga.text)}</textarea>
     </div>
     ${memory.timeline.length ? bulkBar('timeline', `<label class="lm-restore" title="지운 기억에 들어 있던 메시지를 숨김 해제해서 다시 AI에게 보여줘요. 가장 최근 기억을 지우면 그 구간을 다시 압축할 수 있어요"><input type="checkbox" id="lm_restore_src"><span>원본 다시 보이기</span></label>`) : ''}
     <div id="lm_timeline" class="lm-timeline lm-list">${memory.timeline.map(nodeCard).join('') || '<div class="lm-empty">아직 기억한 이야기가 없어요. 패널에서 압축을 누르면 여기에 차곡차곡 쌓여요.</div>'}</div>
@@ -3902,6 +4214,7 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
         const items = visibleItems(pane);
         const picked = items.filter(el => el.querySelector('.lm-sel')?.checked);
         bar.querySelector('.lm-bulk-count').textContent = `${picked.length}개 선택`;
+        bar.classList.toggle('lm-has-sel', picked.length > 0);
         bar.querySelector('.lm-bulk-del').disabled = picked.length === 0;
         const all = bar.querySelector('.lm-sel-all');
         all.checked = items.length > 0 && picked.length === items.length;
@@ -3985,6 +4298,8 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
             });
             return;
         }
+        const menu = root.querySelector('.lm-menu');
+        if (menu?.open && !event.target.closest('.lm-menu > summary')) menu.open = false;
         const tool = event.target.closest('#lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html');
         if (!tool) return;
         switch (tool.id) {
@@ -4193,10 +4508,10 @@ function registerCommands() {
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lm-reindex',
         callback: async () => {
-            await syncVectors({ notify: true });
+            await syncVectors({ notify: true, full: true });
             return '';
         },
-        helpString: '<div>코끼리를 생각하지마: 벡터 검색 색인을 현재 기억에 맞춥니다.</div>',
+        helpString: '<div>코끼리를 생각하지마: 숨긴 메시지까지 포함해 검색 색인을 맞춥니다.</div>',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lm-ask',
@@ -4225,10 +4540,7 @@ function registerCommands() {
         callback: (_args, value) => {
             const s = getSettings();
             const v = String(value || '').trim().toLowerCase();
-            s.autoCompress = v === 'on' ? true : v === 'off' ? false : !s.autoCompress;
-            ctx().saveSettingsDebounced();
-            syncSettingInputs();
-            toastr.info(`자동 압축을 ${s.autoCompress ? '켰어요' : '껐어요'}.`, APP_NAME);
+            setAutoCompress(v === 'on' ? true : v === 'off' ? false : !s.autoCompress);
             return s.autoCompress ? 'on' : 'off';
         },
         unnamedArgumentList: [
@@ -4264,6 +4576,16 @@ function registerCommands() {
 
 // ---------------------------------------------------------------- wand menu
 
+function setAutoCompress(on) {
+    const s = getSettings();
+    s.autoCompress = !!on;
+    ctx().saveSettingsDebounced();
+    syncSettingInputs();
+    renderLive();
+    toastr.info(`자동 압축을 ${s.autoCompress ? `켰어요. 미요약이 ${s.autoCompressAt}개 쌓이면 알아서 압축해요` : '껐어요'}.`, APP_NAME);
+    if (s.autoCompress) maybeAutoCompress();
+}
+
 function addWandMenu() {
     const menu = document.getElementById('extensionsMenu');
     if (!menu || document.getElementById('lm_wand_compress')) return;
@@ -4279,13 +4601,7 @@ function addWandMenu() {
     make('lm_wand_compress', 'fa-feather-pointed', '코끼리: 기억 압축', () => runCompress({ all: false }));
     make('lm_wand_manager', 'fa-book-open', '코끼리: 기억장 열기', () => openManager());
     make('lm_wand_ask', 'fa-circle-question', '코끼리에게 묻기', () => openAsk());
-    make('lm_wand_auto', 'fa-robot', '코끼리: 자동 압축 켜기/끄기', () => {
-        const s = getSettings();
-        s.autoCompress = !s.autoCompress;
-        ctx().saveSettingsDebounced();
-        syncSettingInputs();
-        toastr.info(`자동 압축을 ${s.autoCompress ? '켰어요' : '껐어요'}.`, APP_NAME);
-    });
+    make('lm_wand_auto', 'fa-robot', '코끼리: 자동 압축 켜기/끄기', () => setAutoCompress(!getSettings().autoCompress));
 }
 
 // ---------------------------------------------------------------- chat events
@@ -4351,5 +4667,9 @@ async function onMessageDeleted() {
     eventSource.on(event_types.MORE_MESSAGES_LOADED, () => decorateAll());
     document.addEventListener('click', onDocumentClick, true);
     eventSource.on(event_types.MESSAGE_SENT, updateStatus);
+    // Keeps the "n분 전" labels in the status panel fresh without touching anything else.
+    setInterval(() => {
+        if (document.getElementById('lm_fold')?.closest('.inline-drawer-content')?.offsetParent) renderLive();
+    }, 30000);
     console.log(LOG_PREFIX, 'loaded');
 })();
