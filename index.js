@@ -32,6 +32,7 @@ const DETAIL = {
 };
 
 const CATEGORIES = {
+    note: '꼭 기억할 것',
     character: '인물',
     relation: '관계',
     thread: '진행 중인 일/약속',
@@ -41,6 +42,7 @@ const CATEGORIES = {
 };
 
 const CATEGORY_EN = {
+    note: 'Must-remember note',
     character: 'Character',
     relation: 'Relationship',
     thread: 'Thread',
@@ -129,6 +131,17 @@ const defaultSettings = Object.freeze({
     maxUndo: 10,
     extraRules: '',
     uiSettingsOpen: false,
+    previewBeforeSave: false,
+    autoCompress: false,
+    autoCompressAt: 40,
+    autoForgetDeleted: true,
+    checkContradictions: false,
+    liveStateUpdate: false,
+    queryExpansion: false,
+    expansionTimeoutMs: 15000,
+    autoBackupEvery: 10,
+    backupKeep: 5,
+    injectPreset: 'stable',
 });
 
 // ---------------------------------------------------------------- settings
@@ -168,6 +181,8 @@ function emptyMemory() {
         events: [],
         hiddenRanges: [],
         history: [],
+        tagVersion: 1,
+        opsSinceBackup: 0,
     };
 }
 
@@ -186,6 +201,7 @@ function getMemory(create = true) {
         chatMetadata[META_KEY] = memory;
     }
     const base = emptyMemory();
+    if (!Object.hasOwn(memory, 'tagVersion')) memory.tagVersion = 0;
     for (const key of Object.keys(base)) {
         if (!Object.hasOwn(memory, key)) memory[key] = base[key];
     }
@@ -274,6 +290,169 @@ function setHidden(indices, hide) {
     }
 }
 
+// ---------------------------------------------------------------- message tags
+// Every summarized message carries extra.lm_owner (the memory node covering it), so
+// deletions and edits can be traced even after message indices shift.
+
+const SAGA_OWNER = 'saga';
+
+function rangeIndices(from, to) {
+    const out = [];
+    for (let i = from; i <= to; i++) out.push(i);
+    return out;
+}
+
+function tagMessages(indices, ownerId) {
+    const { chat } = ctx();
+    for (const i of indices) {
+        const msg = chat[i];
+        if (!msg) continue;
+        msg.extra = msg.extra || {};
+        msg.extra.lm_owner = ownerId;
+    }
+}
+
+function retagOwners(fromIds, toId) {
+    const set = new Set(fromIds);
+    for (const msg of ctx().chat) {
+        if (msg?.extra?.lm_owner && set.has(msg.extra.lm_owner)) msg.extra.lm_owner = toId;
+    }
+}
+
+function clearTags() {
+    for (const msg of ctx().chat) {
+        if (!msg?.extra) continue;
+        delete msg.extra.lm_owner;
+        delete msg.extra.lm_hidden;
+    }
+}
+
+// Rebuilds tags from stored ranges (migration, undo, import).
+function retagFromRanges(memory) {
+    const { chat } = ctx();
+    const last = chat.length - 1;
+    for (const msg of chat) {
+        if (msg?.extra) delete msg.extra.lm_owner;
+    }
+    if (memory.saga.text && memory.saga.coversTo >= 0) {
+        tagMessages(rangeIndices(0, Math.min(memory.saga.coversTo, last)), SAGA_OWNER);
+    }
+    for (const node of memory.timeline) {
+        if (node.from < 0) continue;
+        const to = Math.min(node.to, last);
+        tagMessages(rangeIndices(node.from, to), node.id);
+        node.msgCount = Math.max(0, to - node.from + 1);
+    }
+    const hidden = new Set(rangesToList(memory.hiddenRanges));
+    chat.forEach((msg, i) => {
+        if (!msg) return;
+        if (hidden.has(i)) {
+            msg.extra = msg.extra || {};
+            msg.extra.lm_hidden = true;
+        } else if (msg.extra) {
+            delete msg.extra.lm_hidden;
+        }
+    });
+    memory.tagVersion = 1;
+}
+
+// After messages are deleted: drop memories whose messages are all gone, flag partly
+// deleted ones for re-summarizing, and recompute ranges from the surviving tags.
+async function reconcileAfterDeletion() {
+    const memory = getMemory(false);
+    if (!memory) return;
+    const s = getSettings();
+    const { chat } = ctx();
+    const owned = new Map();
+    const hidden = [];
+    chat.forEach((msg, i) => {
+        const owner = msg?.extra?.lm_owner;
+        if (owner) {
+            if (!owned.has(owner)) owned.set(owner, []);
+            owned.get(owner).push(i);
+        }
+        if (msg?.extra?.lm_hidden && msg.is_system) hidden.push(i);
+    });
+    let removed = 0;
+    let staled = 0;
+    const removedIds = new Set();
+    const keep = [];
+    for (const node of memory.timeline) {
+        if (node.from < 0) {
+            keep.push(node);
+            continue;
+        }
+        const list = owned.get(node.id);
+        if (!list?.length) {
+            if (s.autoForgetDeleted) {
+                removed++;
+                removedIds.add(node.id);
+                continue;
+            }
+            if (!node.stale) staled++;
+            node.stale = true;
+            node.from = -2;
+            node.to = -2;
+            keep.push(node);
+            continue;
+        }
+        if (node.msgCount && list.length < node.msgCount && !node.stale) {
+            node.stale = true;
+            staled++;
+        }
+        node.from = list[0];
+        node.to = list[list.length - 1];
+        node.msgCount = list.length;
+        keep.push(node);
+    }
+    memory.timeline = keep;
+    if (memory.saga.text && memory.saga.coversTo >= 0) {
+        const sagaList = owned.get(SAGA_OWNER);
+        if (sagaList?.length) {
+            memory.saga.coversTo = sagaList[sagaList.length - 1];
+        } else if (s.autoForgetDeleted) {
+            memory.saga = { text: '', coversTo: -1 };
+            removedIds.add(SAGA_OWNER);
+            removed++;
+        }
+    }
+    if (removedIds.size) {
+        memory.events = memory.events.filter(e => !removedIds.has(e.episodeId));
+        memory.archive = memory.archive.filter(a => !removedIds.has(a.ownerId));
+    }
+    const byId = new Map(memory.timeline.map(n => [n.id, n]));
+    for (const e of memory.events) {
+        const n = byId.get(e.episodeId);
+        if (n && n.from >= 0) {
+            e.from = n.from;
+            e.to = n.to;
+        }
+    }
+    let maxOwned = -1;
+    for (const list of owned.values()) maxOwned = Math.max(maxOwned, list[list.length - 1]);
+    memory.cursor = maxOwned >= 0 ? maxOwned : Math.min(memory.cursor, chat.length - 1, removed ? -1 : memory.cursor);
+    memory.hiddenRanges = listToRanges(hidden);
+    await ctx().saveMetadata();
+    if (removed) toastr.info(`삭제된 메시지에 대한 기억 ${removed}개를 지웠어요.`, APP_NAME);
+    if (staled) toastr.info(`메시지가 일부 지워진 기억 ${staled}개에 "다시 요약" 표시를 했어요.`, APP_NAME);
+    refreshInjection();
+    updateStatus();
+    if (removed || staled) syncAfter();
+}
+
+function onMessageEdited(id) {
+    const memory = getMemory(false);
+    if (!memory) return;
+    const owner = ctx().chat[Number(id)]?.extra?.lm_owner;
+    if (!owner) return;
+    const node = memory.timeline.find(n => n.id === owner);
+    if (!node || node.stale) return;
+    node.stale = true;
+    ctx().saveMetadataDebounced?.();
+    updateStatus();
+    toastr.info('요약된 메시지가 바뀌었어요. 기억장에서 그 구간을 다시 요약할 수 있어요.', APP_NAME);
+}
+
 // ---------------------------------------------------------------- text helpers
 
 function stripMessage(text) {
@@ -338,7 +517,7 @@ function parseNodeBlock(block) {
     if (!summary) {
         summary = block
             .split('\n')
-            .filter(line => !/^\s*\**(title|importance|keywords)\**\s*[:：]/i.test(line))
+            .filter(line => !/^\s*\**(title|when|importance|keywords)\**\s*[:：]/i.test(line))
             .join('\n')
             .trim();
     }
@@ -349,6 +528,7 @@ function parseNodeBlock(block) {
         .filter(k => k.length >= 2)
         .slice(0, 16);
     return {
+        when: get('when').replace(/^(unknown|none|n\/a|-)$/i, '').slice(0, 80),
         title: get('title').slice(0, 120) || summary.slice(0, 40),
         importance: clampInt(get('importance').replace(/[^0-9]/g, ''), 1, 5, 3),
         keywords,
@@ -428,6 +608,7 @@ function ledgerText(ledger, { includeClosed = false } = {}) {
     ].filter(Boolean);
     if (sceneBits.length) lines.push(`[Current situation]\n${sceneBits.join(' | ')}`);
     const labels = {
+        note: 'Must-remember notes (pinned by the user)',
         character: 'Characters',
         relation: 'Relationships',
         thread: 'Open threads, goals & promises',
@@ -440,15 +621,27 @@ function ledgerText(ledger, { includeClosed = false } = {}) {
             .filter(e => e.cat === cat && (includeClosed || e.status !== 'closed'))
             .sort((a, b) => (b.pinned - a.pinned) || (b.importance - a.importance));
         if (!entries.length) continue;
-        lines.push(`[${labels[cat]}]\n${entries.map(e => `- ${e.key}: ${e.value}${e.status === 'closed' ? ' (resolved)' : ''}`).join('\n')}`);
+        lines.push(`[${labels[cat]}]\n${entries.map(e => {
+            const extra = [];
+            if (e.knownBy?.length) extra.push(`known only by: ${e.knownBy.join(', ')}`);
+            if (e.due) extra.push(`due: ${e.due}`);
+            if (e.status === 'closed') extra.push('resolved');
+            return `- ${e.key}: ${e.value}${extra.length ? ` (${extra.join('; ')})` : ''}`;
+        }).join('\n')}`);
     }
     return lines.join('\n\n');
+}
+
+function rangeLabel(from, to) {
+    if (from === -1) return 'from an earlier chat';
+    if (from < 0) return 'original messages deleted';
+    return from === to ? `message #${from}` : `messages #${from}-#${to}`;
 }
 
 function timelineText(memory, { lastN = null } = {}) {
     const nodes = lastN ? memory.timeline.slice(-lastN) : memory.timeline;
     return nodes
-        .map(n => `### ${n.tier === 'chapter' ? 'Chapter' : 'Episode'}: ${n.title} (messages #${n.from}-#${n.to})\n${n.text}`)
+        .map(n => `### ${n.tier === 'chapter' ? 'Chapter' : 'Episode'}: ${n.title} (${rangeLabel(n.from, n.to)}${n.when ? `; in-story: ${n.when}` : ''})\n${n.text}`)
         .join('\n\n');
 }
 
@@ -465,7 +658,7 @@ function buildMemoryText(memory) {
     const covered = memory.cursor >= 0 ? `messages #0-#${memory.cursor}` : 'earlier messages';
     return [
         '<story_memory>',
-        `This is the authoritative record of the earlier part of this story (${covered}), compressed because the original messages are no longer shown. Treat everything here as established canon of this story: keep names, facts, relationships, injuries, promises and open threads consistent with it. Older events are condensed; the most recent messages continue directly after the last timeline entry. Use it silently; do not repeat or summarize it in replies.`,
+        `This is the authoritative record of the earlier part of this story (${covered}), compressed because the original messages are no longer shown. Treat everything here as established canon of this story: keep names, facts, relationships, injuries, promises and open threads consistent with it. Older events are condensed; the most recent messages continue directly after the last timeline entry. Characters only know secrets they are listed as knowing. Use it silently; do not repeat or summarize it in replies.`,
         '',
         sections.join('\n\n'),
         '</story_memory>',
@@ -492,11 +685,12 @@ function buildAnchorText(memory) {
 
 // ---------------------------------------------------------------- archive
 
-function archiveNode(memory, node, kind = 'timeline') {
+function archiveNode(memory, node, kind = 'timeline', ownerId = null) {
     if (!node?.text) return;
     if (memory.archive.some(a => a.id === node.id)) return;
     memory.archive.push({
         id: node.id,
+        ownerId,
         kind,
         title: node.title,
         text: node.text,
@@ -540,7 +734,7 @@ function buildCorpus(memory) {
     const items = [];
     for (const e of memory.events || []) {
         const text = eventEmbedText(e);
-        items.push({ hash: hashString(`ev|${e.id}|${text}`), kind: 'event', text, display: e.text, importance: e.importance || 3, from: e.from, to: e.to });
+        items.push({ hash: hashString(`ev|${e.id}|${text}`), kind: 'event', text, display: e.text, importance: e.importance || 3, from: e.from, to: e.to, when: e.when || '' });
     }
     for (const a of memory.archive || []) {
         const text = `${a.title}: ${a.text}${a.keywords?.length ? ` | Keywords: ${a.keywords.join(', ')}` : ''}`;
@@ -773,22 +967,25 @@ function recallQuery(recentChat) {
 async function hybridRecall(memory, query, { useDense = true } = {}) {
     const s = getSettings();
     const corpus = buildCorpus(memory);
-    if (!corpus.length || !query.trim()) return { results: [], dense: false };
+    const queries = (Array.isArray(query) ? query : [query]).map(q => String(q || '').trim()).filter(Boolean);
+    if (!corpus.length || !queries.length) return { results: [], dense: false };
     const pool = Math.max(s.recallTopK * 4, 20);
     const byHash = new Map(corpus.map(x => [x.hash, x]));
     const lists = [];
     let dense = false;
-    if (useDense && s.vectorEnabled) {
-        try {
-            const hashes = await denseSearch(query, pool);
-            const items = hashes.map(h => byHash.get(h)).filter(Boolean);
-            if (items.length) lists.push(items);
-            dense = true;
-        } catch (err) {
-            console.warn(LOG_PREFIX, 'dense search skipped', err);
+    for (const q of queries) {
+        if (useDense && s.vectorEnabled) {
+            try {
+                const hashes = await denseSearch(q, pool);
+                const items = hashes.map(h => byHash.get(h)).filter(Boolean);
+                if (items.length) lists.push(items);
+                dense = true;
+            } catch (err) {
+                console.warn(LOG_PREFIX, 'dense search skipped', err);
+            }
         }
+        lists.push(bm25Search(corpus, q, pool));
     }
-    lists.push(bm25Search(corpus, query, pool));
 
     // Reciprocal rank fusion, then rerank by relevance, importance and recency.
     const fused = new Map();
@@ -832,8 +1029,8 @@ function recallText(results) {
     if (!results.length) return '';
     const label = { event: 'event', archive: 'earlier note', raw: 'original dialogue' };
     const lines = results.map(({ item }) => {
-        const where = item.from === item.to || item.to === undefined ? `#${item.from}` : `#${item.from}-#${item.to}`;
-        return `- [${label[item.kind]}, around message ${where}] ${item.display.replace(/\n+/g, ' / ')}`;
+        const where = rangeLabel(item.from ?? -2, item.to ?? item.from ?? -2);
+        return `- [${label[item.kind]}, ${where}${item.when ? `, in-story ${item.when}` : ''}] ${item.display.replace(/\n+/g, ' / ')}`;
     });
     return [
         '<recalled_memories>',
@@ -864,13 +1061,45 @@ function refreshInjection() {
 
 let lastRecall = [];
 
+function withTimeout(promise, ms) {
+    let timer;
+    return Promise.race([
+        promise.finally(() => clearTimeout(timer)),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), ms); }),
+    ]);
+}
+
+// A small model rewrites the latest turn into concrete search queries so indirect
+// references ("that time at the river") still find the right memories.
+async function expandQueries(memory, recentChat) {
+    const s = getSettings();
+    if (!s.queryExpansion) return [];
+    const msgs = (recentChat || []).filter(m => m && !m.is_system).slice(-3)
+        .map(m => `${m.name || ''}: ${stripMessage(m.mes).slice(0, 1200)}`).join('\n\n');
+    if (!msgs.trim()) return [];
+    const terms = memory.ledger.entries.slice(0, 60).map(e => e.key).join(', ');
+    const system = 'You help a memory system find earlier moments of a long story. Given the latest messages, write 2-4 short search queries (names, places, objects, earlier events) for the past moments needed to write the next reply well. Turn vague references such as "that time" or "what you promised" into concrete terms when the known terms allow it. Write the queries in the same language as the messages. Reply with only: <queries>one query per line</queries>';
+    const user = `${terms ? `<known_terms>${terms}</known_terms>\n\n` : ''}<latest_messages>\n${msgs}\n</latest_messages>`;
+    const out = await withTimeout(callModel(system, user, { retries: 0 }), s.expansionTimeoutMs);
+    return (extractTag(out, 'queries') || '').split('\n')
+        .map(q => q.replace(/^[-*\d.)\s]+/, '').trim())
+        .filter(q => q.length >= 2)
+        .slice(0, 4);
+}
+
 async function refreshRecall(recentChat) {
     const s = getSettings();
     const { setExtensionPrompt } = ctx();
     const memory = s.enabled && s.recallEnabled ? getMemory(false) : null;
     let text = '';
     if (memory) {
-        const { results } = await hybridRecall(memory, recallQuery(recentChat));
+        const queries = [recallQuery(recentChat)];
+        try {
+            queries.push(...await expandQueries(memory, recentChat));
+        } catch (err) {
+            console.warn(LOG_PREFIX, 'query expansion skipped', err);
+        }
+        const { results } = await hybridRecall(memory, queries);
         lastRecall = results;
         text = recallText(results);
     }
@@ -892,14 +1121,15 @@ globalThis.longMemoryInterceptor = async function (chat, _contextSize, _abort, t
 let busy = false;
 let abortController = null;
 
-async function callModel(systemText, userText) {
+async function callModel(systemText, userText, { retries = null } = {}) {
     const s = getSettings();
     const c = ctx();
+    const maxRetries = retries ?? s.retries;
     const messages = s.systemAsUser
         ? [{ role: 'user', content: `${systemText}\n\n${userText}` }]
         : [{ role: 'system', content: systemText }, { role: 'user', content: userText }];
     let lastError = null;
-    for (let attempt = 0; attempt <= s.retries; attempt++) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
         if (abortController?.signal.aborted) throw new Error('aborted');
         try {
             let raw;
@@ -926,7 +1156,7 @@ async function callModel(systemText, userText) {
             lastError = err;
             if (abortController?.signal.aborted) throw new Error('aborted');
             console.warn(LOG_PREFIX, `request failed (attempt ${attempt + 1})`, err);
-            if (attempt < s.retries) await sleep(1500 * (attempt + 1));
+            if (attempt < maxRetries) await sleep(1500 * (attempt + 1));
         }
     }
     throw lastError ?? new Error('request failed');
@@ -966,7 +1196,7 @@ const EVENTS_FORMAT = `
 [JSON array of the distinct meaningful events in this transcript; can be empty]
 </events>
 
-Each event is one retrievable memory: {"text":"<1-3 sentences: what happened, including cause and result>","characters":["..."],"place":"...","items":["..."],"keywords":["..."],"importance":<1-5>}
+Each event is one retrievable memory: {"text":"<1-3 sentences: what happened, including cause and result>","when":"<in-story time if known>","characters":["..."],"place":"...","items":["..."],"keywords":["..."],"importance":<1-5>}
 Extract as many events as actually happened (zero for pure small talk, several for eventful scenes). Make each event self-contained: name the characters instead of using pronouns, so it is understandable on its own months later.
 `;
 
@@ -975,10 +1205,11 @@ function summarySystemPrompt() {
     return `${baseArchivistRules()}
 - Length: ${DETAIL[s.detail] ?? DETAIL.standard}
 
-Reply with exactly these two blocks and nothing else:
+Reply with exactly these blocks and nothing else:
 
 <episode>
 title: <short title, at most 10 words>
+when: <in-story date and time span of this transcript if it can be inferred (e.g. "Day 3, evening" or "Spring, year 2"); leave empty if unknown>
 importance: <1-5. 5 = story-defining (confession, death, betrayal, major reveal, lasting vow); 3 = meaningful development; 1 = filler or small talk>
 keywords: <5-12 comma-separated recall cues: names, places, objects, unique terms>
 summary:
@@ -992,6 +1223,7 @@ ${s.eventsEnabled ? EVENTS_FORMAT : ''}
 The ledger is a structured fact sheet (shown as <current_ledger>). Operations:
 {"op":"set","cat":"<category>","key":"<entity or short label>","value":"<concise current fact>","importance":<1-5>}
   Creates or replaces the entry with this cat + key. Write the complete updated value, merging old and new information.
+  Optional fields: "knownBy":["names"] for secrets and hidden facts (exactly who knows it; update it whenever someone learns the truth), "due":"<in-story deadline>" for threads with a deadline.
 {"op":"close","cat":"thread","key":"<key>"}  Marks a thread or promise as resolved.
 {"op":"delete","cat":"<category>","key":"<key>"}  Removes an entry that is no longer true or relevant.
 {"op":"scene","time":"...","place":"...","present":"...","mood":"..."}  The situation at the END of this transcript.
@@ -1000,9 +1232,10 @@ Categories:
 - character: appearance, personality, abilities, role and current condition of each character (including the user's character)
 - relation: how one character feels about or relates to another; key format "A -> B"
 - thread: open plot threads, goals, plans, promises, debts, deadlines, pending questions
-- fact: world rules, established facts, secrets and who knows them
+- fact: world rules, established facts, secrets (always give knownBy for secrets)
 - item: significant objects, who holds them, why they matter
 - divergence: only for fanfiction; where this story departs from the original work's canon
+Entries in the "note" category are pinned by the user: never change or delete them.
 Reuse existing keys exactly when updating. Only emit operations for things that are new or changed. If nothing changed, output [].${extraRules()}`;
 }
 
@@ -1039,16 +1272,21 @@ function applyLedgerOps(memory, ops, atIndex) {
         }
         const cat = String(op.cat || '').toLowerCase();
         const key = String(op.key || '').trim();
-        if (!CATEGORIES[cat] || !key) continue;
+        if (!CATEGORIES[cat] || cat === 'note' || !key) continue;
         const existing = find(cat, key);
+        const knownBy = Array.isArray(op.knownBy) ? toList(op.knownBy) : null;
+        const due = typeof op.due === 'string' ? op.due.trim().slice(0, 80) : null;
         if (kind === 'set') {
             const value = String(op.value ?? '').trim();
             if (!value) continue;
             if (existing) {
+                if (existing.pinned) continue;
                 existing.value = value;
                 existing.importance = clampInt(op.importance, 1, 5, existing.importance);
                 existing.updatedAt = atIndex;
                 existing.status = 'open';
+                if (knownBy) existing.knownBy = knownBy;
+                if (due !== null) existing.due = due;
             } else {
                 entries.push({
                     id: newId(),
@@ -1059,6 +1297,8 @@ function applyLedgerOps(memory, ops, atIndex) {
                     pinned: false,
                     status: 'open',
                     updatedAt: atIndex,
+                    knownBy: knownBy || [],
+                    due: due || '',
                 });
             }
             applied++;
@@ -1122,6 +1362,7 @@ function parseEvents(block) {
             place: String(e.place || '').trim(),
             items: toList(e.items),
             keywords: toList(e.keywords),
+            when: String(e.when || '').trim().slice(0, 80),
             importance: clampInt(e.importance, 1, 5, 3),
         }));
 }
@@ -1188,16 +1429,16 @@ function stillSameChat(chatId) {
     return ctx().getCurrentChatId() === chatId;
 }
 
-async function runCompress({ all = false } = {}) {
-    if (busy) return toastr.warning('이미 작업 중입니다.');
-    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+async function runCompress({ all = false, auto = false } = {}) {
+    if (busy) return auto ? undefined : toastr.warning('이미 작업 중입니다.');
+    if (!hasChat()) return auto ? undefined : toastr.warning('채팅을 먼저 열어주세요.');
     const s = getSettings();
     const { start, end, count } = unsummarizedRange();
-    if (count <= 0) return toastr.info(`압축할 메시지가 없습니다. (최근 ${s.keepRecent}개는 원본 유지)`);
+    if (count <= 0) return auto ? undefined : toastr.info(`압축할 메시지가 없습니다. (최근 ${s.keepRecent}개는 원본 유지)`);
 
     let batches = planBatches(start, end);
-    if (!batches.length) return toastr.info('요약할 내용이 없습니다.');
-    if (!all) batches = batches.slice(0, 1);
+    if (!batches.length) return auto ? undefined : toastr.info('요약할 내용이 없습니다.');
+    if (!all || auto) batches = batches.slice(0, 1);
     if (batches.length > 1) {
         const ok = await ctx().Popup.show.confirm(
             '전체 압축',
@@ -1216,7 +1457,23 @@ async function runCompress({ all = false } = {}) {
             if (abortController.signal.aborted || !stillSameChat(chatId)) break;
             setProgress(`요약 중 ${done + 1}/${batches.length} (#${batch.from}~#${batch.to})`);
             const memory = getMemory(true);
-            const { node, ops, events } = await summarizeBatch(memory, batch);
+            let summary = await summarizeBatch(memory, batch);
+            if (s.previewBeforeSave && !auto) {
+                let stop = false;
+                for (;;) {
+                    const choice = await previewEpisode(summary, batch);
+                    if (choice.action === 'retry') {
+                        setProgress(`다시 요약 중 (#${batch.from}~#${batch.to})`);
+                        summary = await summarizeBatch(memory, batch);
+                        continue;
+                    }
+                    if (choice.action === 'stop') stop = true;
+                    else summary.node = choice.node;
+                    break;
+                }
+                if (stop) break;
+            }
+            const { node, ops, events } = summary;
             if (!stillSameChat(chatId)) break;
             pushHistory(memory, `압축 #${batch.from}-#${batch.to}`);
             const episodeId = newId();
@@ -1227,6 +1484,7 @@ async function runCompress({ all = false } = {}) {
                 from: batch.from,
                 to: batch.to,
                 title: node.title,
+                when: node.when || '',
                 text: node.text,
                 importance: node.importance,
                 keywords: node.keywords,
@@ -1235,19 +1493,25 @@ async function runCompress({ all = false } = {}) {
             });
             applyLedgerOps(memory, ops, batch.to);
             memory.cursor = batch.to;
+            tagMessages(rangeIndices(batch.from, batch.to), episodeId);
+            memory.timeline[memory.timeline.length - 1].msgCount = batch.to - batch.from + 1;
             if (s.hideSummarized) {
                 const toHide = batch.indices.filter(i => !ctx().chat[i]?.is_system);
                 setHidden(toHide, true);
-                for (const i of toHide) memory.hiddenRanges = addRange(memory.hiddenRanges, i, i);
-                await ctx().saveChat();
+                for (const i of toHide) {
+                    memory.hiddenRanges = addRange(memory.hiddenRanges, i, i);
+                    ctx().chat[i].extra.lm_hidden = true;
+                }
             }
+            await ctx().saveChat();
             await ctx().saveMetadata();
             done++;
             refreshInjection();
             updateStatus();
             if (s.autoCompact) await compactInternal(chatId, { force: false });
         }
-        if (done) toastr.success(`${done}개 구간을 기억에 저장했습니다.`);
+        if (done) toastr.success(auto ? `자동 압축: ${done}개 구간을 기억했어요.` : `${done}개 구간을 기억에 저장했습니다.`, auto ? APP_NAME : undefined);
+        if (done) await maybeAutoBackup(done);
         if (done && stillSameChat(chatId)) syncAfter();
     } catch (err) {
         if (String(err?.message) === 'aborted') toastr.info(`중지했습니다. (${done}개 구간 완료)`);
@@ -1263,6 +1527,639 @@ async function runCompress({ all = false } = {}) {
         refreshInjection();
         updateStatus();
     }
+}
+
+// ---------------------------------------------------------------- preview before saving
+
+const PREVIEW_RETRY = 1001;
+
+async function previewEpisode(summary, batch) {
+    const c = ctx();
+    const { node, events, ops } = summary;
+    const root = document.createElement('div');
+    root.innerHTML = `
+<div class="lm-root lm-manager lm-preview">
+  <div class="lm-manager-head">
+    <h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>새 기억 확인</h3>
+    <span class="lm-range">#${batch.from}~#${batch.to}</span>
+  </div>
+  <p class="lm-hint lm-pane-intro">저장하기 전에 고칠 곳이 있으면 고쳐주세요. 마음에 안 들면 다시 요약할 수 있어요.</p>
+  <div class="lm-node-body">
+    <div class="lm-node-meta"><span class="lm-chip lm-chip-episode">에피소드</span><span class="lm-spacer"></span>${impControl(node.importance)}</div>
+    <input class="text_pole lm-title" value="${esc(node.title)}" aria-label="제목">
+    <input class="text_pole lm-when" value="${esc(node.when || '')}" placeholder="작중 시간 (예: 3일째 저녁)" aria-label="작중 시간">
+    <textarea class="text_pole lm-text" rows="9" aria-label="내용">${esc(node.text)}</textarea>
+    <input class="text_pole lm-kw" value="${esc((node.keywords || []).join(', '))}" placeholder="회상 키워드" aria-label="회상 키워드">
+  </div>
+  <p class="lm-hint">함께 찾은 사건 ${events?.length || 0}개와 기록부 변경 ${ops?.length || 0}건도 같이 저장돼요.</p>
+</div>`;
+    applyThemeMode(root.firstElementChild);
+    const popup = new c.Popup(root, c.POPUP_TYPE.CONFIRM, '', {
+        okButton: '저장',
+        cancelButton: '여기서 멈추기',
+        wide: true,
+        allowVerticalScrolling: true,
+        leftAlign: true,
+        customButtons: [{ text: '다시 요약', result: PREVIEW_RETRY, icon: 'fa-rotate' }],
+    });
+    const result = await popup.show();
+    if (result === PREVIEW_RETRY) return { action: 'retry' };
+    if (result !== c.POPUP_RESULT.AFFIRMATIVE) return { action: 'stop' };
+    const body = root.querySelector('.lm-node-body');
+    return {
+        action: 'save',
+        node: {
+            ...node,
+            title: body.querySelector('.lm-title').value.trim() || node.title,
+            when: body.querySelector('.lm-when').value.trim(),
+            text: body.querySelector('.lm-text').value.trim() || node.text,
+            keywords: body.querySelector('.lm-kw').value.split(/[,，、]/).map(k => k.trim()).filter(k => k.length >= 2),
+            importance: readImp(body),
+        },
+    };
+}
+
+// ---------------------------------------------------------------- re-summarize one memory
+
+async function resummarizeNode(nodeId) {
+    if (busy) return toastr.warning('이미 작업 중입니다.');
+    const s = getSettings();
+    const memory = getMemory(false);
+    const node = memory?.timeline.find(n => n.id === nodeId);
+    if (!node || node.from < 0) return toastr.warning('원본 메시지가 없어서 다시 요약할 수 없어요.');
+    const { chat } = ctx();
+    const indices = [];
+    chat.forEach((m, i) => { if (m?.extra?.lm_owner === nodeId) indices.push(i); });
+    const lines = indices.filter(i => chat[i]?.extra?.lm_hidden || isSummarizable(chat[i])).map(i => messageLine(chat[i], i));
+    if (!lines.length) return toastr.warning('원본 메시지를 찾지 못했어요.');
+    if (estTokens(lines.join('\n')) > s.batchTokens) {
+        return toastr.warning('이 구간은 한 번에 다시 요약하기엔 길어요. 설정의 "한 구간 최대 토큰"을 늘려주세요.');
+    }
+    const batch = { from: indices[0], to: indices[indices.length - 1], lines, indices };
+    const chatId = ctx().getCurrentChatId();
+    busy = true;
+    abortController = new AbortController();
+    setBusyUI(true);
+    setProgress(`다시 요약 중 (#${batch.from}~#${batch.to})`);
+    try {
+        const { node: fresh, ops, events } = await summarizeBatch(memory, batch);
+        if (!stillSameChat(chatId)) return;
+        pushHistory(memory, `다시 요약 #${batch.from}-#${batch.to}`);
+        Object.assign(node, {
+            title: fresh.title,
+            when: fresh.when || node.when || '',
+            text: fresh.text,
+            keywords: fresh.keywords,
+            importance: fresh.importance,
+            stale: false,
+            condensed: 0,
+            from: batch.from,
+            to: batch.to,
+            msgCount: indices.length,
+        });
+        memory.events = memory.events.filter(e => e.episodeId !== nodeId);
+        addEvents(memory, events, batch, nodeId);
+        applyLedgerOps(memory, ops, batch.to);
+        await ctx().saveMetadata();
+        toastr.success('다시 요약했어요.');
+        syncAfter();
+    } catch (err) {
+        if (String(err?.message) === 'aborted') toastr.info('중지했습니다.');
+        else toastr.error(`다시 요약 실패: ${err?.message || err}`);
+    } finally {
+        busy = false;
+        abortController = null;
+        setBusyUI(false);
+        setProgress('');
+        refreshInjection();
+        updateStatus();
+    }
+}
+
+// ---------------------------------------------------------------- after each reply: contradiction check + live state
+
+let turnBusy = false;
+const CHECK_SWIPE = 1002;
+const CHECK_CLEAR = 1003;
+
+function afterTurnSystemPrompt(doCheck, doState) {
+    const parts = ['You review one new reply of an ongoing interactive story against its established memory.', ''];
+    parts.push('Reply with only these blocks:');
+    if (doCheck) {
+        parts.push(`
+<issues>
+[JSON array; [] if none]
+</issues>
+Each issue: {"quote":"<short quote from the new reply>","problem":"<what it contradicts and what the established fact is>"}
+Report only real contradictions of established facts: dead or absent characters acting, wrong names, forgotten injuries, items in the wrong hands, characters knowing secrets they are not listed as knowing, broken promises with no explanation, wrong relationships or timeline. Do not report style, new information or plausible developments. Write each "problem" in Korean.`);
+    }
+    if (doState) {
+        parts.push(`
+<ledger>
+[JSON array of updates caused by the new reply; [] if nothing changed]
+</ledger>
+Allowed operations: {"op":"scene","time":"...","place":"...","present":"...","mood":"..."}, {"op":"set","cat":"character|relation|thread|item","key":"...","value":"<complete updated fact>","importance":1-5}, {"op":"close","cat":"thread","key":"..."}. Reuse existing keys exactly. Keep it minimal. ${languageRule()}`);
+    }
+    return parts.join('\n');
+}
+
+async function afterTurn(messageId) {
+    const s = getSettings();
+    const doCheck = s.checkContradictions;
+    const doState = s.liveStateUpdate;
+    if (!s.enabled || (!doCheck && !doState) || turnBusy || !hasChat()) return;
+    const memory = getMemory(false);
+    if (!memory) return;
+    const { chat } = ctx();
+    const msg = chat[messageId];
+    if (!msg || msg.is_user || msg.is_system) return;
+    const chatId = ctx().getCurrentChatId();
+    turnBusy = true;
+    try {
+        const recent = [];
+        for (let i = Math.max(0, messageId - 6); i < messageId; i++) {
+            if (chat[i] && !chat[i].is_system) recent.push(messageLine(chat[i], i));
+        }
+        const user = [
+            frameText(memory.frame) && `<story_frame>\n${frameText(memory.frame)}\n</story_frame>`,
+            `<established_memory>\n${ledgerText(memory.ledger) || '(empty)'}\n\n${timelineText(memory, { lastN: 1 })}\n</established_memory>`,
+            recent.length && `<recent_messages>\n${recent.slice(-4).join('\n\n')}\n</recent_messages>`,
+            `<new_reply>\n${messageLine(msg, messageId)}\n</new_reply>`,
+        ].filter(Boolean).join('\n\n');
+        const out = await callModel(afterTurnSystemPrompt(doCheck, doState), user, { retries: 0 });
+        if (!stillSameChat(chatId) || ctx().chat[messageId] !== msg) return;
+        if (doCheck) {
+            const issues = (parseJsonLenient(extractTag(out, 'issues') || '') || [])
+                .filter(i => i && typeof i === 'object' && String(i.problem || '').trim())
+                .slice(0, 6)
+                .map(i => ({ quote: String(i.quote || '').slice(0, 200), problem: String(i.problem).slice(0, 400) }));
+            msg.extra = msg.extra || {};
+            msg.extra.lm_check = { issues, at: Date.now(), swipe: msg.swipe_id ?? 0 };
+            decorateMessage(messageId);
+            await ctx().saveChat();
+            if (issues.length) toastr.warning(`기억과 다른 부분 ${issues.length}개를 찾았어요. 메시지 이름 옆 ⚠ 표시를 눌러 확인하세요.`, APP_NAME);
+        }
+        if (doState) {
+            const ops = (parseJsonLenient(extractTag(out, 'ledger') || '') || []).filter(op => {
+                const kind = String(op?.op || '').toLowerCase();
+                if (kind === 'scene') return true;
+                return ['set', 'close'].includes(kind) && ['character', 'relation', 'thread', 'item'].includes(String(op.cat || '').toLowerCase());
+            });
+            if (applyLedgerOps(memory, ops, messageId)) {
+                await ctx().saveMetadata();
+                refreshInjection();
+                updateStatus();
+            }
+        }
+    } catch (err) {
+        console.warn(LOG_PREFIX, 'after-turn review failed', err);
+    } finally {
+        turnBusy = false;
+    }
+}
+
+async function showCheckIssues(messageId) {
+    const c = ctx();
+    const msg = c.chat[messageId];
+    const issues = msg?.extra?.lm_check?.issues || [];
+    if (!issues.length) return;
+    const isLast = messageId === c.chat.length - 1;
+    const list = issues.map(i => `
+<article class="lm-result lm-issue">
+  ${i.quote ? `<p class="lm-quote">“${esc(i.quote)}”</p>` : ''}
+  <p>${esc(i.problem)}</p>
+</article>`).join('');
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>기억과 다른 부분</h3></div><p class="lm-hint lm-pane-intro">코끼리가 기억과 맞지 않는다고 본 곳이에요. 맞지 않으면 새로 생성하거나, 괜찮으면 경고를 지우세요.</p><div class="lm-results">${list}</div></div>`;
+    applyThemeMode(wrap.firstElementChild);
+    const buttons = [{ text: '경고 지우기', result: CHECK_CLEAR, icon: 'fa-eraser' }];
+    if (isLast) buttons.unshift({ text: '새로 생성', result: CHECK_SWIPE, icon: 'fa-rotate-right' });
+    const result = await new c.Popup(wrap, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, allowVerticalScrolling: true, leftAlign: true, customButtons: buttons }).show();
+    if (result === CHECK_SWIPE) {
+        await c.executeSlashCommandsWithOptions('/swipes-swipe');
+    } else if (result === CHECK_CLEAR) {
+        delete msg.extra.lm_check;
+        decorateMessage(messageId);
+        await c.saveChat();
+    }
+}
+
+// ---------------------------------------------------------------- message buttons
+
+function decorateMessage(id) {
+    const el = document.querySelector(`#chat .mes[mesid="${id}"]`);
+    const msg = ctx().chat[id];
+    if (!el || !msg) return;
+    const extra = el.querySelector('.extraMesButtons');
+    if (extra && !extra.querySelector('.lm-mes-pin')) {
+        const view = document.createElement('div');
+        view.className = 'mes_button lm-mes-view fa-solid fa-book-open';
+        view.title = '코끼리: 이 메시지가 들어간 기억 보기';
+        view.tabIndex = 0;
+        const pin = document.createElement('div');
+        pin.className = 'mes_button lm-mes-pin fa-solid fa-thumbtack';
+        pin.title = '코끼리: 기억에 새기기';
+        pin.tabIndex = 0;
+        extra.prepend(pin);
+        extra.prepend(view);
+    }
+    const view = el.querySelector('.lm-mes-view');
+    if (view) view.style.display = msg.extra?.lm_owner && msg.extra.lm_owner !== SAGA_OWNER ? '' : 'none';
+    const check = msg.extra?.lm_check;
+    const show = !!check?.issues?.length && (check.swipe ?? 0) === (msg.swipe_id ?? 0);
+    let badge = el.querySelector('.lm-check-badge');
+    if (show && !badge) {
+        badge = document.createElement('span');
+        badge.className = 'lm-check-badge fa-solid fa-triangle-exclamation';
+        badge.title = `코끼리: 기억과 다른 부분 ${check.issues.length}개`;
+        badge.tabIndex = 0;
+        el.querySelector('.name_text')?.after(badge);
+    } else if (!show && badge) {
+        badge.remove();
+    }
+}
+
+function decorateAll() {
+    document.querySelectorAll('#chat .mes[mesid]').forEach(el => decorateMessage(Number(el.getAttribute('mesid'))));
+}
+
+async function pinMessage(id) {
+    if (!hasChat()) return;
+    const c = ctx();
+    const msg = c.chat[id];
+    if (!msg) return;
+    const value = await c.Popup.show.input('기억에 새기기', '코끼리가 꼭 기억할 내용으로 다듬어 주세요. 이 내용은 항상 AI에게 전달돼요.', stripMessage(msg.mes).slice(0, 500), { rows: 6 });
+    const text = String(value ?? '').trim();
+    if (!text) return;
+    const memory = getMemory(true);
+    pushHistory(memory, '기억에 새기기');
+    memory.ledger.entries.push({ id: newId(), cat: 'note', key: `${msg.name || '메시지'} #${id}`, value: text, importance: 5, pinned: true, status: 'open', updatedAt: id, knownBy: [], due: '' });
+    memory.events.push({ id: newId(), from: id, to: id, episodeId: null, text, characters: msg.name ? [msg.name] : [], place: '', items: [], keywords: [], when: '', importance: 5 });
+    await c.saveMetadata();
+    refreshInjection();
+    updateStatus();
+    syncAfter();
+    toastr.success('"꼭 기억할 것"에 새겼어요.', APP_NAME);
+}
+
+function onDocumentClick(event) {
+    const target = event.target.closest?.('.lm-mes-pin, .lm-mes-view, .lm-check-badge');
+    if (!target) return;
+    const id = Number(target.closest('.mes')?.getAttribute('mesid'));
+    if (Number.isNaN(id)) return;
+    event.stopPropagation();
+    if (target.classList.contains('lm-mes-pin')) pinMessage(id);
+    else if (target.classList.contains('lm-check-badge')) showCheckIssues(id);
+    else openManager({ focusOwner: ctx().chat[id]?.extra?.lm_owner });
+}
+
+function onMessageReceived(id, type) {
+    updateStatus();
+    decorateMessage(Number(id));
+    if (['quiet', 'impersonate', 'first_message'].includes(type)) return;
+    maybeAutoCompress();
+    setTimeout(() => afterTurn(Number(id)), 0);
+}
+
+// ---------------------------------------------------------------- storage helpers (backups, hand-off)
+
+function store() {
+    return SillyTavern.libs?.localforage || globalThis.localforage || null;
+}
+
+function downloadFile(name, content, type = 'application/json') {
+    const blob = new Blob([content], { type });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+function fileSafe(str) {
+    return String(str || 'chat').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 80);
+}
+
+function hasContent(memory) {
+    return !!memory && (memory.timeline.length > 0 || memory.ledger.entries.length > 0 || !!memory.saga.text);
+}
+
+// Replaces the current memory with a stored copy and brings hidden flags in line.
+async function restoreMemory(data, label) {
+    const memory = getMemory(true);
+    pushHistory(memory, label);
+    const history = memory.history;
+    const before = new Set(rangesToList(memory.hiddenRanges));
+    const after = new Set(rangesToList(data.hiddenRanges || []));
+    setHidden([...before].filter(i => !after.has(i)), false);
+    setHidden([...after].filter(i => !before.has(i)), true);
+    for (const key of Object.keys(memory)) delete memory[key];
+    Object.assign(memory, emptyMemory(), structuredClone(data), { history });
+    memory.frame = { ...emptyFrame(), ...memory.frame };
+    retagFromRanges(memory);
+    await ctx().saveChat();
+    await ctx().saveMetadata();
+    refreshInjection();
+    updateStatus();
+    syncAfter();
+}
+
+// ---------------------------------------------------------------- backups
+
+function backupKey() {
+    return `lm_backups_${hashString(String(ctx().getCurrentChatId()))}`;
+}
+
+async function saveBackup(label = '수동 백업') {
+    const memory = getMemory(false);
+    const lf = store();
+    if (!memory || !lf) return false;
+    const list = (await lf.getItem(backupKey())) || [];
+    const { history, ...data } = memory;
+    list.push({ at: Date.now(), label, data: structuredClone(data) });
+    while (list.length > Math.max(1, getSettings().backupKeep)) list.shift();
+    await lf.setItem(backupKey(), list);
+    return true;
+}
+
+async function maybeAutoBackup(count) {
+    const s = getSettings();
+    const memory = getMemory(false);
+    if (!s.autoBackupEvery || !memory) return;
+    memory.opsSinceBackup = (memory.opsSinceBackup || 0) + count;
+    if (memory.opsSinceBackup < s.autoBackupEvery) return;
+    memory.opsSinceBackup = 0;
+    try {
+        await saveBackup('자동 백업');
+    } catch (err) {
+        console.warn(LOG_PREFIX, 'auto backup failed', err);
+    }
+}
+
+async function openBackups() {
+    const c = ctx();
+    const lf = store();
+    if (!lf) return toastr.error('이 브라우저에서는 백업 저장소를 쓸 수 없어요.');
+    const list = (await lf.getItem(backupKey())) || [];
+    const wrap = document.createElement('div');
+    const rows = list.map((b, i) => `
+<article class="lm-result lm-backup">
+  <header><span class="lm-chip lm-chip-archive">${esc(b.label)}</span><span class="lm-range">${new Date(b.at).toLocaleString()}</span></header>
+  <p class="lm-hint">타임라인 ${b.data.timeline?.length ?? 0}개, 기록 ${b.data.ledger?.entries?.length ?? 0}개, 사건 ${b.data.events?.length ?? 0}개, #${b.data.cursor}까지</p>
+  <div class="lm-actions lm-actions-inline">
+    <button type="button" class="menu_button lm-btn lm-btn-quiet" data-restore="${i}"><i class="fa-solid fa-clock-rotate-left"></i><span>이 백업으로 되돌리기</span></button>
+    <button type="button" class="menu_button lm-btn lm-btn-quiet" data-download="${i}"><i class="fa-solid fa-download"></i><span>내려받기</span></button>
+  </div>
+</article>`).reverse().join('');
+    wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>백업</h3>
+      <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_backup_now"><i class="fa-solid fa-floppy-disk"></i><span>지금 백업</span></button></div>
+      <p class="lm-hint lm-pane-intro">이 채팅의 기억을 브라우저에 최근 ${getSettings().backupKeep}개까지 보관해요. 압축을 ${getSettings().autoBackupEvery || '?'}번 할 때마다 자동으로 저장돼요.</p>
+      <div class="lm-results">${rows || '<div class="lm-empty">아직 백업이 없어요. 지금 백업을 눌러 만들어 보세요.</div>'}</div></div>`;
+    applyThemeMode(wrap.firstElementChild);
+    const popup = new c.Popup(wrap, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, allowVerticalScrolling: true, leftAlign: true });
+    wrap.addEventListener('click', async (event) => {
+        const restore = event.target.closest('[data-restore]');
+        const download = event.target.closest('[data-download]');
+        if (event.target.closest('#lm_backup_now')) {
+            if (await saveBackup('수동 백업')) toastr.success('백업했어요. 창을 다시 열면 목록에 보여요.');
+        } else if (restore) {
+            const item = list[Number(restore.dataset.restore)];
+            if (!item || !await c.Popup.show.confirm('백업으로 되돌리기', `${new Date(item.at).toLocaleString()} 백업으로 기억을 바꿀까요? 되돌리기로 취소할 수 있어요.`)) return;
+            await restoreMemory(item.data, '백업 복원');
+            toastr.success('백업으로 되돌렸어요.');
+            popup.completeCancelled();
+        } else if (download) {
+            const item = list[Number(download.dataset.download)];
+            if (item) downloadFile(`elephant-backup-${fileSafe(c.getCurrentChatId())}-${item.at}.json`, JSON.stringify(item.data, null, 2));
+        }
+    });
+    await popup.show();
+}
+
+// ---------------------------------------------------------------- carry memories into a new chat
+
+function handoffKey() {
+    const c = ctx();
+    const id = c.groupId ? `g_${c.groupId}` : c.characters?.[c.characterId]?.avatar;
+    return id ? `lm_handoff_${id}` : null;
+}
+
+function carryOver(memory) {
+    const m = structuredClone(memory);
+    const mark = (x) => { x.from = -1; x.to = -1; return x; };
+    m.timeline.forEach(n => { mark(n); n.stale = false; n.msgCount = 0; });
+    m.events.forEach(mark);
+    m.archive.forEach(mark);
+    m.saga.coversTo = -1;
+    m.ledger.entries.forEach(e => { e.updatedAt = -1; });
+    Object.assign(m, { cursor: -1, hiddenRanges: [], history: [], opsSinceBackup: 0, tagVersion: 1 });
+    return m;
+}
+
+async function saveHandoff() {
+    const key = handoffKey();
+    const lf = store();
+    const memory = getMemory(false);
+    if (!key || !lf) return toastr.warning('캐릭터 채팅에서만 쓸 수 있어요.');
+    if (!hasContent(memory)) return toastr.info('이어갈 기억이 아직 없어요.');
+    await lf.setItem(key, { at: Date.now(), chatId: ctx().getCurrentChatId(), name: ctx().name2, memory: carryOver(memory), offered: [] });
+    toastr.success('저장했어요. 이 캐릭터로 새 채팅을 열면 이어갈지 물어볼게요.', APP_NAME);
+}
+
+async function applyHandoff(data) {
+    const c = ctx();
+    const current = getMemory(true);
+    if (hasContent(current) && !await c.Popup.show.confirm('이어가기', '이 채팅에 이미 기억이 있어요. 이어온 기억으로 바꿀까요?')) return false;
+    await restoreMemory({ ...data.memory, cursor: -1, hiddenRanges: [] }, '이어가기');
+    toastr.success('이전 채팅의 기억을 이어받았어요.', APP_NAME);
+    return true;
+}
+
+async function loadHandoff() {
+    const key = handoffKey();
+    const lf = store();
+    if (!key || !lf) return toastr.warning('캐릭터 채팅에서만 쓸 수 있어요.');
+    const data = await lf.getItem(key);
+    if (!data) return toastr.info('저장된 이어가기 기억이 없어요. 이전 채팅의 기억장에서 "새 채팅으로 이어가기"를 먼저 눌러주세요.');
+    if (data.chatId === ctx().getCurrentChatId()) return toastr.info('기억을 저장한 바로 그 채팅이에요.');
+    return applyHandoff(data);
+}
+
+async function offerHandoff() {
+    try {
+        if (!hasChat() || hasContent(getMemory(false)) || ctx().chat.length > 4) return;
+        const key = handoffKey();
+        const lf = store();
+        if (!key || !lf) return;
+        const data = await lf.getItem(key);
+        const chatId = ctx().getCurrentChatId();
+        if (!data || data.chatId === chatId || data.offered?.includes(chatId)) return;
+        data.offered = [...(data.offered || []), chatId].slice(-50);
+        await lf.setItem(key, data);
+        const ok = await ctx().Popup.show.confirm('이어가기', `${data.name || '이 캐릭터'}와의 이전 채팅 기억이 있어요 (${new Date(data.at).toLocaleDateString()} 저장). 이 새 채팅으로 이어갈까요?`);
+        if (ok && stillSameChat(chatId)) await applyHandoff(data);
+    } catch (err) {
+        console.warn(LOG_PREFIX, 'hand-off offer failed', err);
+    }
+}
+
+// ---------------------------------------------------------------- export
+
+const WI_DEFAULTS = Object.freeze({
+    key: [], keysecondary: [], comment: '', content: '', constant: false, vectorized: false, selective: true,
+    selectiveLogic: 0, addMemo: true, order: 100, position: 0, disable: false, ignoreBudget: false,
+    excludeRecursion: false, preventRecursion: false, matchPersonaDescription: false, matchCharacterDescription: false,
+    matchCharacterPersonality: false, matchCharacterDepthPrompt: false, matchScenario: false, matchCreatorNotes: false,
+    delayUntilRecursion: 0, probability: 100, useProbability: true, depth: 4, outletName: '', group: '',
+    groupOverride: false, groupWeight: 100, scanDepth: null, caseSensitive: null, matchWholeWords: null,
+    useGroupScoring: null, automationId: '', role: 0, sticky: null, cooldown: null, delay: null,
+    characterFilterNames: [], characterFilterTags: [], characterFilterExclude: false, triggers: [],
+});
+
+function buildWorldInfo(memory) {
+    const entries = {};
+    let uid = 0;
+    const add = (fields) => {
+        entries[uid] = { ...structuredClone(WI_DEFAULTS), uid, displayIndex: uid, ...fields };
+        uid++;
+    };
+    const frame = frameText(memory.frame);
+    if (frame) add({ comment: '코끼리: 작품 설정', content: frame, constant: true, order: 90 });
+    if (memory.saga.text.trim()) add({ comment: '코끼리: 지금까지의 이야기', content: memory.saga.text.trim(), constant: true, order: 95 });
+    for (const n of memory.timeline) {
+        const keys = (n.keywords || []).slice(0, 10);
+        add({ comment: `코끼리: ${n.title}`, key: keys, content: `${n.title}${n.when ? ` (${n.when})` : ''}: ${n.text}`, constant: keys.length === 0, order: 100 });
+    }
+    for (const e of memory.ledger.entries) {
+        if (e.status === 'closed') continue;
+        const known = e.knownBy?.length ? ` (known only by: ${e.knownBy.join(', ')})` : '';
+        add({ comment: `코끼리 기록: ${CATEGORIES[e.cat] || e.cat} / ${e.key}`, key: [e.key], content: `${e.key}: ${e.value}${known}`, constant: e.cat === 'note', order: 100 });
+    }
+    return { entries };
+}
+
+function buildMarkdown(memory) {
+    const out = [`# 코끼리의 기억장`, '', `채팅: ${ctx().getCurrentChatId()}`, `기억된 지점: #${memory.cursor}`, ''];
+    const frame = frameText(memory.frame);
+    if (frame) out.push('## 작품 설정', '', frame, '');
+    if (memory.saga.text.trim()) out.push('## 지금까지의 이야기', '', memory.saga.text.trim(), '');
+    if (memory.timeline.length) {
+        out.push('## 타임라인', '');
+        for (const n of memory.timeline) {
+            const where = n.from === -1 ? '이전 채팅' : `#${n.from}~#${n.to}`;
+            out.push(`### ${n.tier === 'chapter' ? '챕터' : '에피소드'}: ${n.title}`, '', `${where}${n.when ? `, 작중 ${n.when}` : ''}, 중요도 ${n.importance}`, '', n.text, '');
+        }
+    }
+    const sc = memory.ledger.scene;
+    out.push('## 기록부', '', `현재 상황: ${[sc.time, sc.place, sc.present, sc.mood].filter(Boolean).join(' / ') || '-'}`, '');
+    for (const [cat, label] of Object.entries(CATEGORIES)) {
+        const list = memory.ledger.entries.filter(e => e.cat === cat);
+        if (!list.length) continue;
+        out.push(`### ${label}`, '');
+        for (const e of list) {
+            const extra = [e.knownBy?.length && `아는 사람: ${e.knownBy.join(', ')}`, e.due && `기한: ${e.due}`, e.status === 'closed' && '해결됨'].filter(Boolean);
+            out.push(`- **${e.key}**: ${e.value}${extra.length ? ` (${extra.join(', ')})` : ''}`);
+        }
+        out.push('');
+    }
+    if (memory.events.length) {
+        out.push('## 사건', '');
+        for (const e of memory.events) out.push(`- ${e.from === -1 ? '이전 채팅' : `#${e.from}~#${e.to}`}${e.when ? `, ${e.when}` : ''}: ${e.text}`);
+        out.push('');
+    }
+    return out.join('\n');
+}
+
+async function openExportMenu(getData) {
+    const c = ctx();
+    const name = fileSafe(c.getCurrentChatId());
+    const wrap = document.createElement('div');
+    const option = (id, icon, title, desc) => `
+<button type="button" class="lm-export-option" data-export="${id}">
+  <i class="fa-solid ${icon}"></i><span class="lm-export-text"><b>${title}</b><span class="lm-hint">${desc}</span></span>
+</button>`;
+    wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>내보내기</h3></div>
+      <div class="lm-export-list">
+        ${option('json', 'fa-box-archive', '기억 백업 파일 (.json)', '그대로 다시 가져올 수 있는 전체 백업이에요.')}
+        ${option('md', 'fa-file-lines', '읽기용 문서 (.md)', '줄거리, 타임라인, 기록부, 사건을 사람이 읽기 좋게 정리해요.')}
+        ${option('wi', 'fa-book-atlas', '로어북 (월드인포 .json)', 'ST 월드인포에서 가져오기로 넣을 수 있는 형식이에요.')}
+        ${option('settings', 'fa-sliders', '확장 설정 (.json)', '이 확장의 설정만 저장해요. 다른 기기에서 가져오기로 똑같이 맞출 수 있어요.')}
+      </div></div>`;
+    applyThemeMode(wrap.firstElementChild);
+    wrap.addEventListener('click', (event) => {
+        const btn = event.target.closest('[data-export]');
+        if (!btn) return;
+        const memory = getData();
+        switch (btn.dataset.export) {
+            case 'json': {
+                const { history, ...data } = memory;
+                downloadFile(`elephant-memory-${name}.json`, JSON.stringify(data, null, 2));
+                break;
+            }
+            case 'md':
+                downloadFile(`elephant-memory-${name}.md`, buildMarkdown(memory), 'text/markdown');
+                break;
+            case 'wi':
+                downloadFile(`elephant-lorebook-${name}.json`, JSON.stringify(buildWorldInfo(memory), null, 2));
+                break;
+            case 'settings':
+                downloadFile('elephant-settings.json', JSON.stringify({ type: 'dont-think-of-elephant-settings', version: 1, settings: getSettings() }, null, 2));
+                break;
+        }
+    });
+    await new c.Popup(wrap, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', allowVerticalScrolling: true, leftAlign: true }).show();
+}
+
+function applyImportedSettings(data) {
+    const s = getSettings();
+    for (const key of Object.keys(defaultSettings)) {
+        if (Object.hasOwn(data.settings || {}, key)) s[key] = data.settings[key];
+    }
+    ctx().saveSettingsDebounced();
+    syncSettingInputs();
+    refreshInjection();
+    updateStatus();
+}
+
+// ---------------------------------------------------------------- injection presets
+
+const INJECT_PRESETS = {
+    stable: { label: '안정형 (추천)', desc: '기억은 캐릭터 설정 뒤에, 짧은 리마인더와 회상은 최근 대화 근처에 넣어요. 대부분의 모델에 잘 맞아요.', values: { injectPosition: 'in_prompt', injectRole: 'system', anchorEnabled: true, anchorDepth: 3, recallDepth: 2 } },
+    recent: { label: '최근 강조형', desc: '긴 채팅에서 앞쪽 내용을 자주 놓칠 때. 기억 전체를 최근 대화 가까이에 넣어요.', values: { injectPosition: 'in_chat', injectDepth: 6, injectRole: 'system', anchorEnabled: true, anchorDepth: 2, recallDepth: 1 } },
+    user: { label: '유저 메시지형', desc: 'system 지시를 약하게 따르는 모델용. 기억과 요약 지시를 유저 역할로 보내요.', values: { injectPosition: 'in_chat', injectDepth: 6, injectRole: 'user', anchorEnabled: true, anchorDepth: 2, recallDepth: 1, systemAsUser: true } },
+    light: { label: '토큰 절약형', desc: '리마인더를 끄고 회상 양을 줄여서 토큰을 아껴요.', values: { injectPosition: 'in_prompt', injectRole: 'system', anchorEnabled: false, recallTopK: 3, recallTokenBudget: 800, recallDepth: 2 } },
+};
+
+function applyPreset(name) {
+    const preset = INJECT_PRESETS[name];
+    if (!preset) return;
+    Object.assign(getSettings(), preset.values, { injectPreset: name });
+    ctx().saveSettingsDebounced();
+    syncSettingInputs();
+    refreshInjection();
+    toastr.success(`"${preset.label}" 프리셋을 적용했어요.`);
+}
+
+function syncSettingInputs() {
+    const root = document.getElementById('lm_settings');
+    if (!root) return;
+    const s = getSettings();
+    root.querySelectorAll('[data-lm-setting]').forEach(el => {
+        const key = el.dataset.lmSetting;
+        if (el.type === 'checkbox') el.checked = !!s[key];
+        else el.value = s[key];
+    });
+    const desc = root.querySelector('#lm_preset_desc');
+    if (desc) desc.textContent = INJECT_PRESETS[s.injectPreset]?.desc || '';
+}
+
+// ---------------------------------------------------------------- automatic compression
+
+function maybeAutoCompress() {
+    const s = getSettings();
+    if (!s.enabled || !s.autoCompress || busy || !hasChat()) return;
+    if (unsummarizedRange().count < s.autoCompressAt) return;
+    setTimeout(() => runCompress({ auto: true }), 400);
 }
 
 // ---------------------------------------------------------------- compaction
@@ -1295,7 +2192,7 @@ Reply with one block per note, using the same id, and nothing else:
     for (const { id, text } of results) {
         const node = memory.timeline.find(n => n.id === id);
         if (!node || !text || text.length >= node.text.length) continue;
-        if (!node.condensed) archiveNode(memory, node);
+        if (!node.condensed) archiveNode(memory, node, 'timeline', node.id);
         node.text = text;
         node.condensed = (node.condensed || 0) + 1;
         changed++;
@@ -1340,10 +2237,17 @@ summary:
     const out = await callModel(compactSystemPrompt(task), user);
     const parsed = parseNodeBlock(extractTag(out, 'chapter'));
     if (!parsed) throw new Error('챕터 병합 응답을 해석하지 못했습니다.');
-    for (const n of run) archiveNode(memory, n);
+    const chapterId = newId();
+    for (const n of run) archiveNode(memory, n, 'timeline', chapterId);
+    const runIds = run.map(n => n.id);
+    retagOwners(runIds, chapterId);
+    for (const e of memory.events) if (runIds.includes(e.episodeId)) e.episodeId = chapterId;
+    for (const a of memory.archive) if (runIds.includes(a.ownerId)) a.ownerId = chapterId;
     const chapter = {
-        id: newId(),
+        id: chapterId,
         tier: 'chapter',
+        msgCount: run.reduce((sum, n) => sum + (n.msgCount || (n.to - n.from + 1)), 0),
+        when: [run[0].when, run[run.length - 1].when].filter(Boolean).join(' ~ '),
         from: run[0].from,
         to: run[run.length - 1].to,
         title: parsed.title,
@@ -1381,7 +2285,11 @@ Reply with exactly this block and nothing else:
     const out = await callModel(compactSystemPrompt(task), user);
     const saga = extractTag(out, 'saga');
     if (!saga) throw new Error('전체 줄거리 갱신 응답을 해석하지 못했습니다.');
-    for (const n of run) archiveNode(memory, n);
+    const runIds = run.map(n => n.id);
+    for (const n of run) archiveNode(memory, n, 'timeline', SAGA_OWNER);
+    retagOwners(runIds, SAGA_OWNER);
+    for (const e of memory.events) if (runIds.includes(e.episodeId)) e.episodeId = SAGA_OWNER;
+    for (const a of memory.archive) if (runIds.includes(a.ownerId)) a.ownerId = SAGA_OWNER;
     memory.saga = { text: saga, coversTo: run[run.length - 1].to };
     memory.timeline.splice(0, run.length);
     return true;
@@ -1429,6 +2337,7 @@ async function compactInternal(chatId, { force }) {
         }
         if (!stillSameChat(chatId)) break;
         didAnything = true;
+        await ctx().saveChat();
         await ctx().saveMetadata();
         refreshInjection();
         updateStatus();
@@ -1476,7 +2385,8 @@ async function runUndo() {
     const toUnhide = rangesToList(memory.hiddenRanges).filter(i => !prevHidden.has(i));
     setHidden(toUnhide, false);
     for (const key of Object.keys(previous)) memory[key] = previous[key];
-    if (toUnhide.length) await ctx().saveChat();
+    retagFromRanges(memory);
+    await ctx().saveChat();
     await ctx().saveMetadata();
     refreshInjection();
     updateStatus();
@@ -1492,12 +2402,13 @@ async function runReset() {
     if (!ok) return;
     const unhide = rangesToList(memory.hiddenRanges);
     setHidden(unhide, false);
+    clearTags();
     const frame = memory.frame;
     const fresh = emptyMemory();
     fresh.frame = frame;
     ctx().chatMetadata[META_KEY] = fresh;
     await purgeVectors();
-    if (unhide.length) await ctx().saveChat();
+    await ctx().saveChat();
     await ctx().saveMetadata();
     refreshInjection();
     updateStatus();
@@ -1535,7 +2446,7 @@ function selectOptions(map, selected, useLabelKey = true) {
 
 const UNITS = {
     keepRecent: '개', batchMessages: '개', batchTokens: '토큰', maxOutputTokens: '토큰', retries: '회',
-    remindAt: '개', memoryBudget: '토큰', protectRecent: '개', maxEpisodes: '개', chapterSize: '개',
+    remindAt: '개', autoBackupEvery: '번', backupKeep: '개', expansionTimeoutMs: 'ms', memoryBudget: '토큰', protectRecent: '개', maxEpisodes: '개', chapterSize: '개',
     maxChapters: '개', sagaMaxWords: '단어', staleAfter: '메시지', archiveMax: '개', maxUndo: '회',
     recallTopK: '개', recallTokenBudget: '토큰', recallScan: '개', vectorThreshold: '%', rawChunkMessages: '개',
     rawChunkChars: '자', eventMax: '개', queryTimeoutMs: 'ms',
@@ -1597,6 +2508,7 @@ function spineSegments(memory, total, keepRecent) {
         segments.push({ kind: 'saga', from: 0, to: memory.saga.coversTo, label: '지금까지의 이야기' });
     }
     for (const node of memory?.timeline || []) {
+        if (node.from < 0) continue;
         segments.push({ kind: node.tier, from: node.from, to: node.to, label: node.title });
     }
     const cursor = memory?.cursor ?? -1;
@@ -1686,6 +2598,11 @@ function settingsHtml() {
         <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_compact" title="덜 중요한 기억부터 줄이고 오래된 것을 합칩니다"><i class="fa-solid fa-wand-magic-sparkles"></i><span>정리</span></button>
         <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_undo"><i class="fa-solid fa-rotate-left"></i><span>되돌리기</span></button>
       </div>
+      <label class="lm-auto-row" title="AI 답변이 끝날 때마다 확인해서, 미요약이 기준만큼 쌓이면 한 구간을 자동으로 압축해요">
+        <span class="lm-switch"><input type="checkbox" data-lm-setting="autoCompress" aria-label="자동 압축"><span class="lm-switch-track" aria-hidden="true"></span></span>
+        <span class="lm-auto-text"><b>자동 압축</b><span class="lm-hint">미요약이</span></span>
+        <span class="lm-num-wrap"><input type="number" class="text_pole lm-num lm-num-sm" data-lm-setting="autoCompressAt" min="5" max="100000" step="1" aria-label="자동 압축 기준"><span class="lm-unit">개 쌓이면</span></span>
+      </label>
       <div id="lm_progress" class="lm-progress" aria-live="polite"></div>
 
       <details class="lm-fold" id="lm_fold">
@@ -1695,6 +2612,7 @@ function settingsHtml() {
         <button type="button" class="lm-tab" data-lm-tab="range" role="tab"><i class="fa-solid fa-ruler-horizontal"></i><span>범위</span></button>
         <button type="button" class="lm-tab" data-lm-tab="tidy" role="tab"><i class="fa-solid fa-broom"></i><span>정리</span></button>
         <button type="button" class="lm-tab" data-lm-tab="recall" role="tab"><i class="fa-solid fa-lightbulb"></i><span>회상</span></button>
+        <button type="button" class="lm-tab" data-lm-tab="check" role="tab"><i class="fa-solid fa-shield-heart"></i><span>검사</span></button>
         <button type="button" class="lm-tab" data-lm-tab="inject" role="tab"><i class="fa-solid fa-puzzle-piece"></i><span>주입</span></button>
       </div>
       <div class="lm-panes">
@@ -1705,6 +2623,7 @@ function settingsHtml() {
         ${selectRow('detail', '상세도', selectOptions({ concise: '간결', standard: '보통', detailed: '상세' }, s.detail), s.detail, '상세할수록 오래 기억하지만 토큰이 늘어요')}
         ${numberRow('maxOutputTokens', '응답 최대 토큰', 256, 131072, '요약 한 번에 받을 최대 길이')}
         ${numberRow('retries', '재시도 횟수', 0, 10, '요청이 실패하면 다시 시도')}
+        ${checkRow('previewBeforeSave', '저장 전에 요약 미리보기', '압축할 때마다 결과를 보여주고, 고치거나 다시 요약할 수 있어요. 자동 압축에는 적용되지 않아요')}
         ${checkRow('includePreset', '프로필의 샘플링 설정 사용')}
         ${checkRow('systemAsUser', '지시를 유저 메시지로 보내기', 'system 역할을 받지 않는 모델일 때만 켜세요')}
         <div class="lm-field lm-field-stack">
@@ -1719,6 +2638,7 @@ function settingsHtml() {
         ${numberRow('batchMessages', '한 구간 최대 메시지', 1, 5000, '압축 한 번에 묶을 메시지 수')}
         ${numberRow('batchTokens', '한 구간 최대 토큰', 1000, 2000000, '요약 모델의 컨텍스트 안에서 크게 잡으면 호출이 줄어요')}
         ${checkRow('hideSummarized', '요약한 원본은 AI에게서 숨기기', '채팅창에는 흐리게 남고, 되돌리기로 복구됩니다')}
+        ${checkRow('autoForgetDeleted', '메시지를 지우면 그 기억도 지우기', '요약된 메시지를 모두 지우면 해당 기억을 자동으로 지워요. 일부만 지우면 "다시 요약" 표시를 해요')}
         ${checkRow('stripHtml', 'HTML과 상태창 태그 빼고 요약')}
         ${numberRow('remindAt', '압축 알림 기준', 0, 100000, '미요약이 이만큼 쌓이면 알려줍니다. 0이면 끔')}
         <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane"><i class="fa-solid fa-rotate"></i>이 탭 기본값으로</button></div>
@@ -1735,6 +2655,8 @@ function settingsHtml() {
         ${numberRow('staleAfter', '오래된 사소한 기록 정리', 10, 1000000, '중요도 1인 기록이 이 메시지 수만큼 갱신되지 않으면 보관함으로')}
         ${numberRow('archiveMax', '보관함 최대 항목', 0, 100000)}
         ${numberRow('maxUndo', '되돌리기 기록', 0, 50)}
+        ${numberRow('autoBackupEvery', '자동 백업 간격', 0, 1000, '압축을 이만큼 할 때마다 브라우저에 백업해요. 0이면 끔')}
+        ${numberRow('backupKeep', '백업 보관 개수', 1, 50)}
         <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane"><i class="fa-solid fa-rotate"></i>이 탭 기본값으로</button></div>
       </section>
 
@@ -1743,6 +2665,7 @@ function settingsHtml() {
         ${checkRow('eventsEnabled', '요약할 때 사건도 따로 추출', '누가, 어디서, 무엇을, 왜 — 검색의 기본 단위가 됩니다')}
         ${checkRow('vectorEnabled', '의미 검색 사용', '끄면 키워드 검색만 합니다')}
         ${checkRow('indexRawMessages', '요약된 원본 대사도 검색', '정확한 대사를 그대로 떠올릴 수 있어요')}
+        ${checkRow('queryExpansion', '돌려 말해도 찾기', '"그때 그 일"처럼 애매한 말을 요약 모델이 구체적인 검색어로 바꿔서 찾아요. 답변마다 짧은 호출이 1번 늘고 응답 시작이 조금 늦어져요')}
         ${selectRow('embedSource', '임베딩 소스', selectOptions(EMBED_SOURCES, s.embedSource), s.embedSource, 'API 키는 ST에 저장된 것을 씁니다')}
         ${textRow('embedModel', '임베딩 모델', '비우면 ST 벡터 저장소 설정의 모델', '예: bge-m3')}
         ${textRow('embedApiUrl', '임베딩 서버 주소', 'Ollama, llama.cpp, vLLM만 해당. 비우면 ST 설정', 'http://127.0.0.1:11434')}
@@ -1763,11 +2686,21 @@ function settingsHtml() {
           ${numberRow('rawChunkChars', '원본 묶음 최대 글자', 200, 20000)}
           ${numberRow('eventMax', '사건 최대 보관', 10, 1000000)}
           ${numberRow('queryTimeoutMs', '검색 시간 제한 (ms)', 500, 120000, '넘으면 키워드 검색 결과만 씁니다')}
+          ${numberRow('expansionTimeoutMs', '검색어 확장 시간 제한', 1000, 120000, '넘으면 확장 없이 바로 검색해요')}
         </details>
         <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane"><i class="fa-solid fa-rotate"></i>이 탭 기본값으로</button></div>
       </section>
 
+      <section class="lm-pane" data-lm-pane="check" role="tabpanel">
+        <div class="lm-field-text lm-pane-intro"><span class="lm-hint">AI 답변이 끝날 때마다 요약 모델이 한 번 살펴봐요. 둘 다 켜도 호출은 1번이에요. 요약 모델 프로필을 따로 지정해 두면 대화와 겹치지 않아요.</span></div>
+        ${checkRow('checkContradictions', '모순 검사', '죽은 인물이 등장하거나, 이름·관계·부상이 바뀌거나, 모르는 비밀을 아는 등 기억과 다른 부분을 찾아 메시지에 ⚠ 표시를 해요')}
+        ${checkRow('liveStateUpdate', '현재 상태 실시간 갱신', '압축 전이라도 시간·장소·함께 있는 인물·약속을 매 답변마다 기록부에 반영해요')}
+        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane"><i class="fa-solid fa-rotate"></i>이 탭 기본값으로</button></div>
+      </section>
+
       <section class="lm-pane" data-lm-pane="inject" role="tabpanel">
+        ${selectRow('injectPreset', '주입 프리셋', selectOptions(Object.fromEntries(Object.entries(INJECT_PRESETS).map(([k, v]) => [k, v.label])), s.injectPreset), s.injectPreset, '')}
+        <div class="lm-preset-row"><span class="lm-hint" id="lm_preset_desc">${esc(INJECT_PRESETS[s.injectPreset]?.desc || '')}</span><button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_apply_preset"><i class="fa-solid fa-wand-magic-sparkles"></i><span>적용</span></button></div>
         ${selectRow('injectPosition', '기억 넣을 위치', selectOptions({ in_prompt: '캐릭터 설정 뒤', before_prompt: '프롬프트 맨 앞', in_chat: '채팅 안 (깊이 지정)' }, s.injectPosition), s.injectPosition, '대부분 캐릭터 설정 뒤가 가장 안정적이에요')}
         ${numberRow('injectDepth', '채팅 안 깊이', 0, 10000, '위치가 채팅 안일 때만 사용')}
         ${selectRow('injectRole', '역할', selectOptions({ system: 'system', user: 'user', assistant: 'assistant' }, s.injectRole), s.injectRole)}
@@ -1850,6 +2783,11 @@ function bindSettings(root) {
     root.querySelector('#lm_btn_undo').addEventListener('click', () => runUndo());
     root.querySelector('#lm_btn_stop').addEventListener('click', () => runStop());
     root.querySelector('#lm_btn_reindex').addEventListener('click', () => syncVectors({ notify: true }));
+    const presetSelect = root.querySelector('[data-lm-setting="injectPreset"]');
+    presetSelect.addEventListener('change', () => {
+        root.querySelector('#lm_preset_desc').textContent = INJECT_PRESETS[presetSelect.value]?.desc || '';
+    });
+    root.querySelector('#lm_apply_preset').addEventListener('click', () => applyPreset(presetSelect.value));
     root.querySelector('#lm_btn_search').addEventListener('click', () => openSearchTest());
 }
 
@@ -1937,6 +2875,8 @@ function updateStatus() {
         <span>사건 ${(memory?.events?.length ?? 0).toLocaleString()}개</span>
         <span>기록 ${memory?.ledger.entries.length ?? 0}개</span>
         <span>보관 ${memory?.archive.length ?? 0}개</span>
+        ${memory?.timeline.some(n => n.stale) ? `<span class="lm-warn">다시 요약 필요 ${memory.timeline.filter(n => n.stale).length}개</span>` : ''}
+        ${memory?.timeline.some(n => n.from === -1) ? '<span>이전 채팅에서 이어받음</span>' : ''}
         <span>${vectorStatusText()}</span>
       </div>`;
     const badge = document.getElementById('lm_badge');
@@ -1990,14 +2930,16 @@ function nodeCard(node) {
   <div class="lm-node-body">
     <div class="lm-node-meta">
       <span class="lm-chip lm-chip-${node.tier}">${node.tier === 'chapter' ? '챕터' : '에피소드'}</span>
-      <span class="lm-range">#${node.from}~#${node.to}</span>
+      <span class="lm-range">${node.from === -1 ? '이전 채팅' : node.from < 0 ? '원본 삭제됨' : `#${node.from}~#${node.to}`}</span>
       ${node.condensed ? `<span class="lm-range">${node.condensed}회 압축됨</span>` : ''}
+      ${node.stale ? `<button type="button" class="lm-stale" data-resum="${esc(node.id)}" title="원본이 바뀌었어요. 눌러서 이 구간만 다시 요약해요"><i class="fa-solid fa-rotate"></i>다시 요약</button>` : ''}
       <span class="lm-spacer"></span>
       ${impControl(node.importance)}
       ${iconToggle('lm-pin', 'fa-thumbtack', '고정 (자동 압축에서 제외)', node.pinned)}
       ${deleteButton()}
     </div>
     <input class="text_pole lm-title" value="${esc(node.title)}" aria-label="제목">
+    <input class="text_pole lm-when" value="${esc(node.when || '')}" placeholder="작중 시간 (예: 3일째 저녁)" aria-label="작중 시간">
     <textarea class="text_pole lm-text" rows="4" aria-label="내용">${esc(node.text)}</textarea>
     <input class="text_pole lm-kw" value="${esc((node.keywords || []).join(', '))}" placeholder="회상 키워드, 쉼표로 구분" aria-label="회상 키워드">
   </div>
@@ -2016,6 +2958,8 @@ function entryRow(entry) {
     ${deleteButton()}
   </div>
   <textarea class="text_pole lm-val" rows="2" placeholder="내용" aria-label="내용">${esc(entry.value)}</textarea>
+  ${['fact', 'note', 'item'].includes(entry.cat) ? `<input class="text_pole lm-known" value="${esc((entry.knownBy || []).join(', '))}" placeholder="이 사실을 아는 인물 (쉼표로 구분, 비우면 모두 앎)" aria-label="아는 인물">` : ''}
+  ${entry.cat === 'thread' ? `<input class="text_pole lm-due" value="${esc(entry.due || '')}" placeholder="작중 기한 (예: 보름달 밤까지)" aria-label="기한">` : ''}
 </div>`;
 }
 
@@ -2054,6 +2998,9 @@ function managerHtml(memory) {
     <div class="lm-manager-tools">
       <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_export"><i class="fa-solid fa-file-export"></i><span>내보내기</span></button>
       <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_import"><i class="fa-solid fa-file-import"></i><span>가져오기</span></button>
+      <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_backups"><i class="fa-solid fa-clock-rotate-left"></i><span>백업</span></button>
+      <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_handoff_save" title="이 기억을 저장해 두고, 같은 캐릭터로 새 채팅을 열 때 이어받아요"><i class="fa-solid fa-person-walking-arrow-right"></i><span>새 채팅으로 이어가기</span></button>
+      <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_handoff_load" title="저장해 둔 이전 채팅의 기억을 이 채팅으로 가져와요"><i class="fa-solid fa-person-walking-arrow-loop-left"></i><span>이어받기</span></button>
       <button type="button" class="menu_button lm-btn lm-btn-danger" id="lm_reset"><i class="fa-solid fa-eraser"></i><span>초기화</span></button>
       <input type="file" id="lm_import_file" accept=".json,application/json" hidden>
     </div>
@@ -2138,6 +3085,7 @@ function collectManager(root, memory) {
             return {
                 ...original,
                 title: card.querySelector('.lm-title').value.trim() || original.title,
+                when: card.querySelector('.lm-when')?.value.trim() ?? original.when ?? '',
                 importance: readImp(card),
                 pinned: card.querySelector('.lm-pin').checked,
                 text: card.querySelector('.lm-text').value.trim(),
@@ -2165,6 +3113,8 @@ function collectManager(root, memory) {
                 importance: readImp(row),
                 status: row.querySelector('.lm-closed').checked ? 'closed' : 'open',
                 pinned: row.querySelector('.lm-pin').checked,
+                knownBy: row.querySelector('.lm-known') ? toList(row.querySelector('.lm-known').value) : (original.knownBy || []),
+                due: row.querySelector('.lm-due') ? row.querySelector('.lm-due').value.trim() : (original.due || ''),
             };
         })
         .filter(e => e.key && e.value);
@@ -2181,7 +3131,7 @@ function collectManager(root, memory) {
     return out;
 }
 
-async function openManager() {
+async function openManager({ focusOwner = null } = {}) {
     if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
     if (busy) return toastr.warning('작업이 끝난 뒤에 열어주세요.');
     const c = ctx();
@@ -2190,18 +3140,27 @@ async function openManager() {
     const root = document.createElement('div');
     root.innerHTML = managerHtml(memory);
     applyThemeMode(root.firstElementChild);
+    let popup = null;
+    const selectTab = (name) => {
+        root.querySelectorAll('.lm-tab').forEach(t => t.classList.toggle('active', t.dataset.lmTab === name));
+        root.querySelectorAll('.lm-pane').forEach(pane => pane.classList.toggle('active', pane.dataset.lmPane === name));
+    };
+    // Closes the manager without saving, then runs an action that changes memory.
+    const closeThen = async (action) => {
+        await popup?.completeCancelled();
+        await action();
+    };
 
-    root.addEventListener('click', (event) => {
+    root.addEventListener('click', async (event) => {
         const del = event.target.closest('.lm-del');
         if (del) {
-            const item = del.closest('.lm-node, .lm-entry, .lm-event');
-            item?.classList.toggle('lm-deleted');
+            del.closest('.lm-node, .lm-entry, .lm-event')?.classList.toggle('lm-deleted');
             return;
         }
         const add = event.target.closest('.lm-add-entry');
         if (add) {
             const cat = add.dataset.cat;
-            const entry = { id: newId(), cat, key: '', value: '', importance: 3, pinned: false, status: 'open' };
+            const entry = { id: newId(), cat, key: '', value: '', importance: 3, pinned: cat === 'note', status: 'open', knownBy: [], due: '' };
             const list = root.querySelector(`.lm-group[data-cat="${cat}"] .lm-group-list`);
             list?.insertAdjacentHTML('beforeend', entryRow(entry));
             list?.lastElementChild?.querySelector('.lm-key')?.focus();
@@ -2209,9 +3168,36 @@ async function openManager() {
         }
         const tab = event.target.closest('.lm-tab');
         if (tab) {
-            const name = tab.dataset.lmTab;
-            root.querySelectorAll('.lm-tab').forEach(t => t.classList.toggle('active', t === tab));
-            root.querySelectorAll('.lm-pane').forEach(pane => pane.classList.toggle('active', pane.dataset.lmPane === name));
+            selectTab(tab.dataset.lmTab);
+            return;
+        }
+        const resum = event.target.closest('[data-resum]');
+        if (resum) {
+            const id = resum.dataset.resum;
+            await closeThen(async () => {
+                await resummarizeNode(id);
+                openManager({ focusOwner: id });
+            });
+            return;
+        }
+        const tool = event.target.closest('#lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_reset');
+        if (!tool) return;
+        switch (tool.id) {
+            case 'lm_export':
+                await openExportMenu(() => collectManager(root, memory));
+                break;
+            case 'lm_backups':
+                await closeThen(openBackups);
+                break;
+            case 'lm_handoff_save':
+                await saveHandoff();
+                break;
+            case 'lm_handoff_load':
+                await closeThen(loadHandoff);
+                break;
+            case 'lm_reset':
+                await closeThen(runReset);
+                break;
         }
     });
     const filter = root.querySelector('#lm_event_filter');
@@ -2229,43 +3215,32 @@ async function openManager() {
         await writeExtensionField(characterId, CHAR_FIELD, frame);
         toastr.success('이 캐릭터의 기본 설정으로 저장했습니다.');
     });
-    root.querySelector('#lm_export').addEventListener('click', () => {
-        const data = collectManager(root, memory);
-        delete data.history;
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
-        a.download = `long-memory-${String(ctx().getCurrentChatId()).replace(/[^\w-]+/g, '_')}.json`;
-        a.click();
-        setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-    });
     const fileInput = root.querySelector('#lm_import_file');
     root.querySelector('#lm_import').addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', async () => {
         const file = fileInput.files?.[0];
+        fileInput.value = '';
         if (!file) return;
         try {
             const data = JSON.parse(await file.text());
-            if (!data || !Array.isArray(data.timeline) || !data.ledger) throw new Error('코끼리를 생각하지마 기억 파일이 아닙니다.');
-            const ok = await c.Popup.show.confirm('가져오기', '현재 기억을 파일 내용으로 바꿉니다. (숨김 상태는 바뀌지 않아요)');
-            if (!ok) return;
-            const current = getMemory(true);
-            pushHistory(current, '가져오기');
-            const keepHidden = current.hiddenRanges;
-            const history = current.history;
-            Object.assign(current, emptyMemory(), data, { hiddenRanges: keepHidden, history });
-            await ctx().saveMetadata();
-            refreshInjection();
-            updateStatus();
-            toastr.success('가져왔습니다. 관리자를 다시 열면 반영된 내용이 보여요.');
-            syncAfter();
+            if (data?.type === 'dont-think-of-elephant-settings') {
+                if (!await c.Popup.show.confirm('설정 가져오기', '파일의 설정으로 이 확장의 설정을 바꿀까요?')) return;
+                applyImportedSettings(data);
+                toastr.success('설정을 가져왔어요.');
+                return;
+            }
+            if (!data || !Array.isArray(data.timeline) || !data.ledger) throw new Error('코끼리를 생각하지마 기억 파일이 아니에요.');
+            if (!await c.Popup.show.confirm('기억 가져오기', '현재 기억을 파일 내용으로 바꿀까요? 되돌리기로 취소할 수 있어요.')) return;
+            await closeThen(async () => {
+                await restoreMemory(data, '가져오기');
+                toastr.success('기억을 가져왔어요.');
+            });
         } catch (err) {
             toastr.error(`가져오기 실패: ${err.message}`);
         }
     });
-    root.querySelector('#lm_reset').addEventListener('click', () => runReset());
 
-    const popup = new c.Popup(root, c.POPUP_TYPE.CONFIRM, '', {
+    popup = new c.Popup(root, c.POPUP_TYPE.CONFIRM, '', {
         okButton: '저장',
         cancelButton: '닫기',
         wide: true,
@@ -2273,7 +3248,20 @@ async function openManager() {
         allowVerticalScrolling: true,
         leftAlign: true,
     });
-    const result = await popup.show();
+    const showing = popup.show();
+    if (focusOwner) {
+        setTimeout(() => {
+            selectTab('timeline');
+            const card = root.querySelector(`.lm-node[data-node-id="${CSS.escape(focusOwner)}"]`);
+            if (card) {
+                card.scrollIntoView({ block: 'center' });
+                card.classList.add('lm-focus');
+            } else if (focusOwner === SAGA_OWNER) {
+                root.querySelector('.lm-saga')?.scrollIntoView({ block: 'center' });
+            }
+        }, 80);
+    }
+    const result = await showing;
     if (result !== c.POPUP_RESULT.AFFIRMATIVE) return;
     if (!stillSameChat(chatId)) return toastr.warning('채팅이 바뀌어서 저장하지 않았습니다.');
     const current = getMemory(true);
@@ -2367,6 +3355,40 @@ function registerCommands() {
         helpString: '<div>코끼리를 생각하지마: 벡터 검색 색인을 현재 기억에 맞춥니다.</div>',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lm-auto',
+        callback: (_args, value) => {
+            const s = getSettings();
+            const v = String(value || '').trim().toLowerCase();
+            s.autoCompress = v === 'on' ? true : v === 'off' ? false : !s.autoCompress;
+            ctx().saveSettingsDebounced();
+            syncSettingInputs();
+            toastr.info(`자동 압축을 ${s.autoCompress ? '켰어요' : '껐어요'}.`, APP_NAME);
+            return s.autoCompress ? 'on' : 'off';
+        },
+        unnamedArgumentList: [
+            SlashCommandArgument.fromProps({ description: 'on, off, or empty to toggle', typeList: [ARGUMENT_TYPE.STRING], isRequired: false, enumList: ['on', 'off'] }),
+        ],
+        helpString: '<div>코끼리를 생각하지마: 자동 압축을 켜거나 끕니다. 예: <code>/lm-auto on</code></div>',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lm-remember',
+        callback: async (_args, value) => {
+            const text = String(value || '').trim();
+            if (!text || !hasChat()) return '';
+            const memory = getMemory(true);
+            pushHistory(memory, '기억에 새기기');
+            memory.ledger.entries.push({ id: newId(), cat: 'note', key: `메모 #${ctx().chat.length - 1}`, value: text, importance: 5, pinned: true, status: 'open', updatedAt: ctx().chat.length - 1, knownBy: [], due: '' });
+            await ctx().saveMetadata();
+            refreshInjection();
+            updateStatus();
+            return '';
+        },
+        unnamedArgumentList: [
+            SlashCommandArgument.fromProps({ description: 'text to always remember', typeList: [ARGUMENT_TYPE.STRING], isRequired: true }),
+        ],
+        helpString: '<div>코끼리를 생각하지마: "꼭 기억할 것"에 내용을 새깁니다. 예: <code>/lm-remember 레온은 고양이 알레르기가 있다</code></div>',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lm-show',
         callback: () => buildMemoryText(getMemory(false)) || '(no memory)',
         returns: 'the memory text that is injected into the prompt',
@@ -2390,6 +3412,13 @@ function addWandMenu() {
     };
     make('lm_wand_compress', 'fa-feather-pointed', '코끼리: 기억 압축', () => runCompress({ all: false }));
     make('lm_wand_manager', 'fa-book-open', '코끼리: 기억장 열기', () => openManager());
+    make('lm_wand_auto', 'fa-robot', '코끼리: 자동 압축 켜기/끄기', () => {
+        const s = getSettings();
+        s.autoCompress = !s.autoCompress;
+        ctx().saveSettingsDebounced();
+        syncSettingInputs();
+        toastr.info(`자동 압축을 ${s.autoCompress ? '켰어요' : '껐어요'}.`, APP_NAME);
+    });
 }
 
 // ---------------------------------------------------------------- chat events
@@ -2408,20 +3437,25 @@ function onChatChanged() {
     }
     ctx().setExtensionPrompt(PROMPT_KEY_RECALL, '', POSITIONS.in_chat, 0);
     lastRecall = [];
+    const existing = getMemory(false);
+    if (existing && existing.tagVersion !== 1) {
+        retagFromRanges(existing);
+        c.saveChat?.();
+        c.saveMetadataDebounced?.();
+    }
     refreshInjection();
     updateStatus();
+    setTimeout(decorateAll, 300);
     if (getMemory(false)) syncAfter();
+    setTimeout(offerHandoff, 600);
 }
 
 async function onMessageDeleted() {
-    const memory = getMemory(false);
-    const length = ctx().chat.length;
-    if (memory && memory.cursor >= length) {
-        memory.cursor = length - 1;
-        memory.hiddenRanges = listToRanges(rangesToList(memory.hiddenRanges).filter(i => i < length));
-        await ctx().saveMetadata();
+    try {
+        await reconcileAfterDeletion();
+    } catch (err) {
+        console.error(LOG_PREFIX, 'deletion reconcile failed', err);
     }
-    updateStatus();
 }
 
 // ---------------------------------------------------------------- init
@@ -2442,7 +3476,13 @@ async function onMessageDeleted() {
     });
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
     eventSource.on(event_types.MESSAGE_DELETED, onMessageDeleted);
-    eventSource.on(event_types.MESSAGE_RECEIVED, updateStatus);
+    eventSource.on(event_types.MESSAGE_EDITED, onMessageEdited);
+    eventSource.on(event_types.MESSAGE_SWIPED, onMessageEdited);
+    eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
+    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (id) => decorateMessage(Number(id)));
+    eventSource.on(event_types.USER_MESSAGE_RENDERED, (id) => decorateMessage(Number(id)));
+    eventSource.on(event_types.MORE_MESSAGES_LOADED, () => decorateAll());
+    document.addEventListener('click', onDocumentClick, true);
     eventSource.on(event_types.MESSAGE_SENT, updateStatus);
     console.log(LOG_PREFIX, 'loaded');
 })();

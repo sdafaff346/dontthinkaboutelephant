@@ -473,7 +473,7 @@
 
 #lm_settings .lm-tabs-pill {
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
     overflow: visible;
 }
 
@@ -1056,6 +1056,7 @@
     border-radius: 50%;
 }
 
+.lm-cat-note { background: var(--lm-ear); }
 .lm-cat-character { background: color-mix(in srgb, #5b8def 75%, var(--lm-text)); }
 .lm-cat-relation { background: color-mix(in srgb, #e5679a 75%, var(--lm-text)); }
 .lm-cat-thread { background: var(--lm-accent); }
@@ -1166,4 +1167,156 @@
         transition: none !important;
         animation: none !important;
     }
+}
+
+
+/* ---------- auto compress row ---------- */
+
+.lm-auto-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 10px;
+    padding: 9px 12px;
+    border-radius: 999px;
+    background: var(--lm-card);
+    box-shadow: var(--lm-tile);
+    cursor: pointer;
+}
+
+.lm-auto-text {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 8px;
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.lm-auto-text b {
+    font-family: var(--lm-display);
+    font-weight: 400;
+}
+
+.lm-root .lm-num-sm { width: 64px; }
+
+.lm-root .lm-auto-row:has(input[type="checkbox"]:not(:checked)) .lm-num-wrap { opacity: 0.55; }
+
+/* ---------- presets ---------- */
+
+.lm-preset-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 2px 10px;
+    border-bottom: 1px solid color-mix(in srgb, var(--lm-line) 55%, transparent);
+}
+
+.lm-preset-row .lm-hint { flex: 1 1 auto; }
+
+.lm-root .lm-preset-row .lm-btn {
+    flex: 0 0 auto;
+    min-height: 32px;
+    padding: 5px 14px;
+}
+
+/* ---------- memory book extras ---------- */
+
+.lm-stale {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 10px;
+    border: 0;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--lm-warn-color) 18%, transparent);
+    color: var(--lm-warn-color);
+    font: inherit;
+    font-size: 0.78em;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.lm-stale:hover { background: color-mix(in srgb, var(--lm-warn-color) 28%, transparent); }
+
+.lm-root .lm-when,
+.lm-root .lm-known,
+.lm-root .lm-due {
+    margin: 0;
+    font-size: 0.85em;
+}
+
+.lm-node.lm-focus .lm-node-body {
+    outline: 3px solid var(--lm-sun);
+    outline-offset: 2px;
+}
+
+.lm-manager-tools { flex-wrap: wrap; }
+
+.lm-quote {
+    margin: 0 0 4px !important;
+    color: var(--lm-muted);
+    font-style: italic;
+}
+
+/* export menu */
+
+.lm-export-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.lm-export-option {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    width: 100%;
+    padding: 12px 14px;
+    border: 1.5px solid var(--lm-line);
+    border-radius: var(--lm-radius);
+    background: var(--lm-card);
+    box-shadow: var(--lm-tile);
+    color: var(--lm-text);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.lm-export-option:hover { border-color: var(--lm-sun); }
+
+.lm-export-option > i {
+    width: 1.6em;
+    font-size: 1.2em;
+    color: var(--lm-sun);
+    text-align: center;
+}
+
+.lm-export-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+/* ---------- chat message decorations (outside .lm-root) ---------- */
+
+.lm-check-badge {
+    margin-left: 6px;
+    color: #E8833A;
+    cursor: pointer;
+    font-size: 0.9em;
+    animation: lm-nudge 1.6s ease-in-out 2;
+}
+
+.lm-check-badge:hover { filter: brightness(1.15); }
+
+@keyframes lm-nudge {
+    50% { transform: scale(1.25); }
+}
+
+.mes_button.lm-mes-pin:hover,
+.mes_button.lm-mes-view:hover { color: #E8833A; }
+
+@media (prefers-reduced-motion: reduce) {
+    .lm-check-badge { animation: none; }
 }
