@@ -1315,14 +1315,14 @@ function applyLedgerOps(memory, ops, atIndex) {
     return applied;
 }
 
-function planBatches(start, end) {
+function planBatches(start, end, { includeHidden = false } = {}) {
     const s = getSettings();
     const { chat } = ctx();
     const batches = [];
     let current = null;
     for (let i = start; i <= end; i++) {
         const msg = chat[i];
-        if (!isSummarizable(msg)) continue;
+        if (!msg || !(isSummarizable(msg) || (includeHidden && String(msg.mes ?? '').trim()))) continue;
         const line = messageLine(msg, i);
         const tokens = estTokens(line);
         if (current && (current.lines.length >= s.batchMessages || current.tokens + tokens > s.batchTokens)) {
@@ -1436,8 +1436,21 @@ async function runCompress({ all = false, auto = false } = {}) {
     const { start, end, count } = unsummarizedRange();
     if (count <= 0) return auto ? undefined : toastr.info(`압축할 메시지가 없습니다. (최근 ${s.keepRecent}개는 원본 유지)`);
 
+    let includeHidden = false;
     let batches = planBatches(start, end);
-    if (!batches.length) return auto ? undefined : toastr.info('요약할 내용이 없습니다.');
+    if (!batches.length) {
+        if (auto) return;
+        const hiddenCount = ctx().chat.slice(start, end + 1).filter(m => m?.is_system && String(m.mes ?? '').trim()).length;
+        if (!hiddenCount) return toastr.info('요약할 내용이 없습니다.');
+        const ok = await ctx().Popup.show.confirm(
+            '숨겨진 메시지만 있어요',
+            `메시지 #${start}~#${end}가 모두 이미 숨김 상태라 요약할 게 없었어요. 다른 확장이나 /hide 명령으로 숨겨진 것 같아요. (이전 버전 st-long-memory 폴더가 남아 있다면 지워주세요.)\n\n숨겨진 메시지 ${hiddenCount}개도 포함해서 요약할까요?`,
+        );
+        if (!ok) return;
+        includeHidden = true;
+        batches = planBatches(start, end, { includeHidden: true });
+        if (!batches.length) return toastr.info('요약할 내용이 없습니다.');
+    }
     if (!all || auto) batches = batches.slice(0, 1);
     if (batches.length > 1) {
         const ok = await ctx().Popup.show.confirm(
@@ -1490,6 +1503,7 @@ async function runCompress({ all = false, auto = false } = {}) {
                 keywords: node.keywords,
                 pinned: false,
                 condensed: 0,
+                includeHidden,
             });
             applyLedgerOps(memory, ops, batch.to);
             memory.cursor = batch.to;
@@ -1590,7 +1604,7 @@ async function resummarizeNode(nodeId) {
     const { chat } = ctx();
     const indices = [];
     chat.forEach((m, i) => { if (m?.extra?.lm_owner === nodeId) indices.push(i); });
-    const lines = indices.filter(i => chat[i]?.extra?.lm_hidden || isSummarizable(chat[i])).map(i => messageLine(chat[i], i));
+    const lines = indices.filter(i => chat[i]?.extra?.lm_hidden || isSummarizable(chat[i]) || (node.includeHidden && String(chat[i]?.mes ?? '').trim())).map(i => messageLine(chat[i], i));
     if (!lines.length) return toastr.warning('원본 메시지를 찾지 못했어요.');
     if (estTokens(lines.join('\n')) > s.batchTokens) {
         return toastr.warning('이 구간은 한 번에 다시 요약하기엔 길어요. 설정의 "한 구간 최대 토큰"을 늘려주세요.');
