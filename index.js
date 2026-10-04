@@ -142,6 +142,14 @@ const defaultSettings = Object.freeze({
     autoBackupEvery: 10,
     backupKeep: 5,
     injectPreset: 'stable',
+    loreEnabled: true,
+    loreUseCharacter: true,
+    loreUseChat: true,
+    loreBooks: [],
+    loreTokenBudget: 2000,
+    wikiMaxPages: 40,
+    wikiBatch: 6,
+    qnaTopK: 10,
 });
 
 // ---------------------------------------------------------------- settings
@@ -157,7 +165,7 @@ function getSettings() {
     }
     for (const key of Object.keys(defaultSettings)) {
         if (!Object.hasOwn(extensionSettings[MODULE], key)) {
-            extensionSettings[MODULE][key] = defaultSettings[key];
+            extensionSettings[MODULE][key] = structuredClone(defaultSettings[key]);
         }
     }
     return extensionSettings[MODULE];
@@ -166,7 +174,74 @@ function getSettings() {
 // ---------------------------------------------------------------- memory model
 
 function emptyFrame() {
-    return { mode: 'original', work: '', characters: '', au: '', notes: '' };
+    return {
+        mode: 'original', work: '', characters: '', au: '', notes: '',
+        era: '', eraDetail: '', culture: '', cultureCustom: '', storyLanguage: '', nameStyle: '',
+    };
+}
+
+// World settings: when and where the story takes place, separate from the language it is written in.
+const ERAS = {
+    '': '지정 안 함',
+    modern: '현대',
+    nearfuture: '근미래 · SF',
+    recent: '근현대 (20세기)',
+    historical_east: '동양 사극 · 역사',
+    medieval: '중세 · 판타지',
+    custom: '직접 입력',
+};
+const ERA_EN = {
+    modern: 'the present day',
+    nearfuture: 'the near future / science fiction',
+    recent: 'the 20th century',
+    historical_east: 'a historical East Asian setting',
+    medieval: 'a medieval or fantasy setting',
+};
+const CULTURES = {
+    '': '지정 안 함',
+    korea: '한국',
+    japan: '일본',
+    china: '중국',
+    taiwan_hk: '대만 · 홍콩',
+    us: '미국 · 영어권',
+    europe: '영국 · 유럽',
+    fictional: '가상 세계',
+    custom: '직접 입력',
+};
+const CULTURE_EN = {
+    korea: 'Korean', japan: 'Japanese', china: 'Chinese', taiwan_hk: 'Taiwanese / Hong Kong',
+    us: 'American / English-speaking', europe: 'British / European', fictional: 'the story\'s own fictional',
+};
+const STORY_LANGUAGES = { '': '채팅 언어 따라가기', ko: '한국어', ja: '日本語', en: 'English', zh: '中文' };
+const STORY_LANGUAGE_EN = { ko: 'Korean', ja: 'Japanese', en: 'English', zh: 'Chinese' };
+const NAME_STYLES = {
+    '': '자동',
+    localized: '채팅 언어 발음으로 (예: 사토 하루키)',
+    original: '원래 문자 그대로 (예: 佐藤春樹)',
+    romanized: '로마자로 (예: Sato Haruki)',
+};
+
+function worldText(f) {
+    const parts = [];
+    const era = f.era === 'custom' ? '' : ERA_EN[f.era];
+    if (era || f.eraDetail.trim()) {
+        parts.push(`Era and situation: ${[era, f.eraDetail.trim()].filter(Boolean).join('. ')}.`);
+    }
+    const culture = f.culture === 'custom' ? f.cultureCustom.trim() : CULTURE_EN[f.culture];
+    const lang = STORY_LANGUAGE_EN[f.storyLanguage];
+    if (culture) {
+        parts.push(`The story world follows ${culture} culture and daily life: names and name order, honorifics and forms of address, schools, workplaces, money, food, holidays, customs and place names all fit that culture.`);
+    }
+    if (lang) {
+        parts.push(`All narration and dialogue are written in ${lang}. This is only the writing language, not the characters' nationality or culture${culture ? `: characters speak the language of their ${culture} world in-story, and their speech is rendered naturally in ${lang}, keeping culture-specific address terms and honorifics where they sound natural` : ''}.`);
+    }
+    const names = {
+        localized: `Write names as they are pronounced, in the ${lang || 'writing'} language's script.`,
+        original: 'Write names in their original script.',
+        romanized: 'Write names in romanized form.',
+    }[f.nameStyle];
+    if (names) parts.push(`${names} Keep each name's spelling consistent.`);
+    return parts.join(' ');
 }
 
 function emptyMemory() {
@@ -183,6 +258,8 @@ function emptyMemory() {
         history: [],
         tagVersion: 1,
         opsSinceBackup: 0,
+        wiki: { updatedAt: 0, pages: [] },
+        qna: [],
     };
 }
 
@@ -592,9 +669,94 @@ function frameText(frame) {
             if (f.au.trim()) parts.push(`Setting:\n${f.au.trim()}`);
             break;
     }
+    const world = worldText(f);
+    if (world) parts.push(world);
     if (f.characters.trim()) parts.push(`Character notes (written by the user):\n${f.characters.trim()}`);
     if (f.notes.trim()) parts.push(`Additional notes (written by the user):\n${f.notes.trim()}`);
     return parts.join('\n\n');
+}
+
+// ---------------------------------------------------------------- lorebook reference
+// Reads the character, chat and chosen lorebooks so summaries, checks, the wiki and
+// answers use the right names and world facts. Only entries relevant to the text are sent.
+
+const loreCache = { at: 0, key: '', entries: [] };
+
+function loreBookNames() {
+    const s = getSettings();
+    const c = ctx();
+    const names = new Set((s.loreBooks || []).filter(Boolean));
+    if (s.loreUseCharacter && c.characterId !== undefined && c.characterId !== null) {
+        const world = c.characters?.[c.characterId]?.data?.extensions?.world;
+        if (world) names.add(world);
+    }
+    if (s.loreUseChat && c.chatMetadata?.world_info) names.add(c.chatMetadata.world_info);
+    return [...names];
+}
+
+async function loreEntries() {
+    const s = getSettings();
+    if (!s.loreEnabled || typeof ctx().loadWorldInfo !== 'function') return [];
+    const names = loreBookNames();
+    const key = names.slice().sort().join('|');
+    if (key === loreCache.key && Date.now() - loreCache.at < 60000) return loreCache.entries;
+    const entries = [];
+    for (const name of names) {
+        try {
+            const data = await ctx().loadWorldInfo(name);
+            for (const e of Object.values(data?.entries || {})) {
+                const content = String(e?.content || '').trim();
+                if (!content || e.disable) continue;
+                entries.push({
+                    book: name,
+                    title: String(e.comment || '').trim(),
+                    keys: [...(e.key || []), ...(e.keysecondary || [])].map(k => String(k).trim()).filter(Boolean),
+                    content,
+                    constant: !!e.constant,
+                });
+            }
+        } catch (err) {
+            console.warn(LOG_PREFIX, `lorebook "${name}" could not be read`, err);
+        }
+    }
+    Object.assign(loreCache, { at: Date.now(), key, entries });
+    return entries;
+}
+
+function keyMatches(key, low, raw) {
+    const m = key.match(/^\/(.+)\/([a-z]*)$/);
+    if (m) {
+        try {
+            return new RegExp(m[1], m[2]).test(raw);
+        } catch {
+            return false;
+        }
+    }
+    return key.length >= 2 && low.includes(key.toLowerCase());
+}
+
+async function loreFor(text, budget = getSettings().loreTokenBudget) {
+    const entries = await loreEntries();
+    if (!entries.length || budget <= 0) return '';
+    const raw = String(text || '');
+    const low = raw.toLowerCase();
+    const scored = [];
+    for (const e of entries) {
+        const hits = e.keys.filter(k => keyMatches(k, low, raw)).length;
+        if (!hits && !e.constant) continue;
+        scored.push({ e, score: hits + (e.constant ? 0.5 : 0) });
+    }
+    scored.sort((a, b) => b.score - a.score);
+    const out = [];
+    let used = 0;
+    for (const { e } of scored) {
+        const line = `- ${e.title || e.keys[0] || 'entry'}: ${e.content.replace(/\s+/g, ' ')}`;
+        const cost = estTokens(line);
+        if (used + cost > budget) continue;
+        out.push(line);
+        used += cost;
+    }
+    return out.join('\n');
 }
 
 function ledgerText(ledger, { includeClosed = false } = {}) {
@@ -964,12 +1126,14 @@ function recallQuery(recentChat) {
     return lines.join('\n').slice(-3000);
 }
 
-async function hybridRecall(memory, query, { useDense = true } = {}) {
+async function hybridRecall(memory, query, { useDense = true, topK = null, budget = null } = {}) {
     const s = getSettings();
+    const maxItems = topK ?? s.recallTopK;
+    const maxTokens = budget ?? s.recallTokenBudget;
     const corpus = buildCorpus(memory);
     const queries = (Array.isArray(query) ? query : [query]).map(q => String(q || '').trim()).filter(Boolean);
     if (!corpus.length || !queries.length) return { results: [], dense: false };
-    const pool = Math.max(s.recallTopK * 4, 20);
+    const pool = Math.max(maxItems * 4, 20);
     const byHash = new Map(corpus.map(x => [x.hash, x]));
     const lists = [];
     let dense = false;
@@ -1013,10 +1177,10 @@ async function hybridRecall(memory, query, { useDense = true } = {}) {
     let tokens = 0;
     const usedRaw = [];
     for (const r of ranked) {
-        if (picked.length >= s.recallTopK) break;
+        if (picked.length >= maxItems) break;
         if (r.item.kind === 'raw' && usedRaw.some(([a, b]) => r.item.from <= b + 1 && r.item.to >= a - 1)) continue;
         const cost = estTokens(r.item.display);
-        if (picked.length && tokens + cost > s.recallTokenBudget) continue;
+        if (picked.length && tokens + cost > maxTokens) continue;
         picked.push(r);
         tokens += cost;
         if (r.item.kind === 'raw') usedRaw.push([r.item.from, r.item.to]);
@@ -1239,10 +1403,11 @@ Entries in the "note" category are pinned by the user: never change or delete th
 Reuse existing keys exactly when updating. Only emit operations for things that are new or changed. If nothing changed, output [].${extraRules()}`;
 }
 
-function summaryUserPrompt(memory, batch) {
+function summaryUserPrompt(memory, batch, lore = '') {
     const parts = [];
     const frame = frameText(memory.frame);
     if (frame) parts.push(`<story_frame>\n${frame}\n</story_frame>`);
+    if (lore) parts.push(`<lorebook_reference>\nReference only: use it for correct names, terms and world facts. Do not summarize it as events.\n${lore}\n</lorebook_reference>`);
     const before = [];
     if (memory.saga.text.trim()) before.push(memory.saga.text.trim());
     const recent = timelineText(memory, { lastN: 2 });
@@ -1393,7 +1558,7 @@ function pushHistory(memory, label) {
 
 async function summarizeBatch(memory, batch) {
     const system = summarySystemPrompt();
-    const user = summaryUserPrompt(memory, batch);
+    const user = summaryUserPrompt(memory, batch, await loreFor(batch.lines.join('\n')));
     let node = null;
     let ops = null;
     let events = [];
@@ -1694,8 +1859,10 @@ async function afterTurn(messageId) {
         for (let i = Math.max(0, messageId - 6); i < messageId; i++) {
             if (chat[i] && !chat[i].is_system) recent.push(messageLine(chat[i], i));
         }
+        const lore = await loreFor(`${recent.slice(-2).join('\n')}\n${messageLine(msg, messageId)}`, 1200);
         const user = [
             frameText(memory.frame) && `<story_frame>\n${frameText(memory.frame)}\n</story_frame>`,
+            lore && `<lorebook_reference>\n${lore}\n</lorebook_reference>`,
             `<established_memory>\n${ledgerText(memory.ledger) || '(empty)'}\n\n${timelineText(memory, { lastN: 1 })}\n</established_memory>`,
             recent.length && `<recent_messages>\n${recent.slice(-4).join('\n\n')}\n</recent_messages>`,
             `<new_reply>\n${messageLine(msg, messageId)}\n</new_reply>`,
@@ -1921,12 +2088,12 @@ async function openBackups() {
   <header><span class="lm-chip lm-chip-archive">${esc(b.label)}</span><span class="lm-range">${new Date(b.at).toLocaleString()}</span></header>
   <p class="lm-hint">타임라인 ${b.data.timeline?.length ?? 0}개, 기록 ${b.data.ledger?.entries?.length ?? 0}개, 사건 ${b.data.events?.length ?? 0}개, #${b.data.cursor}까지</p>
   <div class="lm-actions lm-actions-inline">
-    <button type="button" class="menu_button lm-btn lm-btn-quiet" data-restore="${i}"><i class="fa-solid fa-clock-rotate-left"></i><span>이 백업으로 되돌리기</span></button>
-    <button type="button" class="menu_button lm-btn lm-btn-quiet" data-download="${i}"><i class="fa-solid fa-download"></i><span>내려받기</span></button>
+    <button type="button" class="menu_button lm-btn lm-btn-quiet" data-restore="${i}">${icon('backup')}<span>이 백업으로 되돌리기</span></button>
+    <button type="button" class="menu_button lm-btn lm-btn-quiet" data-download="${i}">${icon('download')}<span>내려받기</span></button>
   </div>
 </article>`).reverse().join('');
     wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>백업</h3>
-      <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_backup_now"><i class="fa-solid fa-floppy-disk"></i><span>지금 백업</span></button></div>
+      <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_backup_now">${icon('save')}<span>지금 백업</span></button></div>
       <p class="lm-hint lm-pane-intro">이 채팅의 기억을 브라우저에 최근 ${getSettings().backupKeep}개까지 보관해요. 압축을 ${getSettings().autoBackupEvery || '?'}번 할 때마다 자동으로 저장돼요.</p>
       <div class="lm-results">${rows || '<div class="lm-empty">아직 백업이 없어요. 지금 백업을 눌러 만들어 보세요.</div>'}</div></div>`;
     applyThemeMode(wrap.firstElementChild);
@@ -2088,16 +2255,16 @@ async function openExportMenu(getData) {
     const c = ctx();
     const name = fileSafe(c.getCurrentChatId());
     const wrap = document.createElement('div');
-    const option = (id, icon, title, desc) => `
+    const option = (id, ic, title, desc) => `
 <button type="button" class="lm-export-option" data-export="${id}">
-  <i class="fa-solid ${icon}"></i><span class="lm-export-text"><b>${title}</b><span class="lm-hint">${desc}</span></span>
+  ${icon(ic)}<span class="lm-export-text"><b>${title}</b><span class="lm-hint">${desc}</span></span>
 </button>`;
     wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>내보내기</h3></div>
       <div class="lm-export-list">
-        ${option('json', 'fa-box-archive', '기억 백업 파일 (.json)', '그대로 다시 가져올 수 있는 전체 백업이에요.')}
-        ${option('md', 'fa-file-lines', '읽기용 문서 (.md)', '줄거리, 타임라인, 기록부, 사건을 사람이 읽기 좋게 정리해요.')}
-        ${option('wi', 'fa-book-atlas', '로어북 (월드인포 .json)', 'ST 월드인포에서 가져오기로 넣을 수 있는 형식이에요.')}
-        ${option('settings', 'fa-sliders', '확장 설정 (.json)', '이 확장의 설정만 저장해요. 다른 기기에서 가져오기로 똑같이 맞출 수 있어요.')}
+        ${option('json', 'archive', '기억 백업 파일 (.json)', '그대로 다시 가져올 수 있는 전체 백업이에요.')}
+        ${option('md', 'frame', '읽기용 문서 (.md)', '줄거리, 타임라인, 기록부, 사건을 사람이 읽기 좋게 정리해요.')}
+        ${option('wi', 'wiki', '로어북 (월드인포 .json)', 'ST 월드인포에서 가져오기로 넣을 수 있는 형식이에요.')}
+        ${option('settings', 'sliders', '확장 설정 (.json)', '이 확장의 설정만 저장해요. 다른 기기에서 가져오기로 똑같이 맞출 수 있어요.')}
       </div></div>`;
     applyThemeMode(wrap.firstElementChild);
     wrap.addEventListener('click', (event) => {
@@ -2165,6 +2332,315 @@ function syncSettingInputs() {
     });
     const desc = root.querySelector('#lm_preset_desc');
     if (desc) desc.textContent = INJECT_PRESETS[s.injectPreset]?.desc || '';
+}
+
+// ---------------------------------------------------------------- questions about the story
+
+let askBusy = false;
+
+async function askMemory(question) {
+    const s = getSettings();
+    const memory = getMemory(false);
+    if (!memory || (!hasContent(memory) && !memory.events?.length)) {
+        return { answer: '아직 코끼리가 기억한 이야기가 없어요. 먼저 압축해 주세요.', sources: [] };
+    }
+    const queries = [question];
+    if (s.queryExpansion) {
+        try {
+            queries.push(...await expandQueries(memory, [{ mes: question, name: ctx().name1, is_system: false }]));
+        } catch (err) {
+            console.warn(LOG_PREFIX, 'query expansion skipped', err);
+        }
+    }
+    const { results } = await hybridRecall(memory, queries, { topK: s.qnaTopK, budget: 3500 });
+    const index = memory.timeline
+        .map(n => `- ${n.title} (${rangeLabel(n.from, n.to)}${n.when ? `; in-story ${n.when}` : ''})`)
+        .join('\n');
+    const relevant = results.map(({ item }) => `- (${rangeLabel(item.from ?? -2, item.to ?? item.from ?? -2)}${item.when ? `; in-story ${item.when}` : ''}) ${item.display.replace(/\n+/g, ' / ')}`).join('\n');
+    const lore = await loreFor(`${question}\n${relevant}`, 1000);
+    const system = 'You answer the user\'s questions about an ongoing story using only the memory notes provided. Answer in Korean. Say when it happened (in-story time if known, and message numbers written like #123), what happened, and who was involved. If several moments fit, list them in order. If the notes do not contain the answer, say so plainly instead of guessing. Keep it short: 2-6 sentences unless the question asks for detail. Plain text only.';
+    const user = [
+        frameText(memory.frame) && `<story_frame>\n${frameText(memory.frame)}\n</story_frame>`,
+        memory.saga.text.trim() && `<story_so_far>\n${memory.saga.text.trim()}\n</story_so_far>`,
+        index && `<timeline_index>\n${index}\n</timeline_index>`,
+        `<ledger>\n${ledgerText(memory.ledger, { includeClosed: true }) || '(empty)'}\n</ledger>`,
+        relevant && `<relevant_memories>\n${relevant}\n</relevant_memories>`,
+        lore && `<lorebook_reference>\n${lore}\n</lorebook_reference>`,
+        `<question>\n${question}\n</question>`,
+    ].filter(Boolean).join('\n\n');
+    const answer = cleanOutput(await callModel(system, user, { retries: 1 }));
+    const sources = results.map(({ item }) => ({ kind: item.kind, from: item.from, to: item.to, when: item.when || '', text: item.display.slice(0, 300) }));
+    memory.qna = [...(memory.qna || []), { q: question, a: answer, at: Date.now(), sources }].slice(-30);
+    ctx().saveMetadataDebounced?.();
+    return { answer, sources };
+}
+
+function linkifyRefs(text) {
+    return esc(text).replace(/#(\d+)/g, '<button type="button" class="lm-ref" data-jump="$1">#$1</button>');
+}
+
+function askAnswerHtml(entry) {
+    const kind = { event: '사건', archive: '보관', raw: '원본 대사' };
+    const sources = (entry.sources || []).slice(0, 8).map(src => `
+<li><span class="lm-chip lm-chip-${src.kind}">${kind[src.kind] || src.kind}</span>${src.from >= 0 ? `<button type="button" class="lm-ref" data-jump="${src.from}">#${src.from}</button>` : '<span class="lm-range">이전 채팅</span>'}<span class="lm-src-text">${esc(src.text)}</span></li>`).join('');
+    return `
+<article class="lm-answer">
+  <p class="lm-answer-q">${esc(entry.q)}</p>
+  <p class="lm-answer-a">${linkifyRefs(entry.a)}</p>
+  ${sources ? `<details class="lm-sources"><summary>찾아본 기억 ${entry.sources.length}개</summary><ul>${sources}</ul></details>` : ''}
+</article>`;
+}
+
+function askPanelHtml(memory) {
+    const history = (memory.qna || []).slice(-10).reverse().map(askAnswerHtml).join('');
+    return `
+<div class="lm-ask">
+  <form class="lm-ask-row" id="lm_ask_form">
+    <input class="text_pole" id="lm_ask_input" placeholder="예: 레온이랑 처음 만난 게 언제였지?" autocomplete="off" aria-label="질문">
+    <button type="submit" class="menu_button lm-btn lm-btn-primary" id="lm_ask_btn">${icon('ask')}<span>묻기</span></button>
+  </form>
+  <p class="lm-hint">기억과 로어북을 찾아서 언제, 무슨 일이 있었는지 알려줘요. #번호를 누르면 그 메시지로 이동해요.</p>
+  <div id="lm_ask_out">${history || '<div class="lm-empty">궁금한 걸 물어보세요. 코끼리가 기억을 뒤져볼게요.</div>'}</div>
+</div>`;
+}
+
+function bindAskPanel(root, onJump) {
+    const form = root.querySelector('#lm_ask_form');
+    const input = root.querySelector('#lm_ask_input');
+    const out = root.querySelector('#lm_ask_out');
+    form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const question = input.value.trim();
+        if (!question || askBusy) return;
+        askBusy = true;
+        const btn = root.querySelector('#lm_ask_btn');
+        btn.disabled = true;
+        const pending = document.createElement('div');
+        pending.className = 'lm-answer lm-pending';
+        pending.innerHTML = `<p class="lm-answer-q">${esc(question)}</p><p class="lm-hint">기억을 찾아보는 중…</p>`;
+        out.querySelector('.lm-empty')?.remove();
+        out.prepend(pending);
+        try {
+            const result = await askMemory(question);
+            pending.outerHTML = askAnswerHtml({ q: question, a: result.answer, sources: result.sources });
+            input.value = '';
+        } catch (err) {
+            pending.innerHTML = `<p class="lm-answer-q">${esc(question)}</p><p class="lm-warn">답을 만들지 못했어요: ${esc(err?.message || err)}</p>`;
+        } finally {
+            askBusy = false;
+            btn.disabled = false;
+        }
+    });
+    root.addEventListener('click', (event) => {
+        const ref = event.target.closest('[data-jump]');
+        if (ref) onJump(Number(ref.dataset.jump));
+    });
+}
+
+async function jumpToMessage(id) {
+    if (Number.isNaN(id) || id < 0) return;
+    try {
+        await ctx().executeSlashCommandsWithOptions(`/chat-jump ${id}`);
+    } catch (err) {
+        console.warn(LOG_PREFIX, 'jump failed', err);
+    }
+}
+
+async function openAsk() {
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    const c = ctx();
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>코끼리에게 묻기</h3></div>${askPanelHtml(getMemory(true))}</div>`;
+    applyThemeMode(wrap.firstElementChild);
+    const popup = new c.Popup(wrap, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, allowVerticalScrolling: true, leftAlign: true });
+    bindAskPanel(wrap, async (id) => {
+        await popup.completeCancelled();
+        jumpToMessage(id);
+    });
+    const showing = popup.show();
+    setTimeout(() => wrap.querySelector('#lm_ask_input')?.focus(), 60);
+    await showing;
+}
+
+// ---------------------------------------------------------------- wiki
+
+function collectEntities(memory) {
+    const map = new Map();
+    const add = (name, type, weight) => {
+        const clean = String(name || '').trim();
+        if (clean.length < 2 || clean.length > 40) return;
+        const key = clean.toLowerCase();
+        const cur = map.get(key) || { name: clean, type, score: 0 };
+        cur.score += weight;
+        if (cur.type === 'term' && type !== 'term') cur.type = type;
+        map.set(key, cur);
+    };
+    for (const e of memory.ledger.entries) {
+        if (e.cat === 'character') add(e.key, 'character', 6);
+        else if (e.cat === 'item') add(e.key, 'item', 4);
+        else if (e.cat === 'relation') e.key.split(/\s*(?:->|→|➡|<->|↔|\/|,)\s*/).forEach(n => add(n, 'character', 2));
+        else if (e.cat === 'fact' && e.key.length <= 24) add(e.key, 'term', 1);
+    }
+    for (const ev of memory.events) {
+        (ev.characters || []).forEach(n => add(n, 'character', 1));
+        if (ev.place) add(ev.place, 'place', 1);
+        (ev.items || []).forEach(n => add(n, 'item', 1));
+    }
+    if (memory.ledger.scene.place) add(memory.ledger.scene.place, 'place', 2);
+    return [...map.values()].filter(e => e.score >= 2).sort((a, b) => b.score - a.score).slice(0, getSettings().wikiMaxPages);
+}
+
+function entityContext(memory, ent) {
+    const low = ent.name.toLowerCase();
+    const has = (text) => String(text || '').toLowerCase().includes(low);
+    const ledger = memory.ledger.entries.filter(e => has(e.key) || has(e.value)).slice(0, 12)
+        .map(e => `- [${CATEGORY_EN[e.cat] || e.cat}] ${e.key}: ${e.value}${e.knownBy?.length ? ` (known only by ${e.knownBy.join(', ')})` : ''}`);
+    const events = memory.events.filter(e => has([e.text, ...(e.characters || []), e.place, ...(e.items || [])].join(' ')));
+    const important = [...events].sort((a, b) => b.importance - a.importance).slice(0, 14);
+    const chosen = events.filter(e => important.includes(e)).map(e => `- (${rangeLabel(e.from ?? -2, e.to ?? -2)}${e.when ? `; in-story ${e.when}` : ''}) ${e.text}`);
+    const nodes = memory.timeline.filter(n => has(n.title) || has(n.text)).slice(0, 4).map(n => `- ${n.title}: ${n.text.slice(0, 300)}`);
+    return [ledger.length && `Ledger:\n${ledger.join('\n')}`, chosen.length && `Events (oldest first):\n${chosen.join('\n')}`, nodes.length && `Timeline mentions:\n${nodes.join('\n')}`]
+        .filter(Boolean).join('\n');
+}
+
+async function buildWiki() {
+    if (busy) return toastr.warning('이미 작업 중입니다.');
+    const memory = getMemory(false);
+    if (!hasContent(memory)) return toastr.info('위키로 정리할 기억이 아직 없어요.');
+    const entities = collectEntities(memory);
+    if (!entities.length) return toastr.info('정리할 인물이나 장소를 찾지 못했어요.');
+    const s = getSettings();
+    const batches = [];
+    for (let i = 0; i < entities.length; i += s.wikiBatch) batches.push(entities.slice(i, i + s.wikiBatch));
+    const ok = await ctx().Popup.show.confirm('위키 만들기', `인물·장소·물건 ${entities.length}개를 ${batches.length}번에 나눠 정리해요. 요약 모델을 ${batches.length}번 호출해요. 진행할까요?`);
+    if (!ok) return;
+    const chatId = ctx().getCurrentChatId();
+    busy = true;
+    abortController = new AbortController();
+    setBusyUI(true);
+    let made = 0;
+    try {
+        const system = `You write a concise wiki about the characters, places, items and terms of an ongoing story, using only the notes given. ${languageRule()}
+Reply with only a JSON array, one object per requested entry:
+{"title":"<name>","type":"character|place|item|group|term","aliases":["..."],"summary":"<1-2 sentences>","details":"<short paragraphs or lines starting with '- ': profile, what happened with them, current state>","relations":["<other name>: <relation>"],"firstSeen":"<when first mentioned: message range or in-story time>","status":"<current status in one line>"}
+Do not invent facts. Leave out an entry if the notes say nothing meaningful about it.`;
+        for (let b = 0; b < batches.length; b++) {
+            if (abortController.signal.aborted || !stillSameChat(chatId)) break;
+            setProgress(`위키 정리 중 ${b + 1}/${batches.length}`);
+            const batch = batches[b];
+            const lore = await loreFor(batch.map(e => e.name).join('\n'), 1200);
+            const user = [
+                frameText(memory.frame) && `<story_frame>\n${frameText(memory.frame)}\n</story_frame>`,
+                lore && `<lorebook_reference>\n${lore}\n</lorebook_reference>`,
+                ...batch.map(e => `<entry name="${e.name.replace(/"/g, "'")}" type="${e.type}">\n${entityContext(memory, e) || '(no notes)'}\n</entry>`),
+                `Write the wiki entries for: ${batch.map(e => e.name).join(', ')}.`,
+            ].filter(Boolean).join('\n\n');
+            const out = await callModel(system, user);
+            const pages = (parseJsonLenient(out) || []).filter(p => p && typeof p === 'object' && String(p.title || '').trim() && String(p.summary || p.details || '').trim());
+            if (!stillSameChat(chatId)) break;
+            if (!memory.wiki) memory.wiki = { updatedAt: 0, pages: [] };
+            for (const p of pages) {
+                const title = String(p.title).trim().slice(0, 80);
+                const page = {
+                    id: newId(),
+                    title,
+                    type: ['character', 'place', 'item', 'group', 'term'].includes(p.type) ? p.type : 'term',
+                    aliases: toList(p.aliases),
+                    summary: String(p.summary || '').trim(),
+                    details: String(p.details || '').trim(),
+                    relations: toList(p.relations),
+                    firstSeen: String(p.firstSeen || '').trim().slice(0, 80),
+                    status: String(p.status || '').trim().slice(0, 200),
+                    updatedAt: Date.now(),
+                };
+                const idx = memory.wiki.pages.findIndex(x => x.title.toLowerCase() === title.toLowerCase());
+                if (idx >= 0) memory.wiki.pages[idx] = { ...page, id: memory.wiki.pages[idx].id };
+                else memory.wiki.pages.push(page);
+                made++;
+            }
+            memory.wiki.updatedAt = Date.now();
+            await ctx().saveMetadata();
+        }
+        toastr.success(`위키 문서 ${made}개를 정리했어요.`, APP_NAME);
+    } catch (err) {
+        if (String(err?.message) === 'aborted') toastr.info(`중지했어요. (${made}개 정리됨)`);
+        else toastr.error(`위키 만들기 실패: ${err?.message || err}`);
+    } finally {
+        busy = false;
+        abortController = null;
+        setBusyUI(false);
+        setProgress('');
+        updateStatus();
+    }
+}
+
+const WIKI_TYPES = { character: '인물', place: '장소', item: '물건', group: '집단', term: '용어' };
+
+function wikiPageHtml(p) {
+    return `
+<div class="lm-wiki-page lm-item" data-wiki-id="${esc(p.id)}">
+  <div class="lm-wiki-head">
+    <input type="checkbox" class="lm-sel" aria-label="선택">
+    <span class="lm-chip lm-chip-wiki-${p.type}">${WIKI_TYPES[p.type] || p.type}</span>
+    <span class="lm-wiki-title">${esc(p.title)}</span>
+    <span class="lm-spacer"></span>
+    ${deleteButton()}
+  </div>
+  <p class="lm-wiki-sum">${esc(p.summary)}</p>
+  <details class="lm-wiki-more">
+    <summary>자세히</summary>
+    <div class="lm-wiki-body">
+      ${p.aliases?.length ? `<p class="lm-hint">다른 이름: ${esc(p.aliases.join(', '))}</p>` : ''}
+      ${p.status ? `<p><b>현재</b> ${esc(p.status)}</p>` : ''}
+      ${p.details ? `<p class="lm-wiki-details">${esc(p.details)}</p>` : ''}
+      ${p.relations?.length ? `<ul class="lm-wiki-rel">${p.relations.map(r => `<li>${esc(r)}</li>`).join('')}</ul>` : ''}
+      ${p.firstSeen ? `<p class="lm-hint">처음 등장: ${esc(p.firstSeen)}</p>` : ''}
+    </div>
+  </details>
+</div>`;
+}
+
+function wikiMarkdown(memory) {
+    const out = ['# 코끼리 위키', ''];
+    for (const [type, label] of Object.entries(WIKI_TYPES)) {
+        const pages = (memory.wiki?.pages || []).filter(p => p.type === type);
+        if (!pages.length) continue;
+        out.push(`## ${label}`, '');
+        for (const p of pages) {
+            out.push(`### ${p.title}`, '');
+            if (p.aliases?.length) out.push(`다른 이름: ${p.aliases.join(', ')}`, '');
+            out.push(p.summary, '');
+            if (p.status) out.push(`**현재**: ${p.status}`, '');
+            if (p.details) out.push(p.details, '');
+            if (p.relations?.length) out.push(...p.relations.map(r => `- ${r}`), '');
+            if (p.firstSeen) out.push(`처음 등장: ${p.firstSeen}`, '');
+        }
+    }
+    return out.join('\n');
+}
+
+function wikiHtml(memory) {
+    const pages = memory.wiki?.pages || [];
+    const toc = Object.entries(WIKI_TYPES).map(([type, label]) => {
+        const list = pages.filter(p => p.type === type);
+        return list.length ? `<h3>${label}</h3><ul>${list.map(p => `<li><a href="#p-${esc(p.id)}">${esc(p.title)}</a></li>`).join('')}</ul>` : '';
+    }).join('');
+    const body = pages.map(p => `
+<section id="p-${esc(p.id)}"><h2>${esc(p.title)} <small>${WIKI_TYPES[p.type] || ''}</small></h2>
+${p.aliases?.length ? `<p class="m">다른 이름: ${esc(p.aliases.join(', '))}</p>` : ''}
+<p class="s">${esc(p.summary)}</p>
+${p.status ? `<p><b>현재</b> ${esc(p.status)}</p>` : ''}
+${p.details ? `<p class="d">${esc(p.details)}</p>` : ''}
+${p.relations?.length ? `<ul>${p.relations.map(r => `<li>${esc(r)}</li>`).join('')}</ul>` : ''}
+${p.firstSeen ? `<p class="m">처음 등장: ${esc(p.firstSeen)}</p>` : ''}</section>`).join('');
+    return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>코끼리 위키</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css">
+<style>:root{--bg:#FAF8F4;--card:#fff;--ink:#22212A;--mute:#6E6A77;--line:#E7E1D6;--acc:#B9853A}@media(prefers-color-scheme:dark){:root{--bg:#18171C;--card:#211F27;--ink:#EDE9E2;--mute:#A39DAD;--line:#34313C;--acc:#D8A85A}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.7 'Pretendard Variable',Pretendard,system-ui,sans-serif;letter-spacing:-.01em}
+.wrap{display:grid;grid-template-columns:240px 1fr;gap:32px;max-width:1080px;margin:0 auto;padding:40px 20px}nav{position:sticky;top:20px;align-self:start;font-size:14px}nav h3{font-size:12px;color:var(--mute);margin:18px 0 6px;font-weight:600}nav ul{list-style:none;margin:0;padding:0}nav a{color:var(--ink);text-decoration:none;display:block;padding:3px 0}nav a:hover{color:var(--acc)}
+h1{font-size:28px;margin:0 0 24px;font-weight:700}section{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px 24px;margin-bottom:14px}section h2{margin:0 0 8px;font-size:20px}section h2 small{font-size:12px;color:var(--acc);font-weight:600;margin-left:6px}
+.s{font-weight:500}.d{white-space:pre-wrap}.m{color:var(--mute);font-size:14px}@media(max-width:760px){.wrap{grid-template-columns:1fr}nav{position:static}}</style></head>
+<body><div class="wrap"><nav><h1>코끼리 위키</h1>${toc}</nav><main>${body || '<p>비어 있어요.</p>'}</main></div></body></html>`;
 }
 
 // ---------------------------------------------------------------- automatic compression
@@ -2441,6 +2917,54 @@ function runStop() {
     }
 }
 
+// ---------------------------------------------------------------- icons
+// Hand-drawn line icons (24px grid, 1.7 stroke) used across the extension UI.
+
+const ICONS = {
+    compress: '<path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="m14 10 6.5-6.5"/><path d="M3.5 20.5 10 14"/>',
+    layers: '<path d="M12 3 2.5 8 12 13l9.5-5z"/><path d="m2.5 12.5 9.5 5 9.5-5"/><path d="m2.5 17 9.5 5 9.5-5"/>',
+    stop: '<rect x="6" y="6" width="12" height="12" rx="2.5"/>',
+    book: '<path d="M4 19.5V5a2 2 0 0 1 2-2h13v14H6.5A2.5 2.5 0 0 0 4 19.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-5"/>',
+    sparkle: '<path d="m12 3.5 1.9 5.1 5.1 1.9-5.1 1.9-1.9 5.1-1.9-5.1-5.1-1.9 5.1-1.9z"/><path d="m19 15.5.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/>',
+    undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>',
+    sliders: '<path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/>',
+    chevron: '<path d="m6 9 6 6 6-6"/>',
+    feather: '<path d="M20.2 3.8a6 6 0 0 0-8.5 0L5 10.5V19h8.5l6.7-6.7a6 6 0 0 0 0-8.5z"/><path d="M16 8 2.5 21.5"/><path d="M17.5 15H9"/>',
+    ruler: '<rect x="2.5" y="7" width="19" height="10" rx="2"/><path d="M7 7v3M11 7v4M15 7v3M19 7v4"/>',
+    bulb: '<path d="M9 18h6M10 21.5h4"/><path d="M12 2.5a6.5 6.5 0 0 0-4 11.6c.7.6 1 1.4 1 2.4h6c0-1 .3-1.8 1-2.4a6.5 6.5 0 0 0-4-11.6z"/>',
+    shield: '<path d="M12 2.8 4.5 5.8v5.7c0 4.6 3.1 8.4 7.5 9.7 4.4-1.3 7.5-5.1 7.5-9.7V5.8z"/><path d="m9 12 2 2 4-4.5"/>',
+    plug: '<path d="M9 3v5M15 3v5"/><path d="M6.5 8h11v3.5a5.5 5.5 0 0 1-11 0z"/><path d="M12 17v4"/>',
+    db: '<ellipse cx="12" cy="5.5" rx="7.5" ry="2.8"/><path d="M4.5 5.5v13c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8v-13"/><path d="M4.5 12c0 1.5 3.4 2.8 7.5 2.8s7.5-1.3 7.5-2.8"/>',
+    search: '<circle cx="11" cy="11" r="6.5"/><path d="m20.5 20.5-4.8-4.8"/>',
+    export: '<path d="M12 15V3.5"/><path d="m7.5 8 4.5-4.5L16.5 8"/><path d="M5 14v5.5h14V14"/>',
+    import: '<path d="M12 3.5V15"/><path d="m7.5 10.5 4.5 4.5 4.5-4.5"/><path d="M5 14v5.5h14V14"/>',
+    download: '<path d="M12 3.5V15"/><path d="m7.5 10.5 4.5 4.5 4.5-4.5"/><path d="M5 19.5h14"/>',
+    backup: '<path d="M3.5 12a8.5 8.5 0 1 0 2.5-6"/><path d="M3.5 4v4.5H8"/><path d="M12 7.5V12l3 2"/>',
+    handoff: '<path d="M4 12h15"/><path d="m13.5 6.5 5.5 5.5-5.5 5.5"/>',
+    receive: '<path d="M20 12H5"/><path d="M10.5 6.5 5 12l5.5 5.5"/>',
+    reset: '<path d="M20 20H8.5l-4.7-4.7a1.5 1.5 0 0 1 0-2.1l9.4-9.4a1.5 1.5 0 0 1 2.1 0l5 5a1.5 1.5 0 0 1 0 2.1L11 20"/><path d="m8.5 8.5 7 7"/>',
+    trash: '<path d="M4 6.5h16"/><path d="M9.5 6.5V4h5v2.5"/><path d="m6.5 6.5.8 13.5h9.4l.8-13.5"/><path d="M10 10.5v6M14 10.5v6"/>',
+    plus: '<path d="M12 5v14M5 12h14"/>',
+    pin: '<path d="M9 3.5h6l-1 5 3.5 3.5v2h-11v-2L10 8.5z"/><path d="M12 14v6.5"/>',
+    check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
+    frame: '<path d="M5 3.5h11.5L19 6v14.5H5z"/><path d="M8.5 9h7M8.5 13h7M8.5 17h4"/>',
+    timeline: '<circle cx="6" cy="6" r="1.8"/><circle cx="6" cy="12" r="1.8"/><circle cx="6" cy="18" r="1.8"/><path d="M10.5 6H20M10.5 12H17M10.5 18H19"/>',
+    ledger: '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="11" r="2.2"/><path d="M5.8 16c.6-1.6 1.8-2.4 3.2-2.4s2.6.8 3.2 2.4"/><path d="M14.5 10h4M14.5 13.5h3"/>',
+    events: '<path d="M13 2.5 4.5 13.5H11l-1 8 8.5-11H12z"/>',
+    wiki: '<path d="M2.5 5h6A3.5 3.5 0 0 1 12 8.5V20a2.5 2.5 0 0 0-2.5-2.5h-7z"/><path d="M21.5 5h-6A3.5 3.5 0 0 0 12 8.5V20a2.5 2.5 0 0 1 2.5-2.5h7z"/>',
+    ask: '<path d="M20.5 12a8.5 8.5 0 0 1-12.6 7.4l-4.4 1.1 1.1-4.4A8.5 8.5 0 1 1 20.5 12z"/><path d="M9.8 9.5a2.3 2.3 0 0 1 4.4.8c0 1.6-2.2 2-2.2 3.2"/><path d="M12 16.3v.2"/>',
+    archive: '<rect x="3" y="3.5" width="18" height="4.5" rx="1"/><path d="M5 8v12.5h14V8"/><path d="M10 12h4"/>',
+    userpen: '<circle cx="10" cy="7.5" r="4"/><path d="M3 20.5a7 7 0 0 1 10.5-6"/><path d="m17.5 13.5 3 3-5 5h-3v-3z"/>',
+    range: '<rect x="3.5" y="4" width="5" height="5" rx="1"/><rect x="3.5" y="15" width="5" height="5" rx="1"/><path d="M12 6.5h8.5M12 17.5h8.5M6 10v4"/>',
+    rotate: '<path d="M20 11.5A8 8 0 1 0 17.6 17"/><path d="M20.5 4.5v7h-7"/>',
+    save: '<path d="M5 3.5h11.5L20 7v13.5H4V4.5a1 1 0 0 1 1-1z"/><path d="M8 3.5v5h7.5v-5"/><path d="M7.5 20.5v-6h9v6"/>',
+    alert: '<path d="M12 3.5 2.5 20h19z"/><path d="M12 10v4.5M12 17.2v.3"/>',
+};
+
+function icon(name) {
+    return `<svg class="lm-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${ICONS[name] || ''}</svg>`;
+}
+
 // ---------------------------------------------------------------- settings panel
 
 function profileOptions(selected) {
@@ -2463,7 +2987,7 @@ const UNITS = {
     remindAt: '개', autoBackupEvery: '번', backupKeep: '개', expansionTimeoutMs: 'ms', memoryBudget: '토큰', protectRecent: '개', maxEpisodes: '개', chapterSize: '개',
     maxChapters: '개', sagaMaxWords: '단어', staleAfter: '메시지', archiveMax: '개', maxUndo: '회',
     recallTopK: '개', recallTokenBudget: '토큰', recallScan: '개', vectorThreshold: '%', rawChunkMessages: '개',
-    rawChunkChars: '자', eventMax: '개', queryTimeoutMs: 'ms',
+    rawChunkChars: '자', eventMax: '개', queryTimeoutMs: 'ms', loreTokenBudget: '토큰',
 };
 
 function numberRow(key, label, min, max, hint = '') {
@@ -2547,12 +3071,29 @@ function readImp(row) {
     return clampInt(row.querySelector('.lm-imp input:checked')?.value, 1, 5, 3);
 }
 
-function iconToggle(cls, icon, title, checked) {
-    return `<label class="lm-icon-toggle" title="${title}"><input type="checkbox" class="${cls}" ${checked ? 'checked' : ''} aria-label="${title}"><i class="fa-solid ${icon}"></i></label>`;
+function iconToggle(cls, ic, title, checked) {
+    const name = { 'fa-thumbtack': 'pin', 'fa-check': 'check' }[ic] || ic;
+    return `<label class="lm-icon-toggle" title="${title}"><input type="checkbox" class="${cls}" ${checked ? 'checked' : ''} aria-label="${title}">${icon(name)}</label>`;
+}
+
+function bulkBar(scope, extra = '') {
+    return `
+<div class="lm-bulk" data-scope="${scope}">
+  <label class="lm-bulk-all"><input type="checkbox" class="lm-sel-all" aria-label="전체 선택"><span>전체</span></label>
+  <span class="lm-bulk-count">0개 선택</span>
+  <span class="lm-spacer"></span>
+  <button type="button" class="lm-chipbtn lm-range-mode" title="켜고 첫 항목과 끝 항목을 차례로 누르면 그 사이를 한 번에 선택해요. 컴퓨터에서는 Shift를 누른 채 눌러도 돼요">${icon('range')}<span>범위 선택</span></button>
+  <button type="button" class="lm-chipbtn lm-chipbtn-danger lm-bulk-del" disabled>${icon('trash')}<span>선택 삭제</span></button>
+  ${extra}
+</div>`;
+}
+
+function selBox() {
+    return '<input type="checkbox" class="lm-sel" aria-label="선택">';
 }
 
 function deleteButton() {
-    return '<button type="button" class="lm-icon-btn lm-del" title="삭제 (다시 누르면 취소)" aria-label="삭제"><i class="fa-solid fa-trash-can"></i></button>';
+    return `<button type="button" class="lm-icon-btn lm-del" title="삭제 (다시 누르면 취소)" aria-label="삭제">${icon('trash')}</button>`;
 }
 
 function ledgerGroups(memory) {
@@ -2565,7 +3106,7 @@ function ledgerGroups(memory) {
     <span class="lm-group-name">${label}</span>
     <span class="lm-count">${entries.length}</span>
     <span class="lm-spacer"></span>
-    <button type="button" class="lm-icon-btn lm-add-entry" data-cat="${cat}" title="${label} 항목 추가"><i class="fa-solid fa-plus"></i></button>
+    <button type="button" class="lm-icon-btn lm-add-entry" data-cat="${cat}" title="${label} 항목 추가">${icon('plus')}</button>
   </div>
   <div class="lm-group-list">${entries.map(entryRow).join('')}</div>
 </div>`;
@@ -2598,19 +3139,19 @@ function settingsHtml() {
 
       <div class="lm-actions">
         <button type="button" class="menu_button lm-btn lm-btn-primary" id="lm_btn_compress" title="미요약 메시지에서 한 구간을 요약합니다">
-          <i class="fa-solid fa-feather-pointed"></i><span>압축</span><span class="lm-badge" id="lm_badge" hidden></span>
+          ${icon('compress')}<span>압축</span><span class="lm-badge" id="lm_badge" hidden></span>
         </button>
         <button type="button" class="menu_button lm-btn" id="lm_btn_all" title="남은 미요약 메시지를 처음부터 전부 요약합니다">
-          <i class="fa-solid fa-layer-group"></i><span>전체 압축</span>
+          ${icon('layers')}<span>전체 압축</span>
         </button>
         <button type="button" class="menu_button lm-btn lm-btn-stop" id="lm_btn_stop" title="진행 중인 작업을 멈춥니다">
-          <i class="fa-solid fa-stop"></i><span>중지</span>
+          ${icon('stop')}<span>중지</span>
         </button>
       </div>
       <div class="lm-actions lm-actions-sub">
-        <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_manager"><i class="fa-solid fa-book-open"></i><span>기억장</span></button>
-        <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_compact" title="덜 중요한 기억부터 줄이고 오래된 것을 합칩니다"><i class="fa-solid fa-wand-magic-sparkles"></i><span>정리</span></button>
-        <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_undo"><i class="fa-solid fa-rotate-left"></i><span>되돌리기</span></button>
+        <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_manager">${icon('book')}<span>기억장</span></button>
+        <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_compact" title="덜 중요한 기억부터 줄이고 오래된 것을 합칩니다">${icon('sparkle')}<span>정리</span></button>
+        <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_undo">${icon('undo')}<span>되돌리기</span></button>
       </div>
       <label class="lm-auto-row" title="AI 답변이 끝날 때마다 확인해서, 미요약이 기준만큼 쌓이면 한 구간을 자동으로 압축해요">
         <span class="lm-switch"><input type="checkbox" data-lm-setting="autoCompress" aria-label="자동 압축"><span class="lm-switch-track" aria-hidden="true"></span></span>
@@ -2620,14 +3161,14 @@ function settingsHtml() {
       <div id="lm_progress" class="lm-progress" aria-live="polite"></div>
 
       <details class="lm-fold" id="lm_fold">
-        <summary class="lm-fold-head"><i class="fa-solid fa-sliders"></i><span>설정</span><i class="fa-solid fa-chevron-down lm-fold-chev"></i></summary>
+        <summary class="lm-fold-head">${icon('sliders')}<span>설정</span><span class="lm-fold-chev">${icon('chevron')}</span></summary>
       <div class="lm-tabs lm-tabs-pill" role="tablist">
-        <button type="button" class="lm-tab active" data-lm-tab="summary" role="tab"><i class="fa-solid fa-feather"></i><span>요약</span></button>
-        <button type="button" class="lm-tab" data-lm-tab="range" role="tab"><i class="fa-solid fa-ruler-horizontal"></i><span>범위</span></button>
-        <button type="button" class="lm-tab" data-lm-tab="tidy" role="tab"><i class="fa-solid fa-broom"></i><span>정리</span></button>
-        <button type="button" class="lm-tab" data-lm-tab="recall" role="tab"><i class="fa-solid fa-lightbulb"></i><span>회상</span></button>
-        <button type="button" class="lm-tab" data-lm-tab="check" role="tab"><i class="fa-solid fa-shield-heart"></i><span>검사</span></button>
-        <button type="button" class="lm-tab" data-lm-tab="inject" role="tab"><i class="fa-solid fa-puzzle-piece"></i><span>주입</span></button>
+        <button type="button" class="lm-tab active" data-lm-tab="summary" role="tab">${icon('feather')}<span>요약</span></button>
+        <button type="button" class="lm-tab" data-lm-tab="range" role="tab">${icon('ruler')}<span>범위</span></button>
+        <button type="button" class="lm-tab" data-lm-tab="tidy" role="tab">${icon('sparkle')}<span>정리</span></button>
+        <button type="button" class="lm-tab" data-lm-tab="recall" role="tab">${icon('bulb')}<span>회상</span></button>
+        <button type="button" class="lm-tab" data-lm-tab="check" role="tab">${icon('shield')}<span>검사</span></button>
+        <button type="button" class="lm-tab" data-lm-tab="inject" role="tab">${icon('plug')}<span>주입</span></button>
       </div>
       <div class="lm-panes">
 
@@ -2640,11 +3181,20 @@ function settingsHtml() {
         ${checkRow('previewBeforeSave', '저장 전에 요약 미리보기', '압축할 때마다 결과를 보여주고, 고치거나 다시 요약할 수 있어요. 자동 압축에는 적용되지 않아요')}
         ${checkRow('includePreset', '프로필의 샘플링 설정 사용')}
         ${checkRow('systemAsUser', '지시를 유저 메시지로 보내기', 'system 역할을 받지 않는 모델일 때만 켜세요')}
+        <div class="lm-subhead">로어북 참고</div>
+        ${checkRow('loreEnabled', '로어북 참고하기', '요약, 모순 검사, 위키, 질문 답변에서 관련된 로어북 항목을 함께 참고해 이름과 설정을 정확하게 맞춰요')}
+        ${checkRow('loreUseCharacter', '캐릭터 로어북 자동 포함')}
+        ${checkRow('loreUseChat', '채팅 로어북 자동 포함')}
+        <div class="lm-field lm-field-stack">
+          <div class="lm-field-text"><span class="lm-field-label">추가로 참고할 로어북</span><span class="lm-hint">전역 로어북 등 함께 볼 것을 골라주세요</span></div>
+          <div class="lm-lore-list" id="lm_lore_list"></div>
+        </div>
+        ${numberRow('loreTokenBudget', '로어북 참고 상한', 0, 100000, '한 번에 보낼 로어북 내용의 최대 크기')}
         <div class="lm-field lm-field-stack">
           <div class="lm-field-text"><span class="lm-field-label">추가 요약 규칙</span><span class="lm-hint">요약 AI에게 덧붙일 지시. 영어로 쓰면 가장 정확해요</span></div>
           <textarea class="text_pole lm-textarea" data-lm-setting="extraRules" rows="3" placeholder="Always track the in-story date."></textarea>
         </div>
-        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane"><i class="fa-solid fa-rotate"></i>이 탭 기본값으로</button></div>
+        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane">${icon('rotate')}이 탭 기본값으로</button></div>
       </section>
 
       <section class="lm-pane" data-lm-pane="range" role="tabpanel">
@@ -2655,7 +3205,7 @@ function settingsHtml() {
         ${checkRow('autoForgetDeleted', '메시지를 지우면 그 기억도 지우기', '요약된 메시지를 모두 지우면 해당 기억을 자동으로 지워요. 일부만 지우면 "다시 요약" 표시를 해요')}
         ${checkRow('stripHtml', 'HTML과 상태창 태그 빼고 요약')}
         ${numberRow('remindAt', '압축 알림 기준', 0, 100000, '미요약이 이만큼 쌓이면 알려줍니다. 0이면 끔')}
-        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane"><i class="fa-solid fa-rotate"></i>이 탭 기본값으로</button></div>
+        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane">${icon('rotate')}이 탭 기본값으로</button></div>
       </section>
 
       <section class="lm-pane" data-lm-pane="tidy" role="tabpanel">
@@ -2671,7 +3221,7 @@ function settingsHtml() {
         ${numberRow('maxUndo', '되돌리기 기록', 0, 50)}
         ${numberRow('autoBackupEvery', '자동 백업 간격', 0, 1000, '압축을 이만큼 할 때마다 브라우저에 백업해요. 0이면 끔')}
         ${numberRow('backupKeep', '백업 보관 개수', 1, 50)}
-        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane"><i class="fa-solid fa-rotate"></i>이 탭 기본값으로</button></div>
+        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane">${icon('rotate')}이 탭 기본값으로</button></div>
       </section>
 
       <section class="lm-pane" data-lm-pane="recall" role="tabpanel">
@@ -2684,8 +3234,8 @@ function settingsHtml() {
         ${textRow('embedModel', '임베딩 모델', '비우면 ST 벡터 저장소 설정의 모델', '예: bge-m3')}
         ${textRow('embedApiUrl', '임베딩 서버 주소', 'Ollama, llama.cpp, vLLM만 해당. 비우면 ST 설정', 'http://127.0.0.1:11434')}
         <div class="lm-actions lm-actions-inline">
-          <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_reindex"><i class="fa-solid fa-database"></i><span>색인 맞추기</span></button>
-          <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_search"><i class="fa-solid fa-magnifying-glass"></i><span>검색 테스트</span></button>
+          <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_reindex">${icon('db')}<span>색인 맞추기</span></button>
+          <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_search">${icon('search')}<span>검색 테스트</span></button>
         </div>
         <details class="lm-more">
           <summary>세부 조정</summary>
@@ -2702,26 +3252,26 @@ function settingsHtml() {
           ${numberRow('queryTimeoutMs', '검색 시간 제한 (ms)', 500, 120000, '넘으면 키워드 검색 결과만 씁니다')}
           ${numberRow('expansionTimeoutMs', '검색어 확장 시간 제한', 1000, 120000, '넘으면 확장 없이 바로 검색해요')}
         </details>
-        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane"><i class="fa-solid fa-rotate"></i>이 탭 기본값으로</button></div>
+        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane">${icon('rotate')}이 탭 기본값으로</button></div>
       </section>
 
       <section class="lm-pane" data-lm-pane="check" role="tabpanel">
         <div class="lm-field-text lm-pane-intro"><span class="lm-hint">AI 답변이 끝날 때마다 요약 모델이 한 번 살펴봐요. 둘 다 켜도 호출은 1번이에요. 요약 모델 프로필을 따로 지정해 두면 대화와 겹치지 않아요.</span></div>
         ${checkRow('checkContradictions', '모순 검사', '죽은 인물이 등장하거나, 이름·관계·부상이 바뀌거나, 모르는 비밀을 아는 등 기억과 다른 부분을 찾아 메시지에 ⚠ 표시를 해요')}
         ${checkRow('liveStateUpdate', '현재 상태 실시간 갱신', '압축 전이라도 시간·장소·함께 있는 인물·약속을 매 답변마다 기록부에 반영해요')}
-        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane"><i class="fa-solid fa-rotate"></i>이 탭 기본값으로</button></div>
+        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane">${icon('rotate')}이 탭 기본값으로</button></div>
       </section>
 
       <section class="lm-pane" data-lm-pane="inject" role="tabpanel">
         ${selectRow('injectPreset', '주입 프리셋', selectOptions(Object.fromEntries(Object.entries(INJECT_PRESETS).map(([k, v]) => [k, v.label])), s.injectPreset), s.injectPreset, '')}
-        <div class="lm-preset-row"><span class="lm-hint" id="lm_preset_desc">${esc(INJECT_PRESETS[s.injectPreset]?.desc || '')}</span><button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_apply_preset"><i class="fa-solid fa-wand-magic-sparkles"></i><span>적용</span></button></div>
+        <div class="lm-preset-row"><span class="lm-hint" id="lm_preset_desc">${esc(INJECT_PRESETS[s.injectPreset]?.desc || '')}</span><button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_apply_preset">${icon('sparkle')}<span>적용</span></button></div>
         ${selectRow('injectPosition', '기억 넣을 위치', selectOptions({ in_prompt: '캐릭터 설정 뒤', before_prompt: '프롬프트 맨 앞', in_chat: '채팅 안 (깊이 지정)' }, s.injectPosition), s.injectPosition, '대부분 캐릭터 설정 뒤가 가장 안정적이에요')}
         ${numberRow('injectDepth', '채팅 안 깊이', 0, 10000, '위치가 채팅 안일 때만 사용')}
         ${selectRow('injectRole', '역할', selectOptions({ system: 'system', user: 'user', assistant: 'assistant' }, s.injectRole), s.injectRole)}
         ${checkRow('anchorEnabled', '현재 상태 리마인더', '최근 대화 근처에 짧게 넣어 긴 채팅에서도 흐름을 놓치지 않게 합니다')}
         ${numberRow('anchorDepth', '리마인더 깊이', 0, 10000)}
         ${numberRow('recallDepth', '회상 넣을 깊이', 0, 10000, '0이면 마지막 메시지 바로 뒤')}
-        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane"><i class="fa-solid fa-rotate"></i>이 탭 기본값으로</button></div>
+        <div class="lm-pane-foot"><button type="button" class="lm-link-btn lm-reset-pane">${icon('rotate')}이 탭 기본값으로</button></div>
       </section>
       </div>
       </details>
@@ -2797,12 +3347,46 @@ function bindSettings(root) {
     root.querySelector('#lm_btn_undo').addEventListener('click', () => runUndo());
     root.querySelector('#lm_btn_stop').addEventListener('click', () => runStop());
     root.querySelector('#lm_btn_reindex').addEventListener('click', () => syncVectors({ notify: true }));
+    renderLoreList();
+    root.querySelector('#lm_fold').addEventListener('toggle', renderLoreList);
+    root.querySelector('#lm_lore_list').addEventListener('change', (event) => {
+        const box = event.target.closest('input[data-lore]');
+        if (!box) return;
+        const set = new Set(s.loreBooks || []);
+        if (box.checked) set.add(box.dataset.lore);
+        else set.delete(box.dataset.lore);
+        s.loreBooks = [...set];
+        saveSettingsDebounced();
+        loreCache.key = '';
+    });
     const presetSelect = root.querySelector('[data-lm-setting="injectPreset"]');
     presetSelect.addEventListener('change', () => {
         root.querySelector('#lm_preset_desc').textContent = INJECT_PRESETS[presetSelect.value]?.desc || '';
     });
     root.querySelector('#lm_apply_preset').addEventListener('click', () => applyPreset(presetSelect.value));
     root.querySelector('#lm_btn_search').addEventListener('click', () => openSearchTest());
+}
+
+function renderLoreList() {
+    const el = document.getElementById('lm_lore_list');
+    if (!el) return;
+    const s = getSettings();
+    let names = [];
+    try {
+        names = ctx().getWorldInfoNames?.() || [];
+    } catch {
+        names = [];
+    }
+    const auto = new Set(loreBookNames());
+    if (!names.length) {
+        el.innerHTML = '<span class="lm-hint">로어북이 없어요.</span>';
+        return;
+    }
+    el.innerHTML = names.map(n => {
+        const picked = (s.loreBooks || []).includes(n);
+        const isAuto = auto.has(n) && !picked;
+        return `<label class="lm-lore-chip ${picked ? 'on' : ''}"><input type="checkbox" data-lore="${esc(n)}" ${picked ? 'checked' : ''}><span>${esc(n)}</span>${isAuto ? '<em>자동</em>' : ''}</label>`;
+    }).join('');
 }
 
 function setBusyUI(isBusy) {
@@ -2939,14 +3523,15 @@ async function openSearchTest() {
 
 function nodeCard(node) {
     return `
-<div class="lm-node lm-node-${node.tier}" data-node-id="${esc(node.id)}">
+<div class="lm-node lm-item lm-node-${node.tier}" data-node-id="${esc(node.id)}">
   <div class="lm-node-dot" aria-hidden="true"></div>
   <div class="lm-node-body">
     <div class="lm-node-meta">
+      ${selBox()}
       <span class="lm-chip lm-chip-${node.tier}">${node.tier === 'chapter' ? '챕터' : '에피소드'}</span>
       <span class="lm-range">${node.from === -1 ? '이전 채팅' : node.from < 0 ? '원본 삭제됨' : `#${node.from}~#${node.to}`}</span>
       ${node.condensed ? `<span class="lm-range">${node.condensed}회 압축됨</span>` : ''}
-      ${node.stale ? `<button type="button" class="lm-stale" data-resum="${esc(node.id)}" title="원본이 바뀌었어요. 눌러서 이 구간만 다시 요약해요"><i class="fa-solid fa-rotate"></i>다시 요약</button>` : ''}
+      ${node.stale ? `<button type="button" class="lm-stale" data-resum="${esc(node.id)}" title="원본이 바뀌었어요. 눌러서 이 구간만 다시 요약해요">${icon('rotate')}다시 요약</button>` : ''}
       <span class="lm-spacer"></span>
       ${impControl(node.importance)}
       ${iconToggle('lm-pin', 'fa-thumbtack', '고정 (자동 압축에서 제외)', node.pinned)}
@@ -2962,8 +3547,9 @@ function nodeCard(node) {
 
 function entryRow(entry) {
     return `
-<div class="lm-entry" data-entry-id="${esc(entry.id)}">
+<div class="lm-entry lm-item" data-entry-id="${esc(entry.id)}">
   <div class="lm-entry-top">
+    ${selBox()}
     <input class="text_pole lm-key" value="${esc(entry.key)}" placeholder="이름 또는 항목" aria-label="항목">
     <select class="text_pole lm-cat" aria-label="분류">${selectOptions(CATEGORIES, entry.cat)}</select>
     ${impControl(entry.importance)}
@@ -2980,8 +3566,9 @@ function entryRow(entry) {
 function eventRow(e) {
     const who = [e.characters?.join(', '), e.place].filter(Boolean);
     return `
-<div class="lm-event" data-event-id="${esc(e.id)}">
+<div class="lm-event lm-item" data-event-id="${esc(e.id)}">
   <div class="lm-entry-top">
+    ${selBox()}
     <span class="lm-range">#${e.from}~#${e.to}</span>
     ${who.map(w => `<span class="lm-tag">${esc(w)}</span>`).join('')}
     <span class="lm-spacer"></span>
@@ -2997,65 +3584,103 @@ function managerHtml(memory) {
     const sc = memory.ledger.scene;
     const archive = memory.archive.slice(-100).reverse()
         .map(a => `
-<article class="lm-result">
-  <header><span class="lm-chip lm-chip-archive">${a.kind === 'ledger' ? '기록' : '요약'}</span><span class="lm-range">#${a.from ?? '?'}~#${a.to ?? '?'}</span></header>
+<article class="lm-result lm-arch lm-item" data-archive-id="${esc(a.id)}">
+  <header>${selBox()}<span class="lm-chip lm-chip-archive">${a.kind === 'ledger' ? '기록' : '요약'}</span><span class="lm-range">${a.from === -1 ? '이전 채팅' : `#${a.from ?? '?'}~#${a.to ?? '?'}`}</span><span class="lm-spacer"></span>${deleteButton()}</header>
   <p><b>${esc(a.title)}</b><br>${esc(a.text)}</p>
 </article>`).join('');
     const frameModes = Object.entries(FRAME_MODES).map(([value, label]) => {
         const [name, desc] = label.split(' (');
         return `<label class="lm-mode"><input type="radio" name="lm_f_mode" value="${value}" ${value === f.mode ? 'checked' : ''}><span class="lm-mode-name">${esc(name)}</span><span class="lm-mode-desc">${esc((desc || '').replace(/\)$/, ''))}</span></label>`;
     }).join('');
+    const wikiPages = (memory.wiki?.pages || []).slice().sort((x, y) => Object.keys(WIKI_TYPES).indexOf(x.type) - Object.keys(WIKI_TYPES).indexOf(y.type) || x.title.localeCompare(y.title));
+    const tab = (id, ic, label, count = null, active = false) =>
+        `<button type="button" class="lm-tab ${active ? 'active' : ''}" data-lm-tab="${id}" role="tab">${icon(ic)}<span>${label}</span>${count === null ? '' : `<span class="lm-count">${count}</span>`}</button>`;
+    const tool = (id, ic, label, extra = '', title = '') =>
+        `<button type="button" class="lm-toolbtn ${extra}" id="${id}" ${title ? `title="${esc(title)}"` : ''}>${icon(ic)}<span>${label}</span></button>`;
     return `
 <div class="lm-root lm-manager">
   <div class="lm-manager-head">
     <h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>코끼리의 기억장</h3>
     <div class="lm-manager-tools">
-      <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_export"><i class="fa-solid fa-file-export"></i><span>내보내기</span></button>
-      <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_import"><i class="fa-solid fa-file-import"></i><span>가져오기</span></button>
-      <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_backups"><i class="fa-solid fa-clock-rotate-left"></i><span>백업</span></button>
-      <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_handoff_save" title="이 기억을 저장해 두고, 같은 캐릭터로 새 채팅을 열 때 이어받아요"><i class="fa-solid fa-person-walking-arrow-right"></i><span>새 채팅으로 이어가기</span></button>
-      <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_handoff_load" title="저장해 둔 이전 채팅의 기억을 이 채팅으로 가져와요"><i class="fa-solid fa-person-walking-arrow-loop-left"></i><span>이어받기</span></button>
-      <button type="button" class="menu_button lm-btn lm-btn-danger" id="lm_reset"><i class="fa-solid fa-eraser"></i><span>초기화</span></button>
+      ${tool('lm_export', 'export', '내보내기')}
+      ${tool('lm_import', 'import', '가져오기')}
+      ${tool('lm_backups', 'backup', '백업')}
+      ${tool('lm_handoff_save', 'handoff', '새 채팅으로 이어가기', '', '이 기억을 저장해 두고, 같은 캐릭터로 새 채팅을 열 때 이어받아요')}
+      ${tool('lm_handoff_load', 'receive', '이어받기', '', '저장해 둔 이전 채팅의 기억을 이 채팅으로 가져와요')}
+      ${tool('lm_reset', 'reset', '초기화', 'lm-toolbtn-danger')}
       <input type="file" id="lm_import_file" accept=".json,application/json" hidden>
     </div>
   </div>
 
-  <div class="lm-tabs lm-tabs-pill lm-tabs-sticky" role="tablist">
-    <button type="button" class="lm-tab active" data-lm-tab="frame" role="tab"><i class="fa-solid fa-masks-theater"></i><span>작품 설정</span></button>
-    <button type="button" class="lm-tab" data-lm-tab="timeline" role="tab"><i class="fa-solid fa-timeline"></i><span>타임라인</span><span class="lm-count">${memory.timeline.length}</span></button>
-    <button type="button" class="lm-tab" data-lm-tab="ledger" role="tab"><i class="fa-solid fa-address-book"></i><span>기록부</span><span class="lm-count">${memory.ledger.entries.length}</span></button>
-    <button type="button" class="lm-tab" data-lm-tab="events" role="tab"><i class="fa-solid fa-bolt"></i><span>사건</span><span class="lm-count">${memory.events.length}</span></button>
-    <button type="button" class="lm-tab" data-lm-tab="archive" role="tab"><i class="fa-solid fa-box-archive"></i><span>보관함</span><span class="lm-count">${memory.archive.length}</span></button>
+  <div class="lm-tabs lm-tabs-line lm-tabs-sticky" role="tablist">
+    ${tab('frame', 'frame', '작품 설정', null, true)}
+    ${tab('timeline', 'timeline', '타임라인', memory.timeline.length)}
+    ${tab('ledger', 'ledger', '기록부', memory.ledger.entries.length)}
+    ${tab('events', 'events', '사건', memory.events.length)}
+    ${tab('wiki', 'wiki', '위키', wikiPages.length)}
+    ${tab('ask', 'ask', '질문')}
+    ${tab('archive', 'archive', '보관함', memory.archive.length)}
   </div>
 
   <section class="lm-pane active" data-lm-pane="frame" role="tabpanel">
-    <div class="lm-field-text lm-pane-intro"><span class="lm-hint">여기 적은 내용은 요약할 때와 대화할 때 모두 AI에게 전달됩니다.</span></div>
+    <p class="lm-hint lm-pane-intro">여기 적은 내용은 요약할 때와 대화할 때 모두 AI에게 전달돼요.</p>
     <div class="lm-modes" role="radiogroup" aria-label="작품 유형">${frameModes}</div>
-    <div class="lm-field lm-field-stack">
-      <div class="lm-field-text"><span class="lm-field-label">원작 제목</span></div>
-      <input class="text_pole" id="lm_f_work" value="${esc(f.work)}" placeholder="2차 창작일 때 원작 이름">
+    <div class="lm-card-group">
+      <div class="lm-field lm-field-stack">
+        <div class="lm-field-text"><span class="lm-field-label">원작 제목</span></div>
+        <input class="text_pole" id="lm_f_work" value="${esc(f.work)}" placeholder="2차 창작일 때 원작 이름">
+      </div>
     </div>
-    <div class="lm-field lm-field-stack">
-      <div class="lm-field-text"><span class="lm-field-label">캐릭터 소개</span><span class="lm-hint">누가 어떤 캐릭터인지, 이 이야기에서의 관계까지</span></div>
-      <textarea class="text_pole" id="lm_f_characters" rows="5" placeholder="예: 레온: 원작 주인공. 무뚝뚝하지만 동료를 아낌. 이 이야기에서는 유저의 소꿉친구.">${esc(f.characters)}</textarea>
+    <h4 class="lm-subhead">세계와 언어</h4>
+    <div class="lm-card-group lm-world">
+      <div class="lm-field lm-field-stack">
+        <div class="lm-field-text"><span class="lm-field-label">시대</span></div>
+        <select class="text_pole" id="lm_f_era">${selectOptions(ERAS, f.era)}</select>
+      </div>
+      <div class="lm-field lm-field-stack">
+        <div class="lm-field-text"><span class="lm-field-label">세계 문화권</span><span class="lm-hint">이야기 속 사람들이 사는 곳</span></div>
+        <select class="text_pole" id="lm_f_culture">${selectOptions(CULTURES, f.culture)}</select>
+        <input class="text_pole" id="lm_f_culture_custom" value="${esc(f.cultureCustom)}" placeholder="직접 입력 (예: 1920년대 상하이)" ${f.culture === 'custom' ? '' : 'hidden'}>
+      </div>
+      <div class="lm-field lm-field-stack">
+        <div class="lm-field-text"><span class="lm-field-label">채팅에 쓰는 언어</span><span class="lm-hint">글로 쓰는 언어일 뿐, 인물의 국적과는 별개예요</span></div>
+        <select class="text_pole" id="lm_f_lang">${selectOptions(STORY_LANGUAGES, f.storyLanguage)}</select>
+      </div>
+      <div class="lm-field lm-field-stack">
+        <div class="lm-field-text"><span class="lm-field-label">이름 표기</span></div>
+        <select class="text_pole" id="lm_f_names">${selectOptions(NAME_STYLES, f.nameStyle)}</select>
+      </div>
+      <div class="lm-field lm-field-stack lm-span-2">
+        <div class="lm-field-text"><span class="lm-field-label">시대 · 상황 설명</span><span class="lm-hint">예: 2024년 도쿄, 고등학교 2학년 봄 / 전쟁 직후의 항구 도시</span></div>
+        <textarea class="text_pole" id="lm_f_era_detail" rows="2" placeholder="언제, 어디서, 어떤 상황인지">${esc(f.eraDetail)}</textarea>
+      </div>
+      <p class="lm-hint lm-span-2 lm-example">일본 만화 2차 창작이라면 <b>세계 문화권: 일본</b>, <b>채팅 언어: 한국어</b>로 두세요. 인물들은 일본 현대 사회에서 살지만, 대사와 서술은 한국어로 써요.</p>
     </div>
-    <div class="lm-field lm-field-stack">
-      <div class="lm-field-text"><span class="lm-field-label">배경 · AU 설정</span><span class="lm-hint">AU나 자유 2차 창작일 때 바뀐 세계관</span></div>
-      <textarea class="text_pole" id="lm_f_au" rows="3" placeholder="예: 현대 대학가, 마법은 존재하지 않음">${esc(f.au)}</textarea>
+    <h4 class="lm-subhead">인물과 배경</h4>
+    <div class="lm-card-group">
+      <div class="lm-field lm-field-stack">
+        <div class="lm-field-text"><span class="lm-field-label">캐릭터 소개</span><span class="lm-hint">누가 어떤 캐릭터인지, 이 이야기에서의 관계까지</span></div>
+        <textarea class="text_pole" id="lm_f_characters" rows="5" placeholder="예: 레온: 원작 주인공. 무뚝뚝하지만 동료를 아낌. 이 이야기에서는 유저의 소꿉친구.">${esc(f.characters)}</textarea>
+      </div>
+      <div class="lm-field lm-field-stack">
+        <div class="lm-field-text"><span class="lm-field-label">배경 · AU 설정</span><span class="lm-hint">AU나 자유 2차 창작일 때 바뀐 세계관</span></div>
+        <textarea class="text_pole" id="lm_f_au" rows="3" placeholder="예: 현대 대학가, 마법은 존재하지 않음">${esc(f.au)}</textarea>
+      </div>
+      <div class="lm-field lm-field-stack">
+        <div class="lm-field-text"><span class="lm-field-label">기타 메모</span></div>
+        <textarea class="text_pole" id="lm_f_notes" rows="2">${esc(f.notes)}</textarea>
+      </div>
     </div>
-    <div class="lm-field lm-field-stack">
-      <div class="lm-field-text"><span class="lm-field-label">기타 메모</span></div>
-      <textarea class="text_pole" id="lm_f_notes" rows="2">${esc(f.notes)}</textarea>
-    </div>
-    <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_f_save_char" title="이 캐릭터로 새 채팅을 열 때 자동으로 불러옵니다"><i class="fa-solid fa-user-pen"></i><span>이 캐릭터의 기본값으로 저장</span></button>
+    ${tool('lm_f_save_char', 'userpen', '이 캐릭터의 기본값으로 저장', 'lm-toolbtn-wide', '이 캐릭터로 새 채팅을 열 때 자동으로 불러와요')}
   </section>
 
   <section class="lm-pane" data-lm-pane="timeline" role="tabpanel">
     <div class="lm-saga">
-      <div class="lm-field-text"><span class="lm-field-label">지금까지의 이야기</span><span class="lm-hint">오래된 챕터가 합쳐지면 여기에 쌓입니다</span></div>
+      <div class="lm-field-text"><span class="lm-field-label">지금까지의 이야기</span><span class="lm-hint">오래된 챕터가 합쳐지면 여기에 쌓여요</span></div>
       <textarea class="text_pole" id="lm_saga" rows="6" placeholder="아직 비어 있어요.">${esc(memory.saga.text)}</textarea>
     </div>
-    <div id="lm_timeline" class="lm-timeline">${memory.timeline.map(nodeCard).join('') || '<div class="lm-empty">아직 코끼리가 기억한 이야기가 없어요. 패널에서 압축을 누르면 여기에 차곡차곡 쌓여요.</div>'}</div>
+    ${memory.timeline.length ? bulkBar('timeline', `<label class="lm-restore" title="지운 기억에 들어 있던 메시지를 숨김 해제해서 다시 AI에게 보여줘요. 가장 최근 기억을 지우면 그 구간을 다시 압축할 수 있어요"><input type="checkbox" id="lm_restore_src"><span>원본 다시 보이기</span></label>`) : ''}
+    <div id="lm_timeline" class="lm-timeline lm-list">${memory.timeline.map(nodeCard).join('') || '<div class="lm-empty">아직 기억한 이야기가 없어요. 패널에서 압축을 누르면 여기에 차곡차곡 쌓여요.</div>'}</div>
   </section>
 
   <section class="lm-pane" data-lm-pane="ledger" role="tabpanel">
@@ -3065,18 +3690,36 @@ function managerHtml(memory) {
       <div class="lm-field lm-field-stack"><div class="lm-field-text"><span class="lm-field-label">함께 있는 인물</span></div><input class="text_pole" id="lm_s_present" value="${esc(sc.present)}"></div>
       <div class="lm-field lm-field-stack"><div class="lm-field-text"><span class="lm-field-label">분위기</span></div><input class="text_pole" id="lm_s_mood" value="${esc(sc.mood)}"></div>
     </div>
-    <div id="lm_entries">${ledgerGroups(memory)}</div>
+    ${bulkBar('ledger')}
+    <div id="lm_entries" class="lm-list">${ledgerGroups(memory)}</div>
   </section>
 
   <section class="lm-pane" data-lm-pane="events" role="tabpanel">
-    <input class="text_pole lm-filter" id="lm_event_filter" placeholder="사건 찾기: 이름, 장소, 물건…" aria-label="사건 찾기">
-    <div class="lm-hint lm-pane-intro">회상 검색에 쓰이는 개별 사건입니다. 최근 ${Math.min(memory.events.length, 300)}개를 보여줘요.</div>
-    <div id="lm_events" class="lm-list">${memory.events.slice(-300).reverse().map(eventRow).join('') || '<div class="lm-empty">아직 사건이 없어요. 회상 탭에서 사건 추출을 켜고 압축하면 생깁니다.</div>'}</div>
+    <div class="lm-search">${icon('search')}<input class="text_pole lm-filter" id="lm_event_filter" placeholder="사건 찾기: 이름, 장소, 물건" aria-label="사건 찾기"></div>
+    <p class="lm-hint lm-pane-intro">회상 검색에 쓰이는 개별 사건이에요. 최근 ${Math.min(memory.events.length, 300)}개를 보여줘요.</p>
+    ${memory.events.length ? bulkBar('events') : ''}
+    <div id="lm_events" class="lm-list">${memory.events.slice(-300).reverse().map(eventRow).join('') || '<div class="lm-empty">아직 사건이 없어요. 회상 탭에서 사건 추출을 켜고 압축하면 생겨요.</div>'}</div>
+  </section>
+
+  <section class="lm-pane" data-lm-pane="wiki" role="tabpanel">
+    <div class="lm-wiki-tools">
+      ${tool('lm_wiki_build', 'sparkle', wikiPages.length ? '위키 새로 정리' : '위키 만들기', 'lm-toolbtn-accent')}
+      ${tool('lm_wiki_md', 'download', '.md')}
+      ${tool('lm_wiki_html', 'download', '.html')}
+    </div>
+    <p class="lm-hint lm-pane-intro">기록부와 사건을 바탕으로 인물, 장소, 물건을 문서로 정리해요.${memory.wiki?.updatedAt ? ` 마지막 정리: ${new Date(memory.wiki.updatedAt).toLocaleString()}` : ''}</p>
+    ${wikiPages.length ? `<div class="lm-search">${icon('search')}<input class="text_pole lm-filter" id="lm_wiki_filter" placeholder="위키 찾기" aria-label="위키 찾기"></div>${bulkBar('wiki')}` : ''}
+    <div id="lm_wiki" class="lm-list">${wikiPages.map(wikiPageHtml).join('') || '<div class="lm-empty">아직 위키가 없어요. 위키 만들기를 눌러 정리해 보세요.</div>'}</div>
+  </section>
+
+  <section class="lm-pane" data-lm-pane="ask" role="tabpanel">
+    ${askPanelHtml(memory)}
   </section>
 
   <section class="lm-pane" data-lm-pane="archive" role="tabpanel">
-    <div class="lm-hint lm-pane-intro">압축하면서 줄어든 옛 요약입니다. 회상 검색에 쓰이며, 최근 100개를 보여줘요.</div>
-    <div class="lm-results">${archive || '<div class="lm-empty">비어 있어요.</div>'}</div>
+    <p class="lm-hint lm-pane-intro">압축하면서 줄어든 옛 요약이에요. 회상 검색에 쓰이고, 최근 100개를 보여줘요.</p>
+    ${archive ? bulkBar('archive') : ''}
+    <div class="lm-results lm-list" id="lm_archive">${archive || '<div class="lm-empty">비어 있어요.</div>'}</div>
   </section>
 </div>`;
 }
@@ -3089,6 +3732,12 @@ function collectManager(root, memory) {
         characters: root.querySelector('#lm_f_characters').value,
         au: root.querySelector('#lm_f_au').value,
         notes: root.querySelector('#lm_f_notes').value,
+        era: root.querySelector('#lm_f_era').value,
+        eraDetail: root.querySelector('#lm_f_era_detail').value,
+        culture: root.querySelector('#lm_f_culture').value,
+        cultureCustom: root.querySelector('#lm_f_culture_custom').value,
+        storyLanguage: root.querySelector('#lm_f_lang').value,
+        nameStyle: root.querySelector('#lm_f_names').value,
     };
     out.saga.text = root.querySelector('#lm_saga').value;
     const byId = new Map(memory.timeline.map(n => [n.id, n]));
@@ -3142,10 +3791,34 @@ function collectManager(root, memory) {
             return { ...e, text: row.querySelector('.lm-text').value.trim(), importance: readImp(row) };
         })
         .filter(e => e && e.text);
+    const deletedArchive = new Set([...root.querySelectorAll('#lm_archive .lm-arch.lm-deleted')].map(el => el.dataset.archiveId));
+    out.archive = memory.archive.filter(a => !deletedArchive.has(a.id));
+    const deletedWiki = new Set([...root.querySelectorAll('#lm_wiki .lm-wiki-page.lm-deleted')].map(el => el.dataset.wikiId));
+    out.wiki = { ...(memory.wiki || { updatedAt: 0 }), pages: (memory.wiki?.pages || []).filter(p => !deletedWiki.has(p.id)) };
     return out;
 }
 
-async function openManager({ focusOwner = null } = {}) {
+// Shows the messages of deleted memories to the AI again and pulls the cursor back
+// when the newest memories were removed, so that part can be compressed again.
+function restoreSources(memory, ids) {
+    const { chat } = ctx();
+    const unhide = [];
+    chat.forEach((msg, i) => {
+        if (!msg?.extra?.lm_owner || !ids.has(msg.extra.lm_owner)) return;
+        delete msg.extra.lm_owner;
+        if (msg.extra.lm_hidden) {
+            delete msg.extra.lm_hidden;
+            unhide.push(i);
+        }
+    });
+    setHidden(unhide, false);
+    let maxOwned = -1;
+    chat.forEach((msg, i) => { if (msg?.extra?.lm_owner) maxOwned = i; });
+    memory.cursor = maxOwned;
+    memory.hiddenRanges = listToRanges(chat.map((m, i) => (m?.extra?.lm_hidden ? i : -1)).filter(i => i >= 0));
+}
+
+async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
     if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
     if (busy) return toastr.warning('작업이 끝난 뒤에 열어주세요.');
     const c = ctx();
@@ -3165,10 +3838,73 @@ async function openManager({ focusOwner = null } = {}) {
         await action();
     };
 
+    const lastPicked = new WeakMap();
+    const paneOf = (el) => el.closest('.lm-pane');
+    const visibleItems = (pane) => [...pane.querySelectorAll('.lm-item')].filter(el => !el.hidden);
+    const updateBulk = (pane) => {
+        const bar = pane?.querySelector('.lm-bulk');
+        if (!bar) return;
+        const items = visibleItems(pane);
+        const picked = items.filter(el => el.querySelector('.lm-sel')?.checked);
+        bar.querySelector('.lm-bulk-count').textContent = `${picked.length}개 선택`;
+        bar.querySelector('.lm-bulk-del').disabled = picked.length === 0;
+        const all = bar.querySelector('.lm-sel-all');
+        all.checked = items.length > 0 && picked.length === items.length;
+        all.indeterminate = picked.length > 0 && picked.length < items.length;
+        const allDeleted = picked.length > 0 && picked.every(el => el.classList.contains('lm-deleted'));
+        bar.querySelector('.lm-bulk-del span').textContent = allDeleted ? '선택 복구' : '선택 삭제';
+        items.forEach(el => el.classList.toggle('lm-picked', !!el.querySelector('.lm-sel')?.checked));
+    };
+
     root.addEventListener('click', async (event) => {
+        const sel = event.target.closest('.lm-sel');
+        if (sel) {
+            const pane = paneOf(sel);
+            const item = sel.closest('.lm-item');
+            const rangeBtn = pane.querySelector('.lm-range-mode');
+            const ranged = event.shiftKey || rangeBtn?.classList.contains('on');
+            const last = lastPicked.get(pane);
+            if (ranged && last && last !== item && pane.contains(last)) {
+                const items = visibleItems(pane);
+                const [a, b] = [items.indexOf(last), items.indexOf(item)].sort((x, y) => x - y);
+                if (a >= 0 && b >= 0) items.slice(a, b + 1).forEach(el => { el.querySelector('.lm-sel').checked = sel.checked; });
+                rangeBtn?.classList.remove('on');
+            }
+            lastPicked.set(pane, item);
+            updateBulk(pane);
+            return;
+        }
+        const selAll = event.target.closest('.lm-sel-all');
+        if (selAll) {
+            const pane = paneOf(selAll);
+            visibleItems(pane).forEach(el => { el.querySelector('.lm-sel').checked = selAll.checked; });
+            updateBulk(pane);
+            return;
+        }
+        const rangeMode = event.target.closest('.lm-range-mode');
+        if (rangeMode) {
+            rangeMode.classList.toggle('on');
+            if (rangeMode.classList.contains('on')) toastr.info('시작 항목과 끝 항목을 차례로 눌러주세요.', '', { timeOut: 2500 });
+            return;
+        }
+        const bulkDel = event.target.closest('.lm-bulk-del');
+        if (bulkDel) {
+            const pane = paneOf(bulkDel);
+            const picked = visibleItems(pane).filter(el => el.querySelector('.lm-sel')?.checked);
+            const restore = picked.every(el => el.classList.contains('lm-deleted'));
+            picked.forEach(el => {
+                el.classList.toggle('lm-deleted', !restore);
+                el.querySelector('.lm-sel').checked = false;
+            });
+            updateBulk(pane);
+            if (!restore) toastr.info(`${picked.length}개를 삭제로 표시했어요. 저장을 누르면 반영돼요.`, '', { timeOut: 2500 });
+            return;
+        }
         const del = event.target.closest('.lm-del');
         if (del) {
-            del.closest('.lm-node, .lm-entry, .lm-event')?.classList.toggle('lm-deleted');
+            event.preventDefault();
+            del.closest('.lm-item')?.classList.toggle('lm-deleted');
+            updateBulk(paneOf(del));
             return;
         }
         const add = event.target.closest('.lm-add-entry');
@@ -3194,9 +3930,27 @@ async function openManager({ focusOwner = null } = {}) {
             });
             return;
         }
-        const tool = event.target.closest('#lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_reset');
+        const tool = event.target.closest('#lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html');
         if (!tool) return;
         switch (tool.id) {
+            case 'lm_wiki_build':
+                await closeThen(async () => {
+                    await buildWiki();
+                    openManager({ tab: 'wiki' });
+                });
+                break;
+            case 'lm_wiki_md': {
+                const data = collectManager(root, memory);
+                if (!data.wiki.pages.length) return toastr.info('아직 위키가 없어요.');
+                downloadFile(`elephant-wiki-${fileSafe(c.getCurrentChatId())}.md`, wikiMarkdown(data), 'text/markdown');
+                break;
+            }
+            case 'lm_wiki_html': {
+                const data = collectManager(root, memory);
+                if (!data.wiki.pages.length) return toastr.info('아직 위키가 없어요.');
+                downloadFile(`elephant-wiki-${fileSafe(c.getCurrentChatId())}.html`, wikiHtml(data), 'text/html');
+                break;
+            }
             case 'lm_export':
                 await openExportMenu(() => collectManager(root, memory));
                 break;
@@ -3221,6 +3975,16 @@ async function openManager({ focusOwner = null } = {}) {
             const text = (row.querySelector('.lm-text').value + ' ' + row.querySelector('.lm-entry-top').textContent).toLowerCase();
             row.hidden = !!q && !text.includes(q);
         });
+    });
+    const wikiFilter = root.querySelector('#lm_wiki_filter');
+    wikiFilter?.addEventListener('input', () => {
+        const q = wikiFilter.value.trim().toLowerCase();
+        root.querySelectorAll('#lm_wiki .lm-wiki-page').forEach(el => { el.hidden = !!q && !el.textContent.toLowerCase().includes(q); });
+    });
+    bindAskPanel(root, (id) => closeThen(() => jumpToMessage(id)));
+    const cultureSel = root.querySelector('#lm_f_culture');
+    cultureSel.addEventListener('change', () => {
+        root.querySelector('#lm_f_culture_custom').hidden = cultureSel.value !== 'custom';
     });
     root.querySelector('#lm_f_save_char').addEventListener('click', async () => {
         const { characterId, writeExtensionField } = ctx();
@@ -3263,6 +4027,7 @@ async function openManager({ focusOwner = null } = {}) {
         leftAlign: true,
     });
     const showing = popup.show();
+    if (startTab) setTimeout(() => selectTab(startTab), 30);
     if (focusOwner) {
         setTimeout(() => {
             selectTab('timeline');
@@ -3282,7 +4047,17 @@ async function openManager({ focusOwner = null } = {}) {
     if (current !== memory) return toastr.warning('기억이 바뀌어서 저장하지 않았습니다. 다시 열어주세요.');
     const edited = collectManager(root, memory);
     pushHistory(current, '직접 편집');
-    for (const key of ['frame', 'saga', 'timeline', 'ledger', 'events']) current[key] = edited[key];
+    const keptIds = new Set(edited.timeline.map(n => n.id));
+    const removedIds = new Set(memory.timeline.map(n => n.id).filter(id => !keptIds.has(id)));
+    if (removedIds.size) {
+        edited.events = edited.events.filter(e => !removedIds.has(e.episodeId));
+        edited.archive = edited.archive.filter(a => !removedIds.has(a.ownerId));
+    }
+    for (const key of ['frame', 'saga', 'timeline', 'ledger', 'events', 'archive', 'wiki']) current[key] = edited[key];
+    if (removedIds.size && root.querySelector('#lm_restore_src')?.checked) {
+        restoreSources(current, removedIds);
+        await ctx().saveChat();
+    }
     await ctx().saveMetadata();
     refreshInjection();
     updateStatus();
@@ -3369,6 +4144,28 @@ function registerCommands() {
         helpString: '<div>코끼리를 생각하지마: 벡터 검색 색인을 현재 기억에 맞춥니다.</div>',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lm-ask',
+        callback: async (_args, value) => {
+            const question = String(value || '').trim();
+            if (!question || !hasChat()) return '';
+            const { answer } = await askMemory(question);
+            return answer;
+        },
+        unnamedArgumentList: [
+            SlashCommandArgument.fromProps({ description: 'question about the story', typeList: [ARGUMENT_TYPE.STRING], isRequired: true }),
+        ],
+        returns: 'the answer',
+        helpString: '<div>코끼리를 생각하지마: 지금까지의 이야기에 대해 물어봅니다. 예: <code>/lm-ask 레온과 처음 만난 게 언제야? | /echo</code></div>',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lm-wiki',
+        callback: async () => {
+            await buildWiki();
+            return '';
+        },
+        helpString: '<div>코끼리를 생각하지마: 기억을 위키로 정리합니다.</div>',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lm-auto',
         callback: (_args, value) => {
             const s = getSettings();
@@ -3426,6 +4223,7 @@ function addWandMenu() {
     };
     make('lm_wand_compress', 'fa-feather-pointed', '코끼리: 기억 압축', () => runCompress({ all: false }));
     make('lm_wand_manager', 'fa-book-open', '코끼리: 기억장 열기', () => openManager());
+    make('lm_wand_ask', 'fa-circle-question', '코끼리에게 묻기', () => openAsk());
     make('lm_wand_auto', 'fa-robot', '코끼리: 자동 압축 켜기/끄기', () => {
         const s = getSettings();
         s.autoCompress = !s.autoCompress;
