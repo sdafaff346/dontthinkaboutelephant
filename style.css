@@ -1538,3 +1538,17 @@
 @media (max-width: 600px) {
     #lm_settings .lm-tabs-pill { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
+
+/* prompt editors */
+.lm-prompt-list { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 8px; }
+.lm-prompt-item { border: 1px solid var(--lm-line); border-radius: 10px; background: var(--lm-card); }
+.lm-prompt-item > summary { display: flex; align-items: center; gap: 8px; padding: 10px 12px; list-style: none; cursor: pointer; font-size: 13.5px; font-weight: 600; }
+.lm-prompt-item > summary::-webkit-details-marker { display: none; }
+.lm-prompt-item[open] .lm-fold-chev { transform: rotate(180deg); }
+.lm-prompt-item > .lm-hint { margin: 0 12px 6px; }
+.lm-prompt-item > textarea { display: block; width: calc(100% - 24px); margin: 0 12px 6px; }
+.lm-prompt-item > .lm-inline-action { margin: 0 12px 10px; }
+.lm-prompt-mod { display: none; padding: 1px 7px; border-radius: 999px; background: var(--lm-accent-soft); color: var(--lm-accent-ink); font-size: 11px; font-weight: 600; }
+.lm-prompt-item.lm-modified .lm-prompt-mod { display: inline-block; }
+.lm-prompt-item .lm-fold-chev { margin-left: auto; }
+.lm-prompt-item:not([open]) .lm-fold-chev { transform: none; }
