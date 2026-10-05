@@ -1552,3 +1552,13 @@
 .lm-prompt-item.lm-modified .lm-prompt-mod { display: inline-block; }
 .lm-prompt-item .lm-fold-chev { margin-left: auto; }
 .lm-prompt-item:not([open]) .lm-fold-chev { transform: none; }
+
+/* read-only Korean view */
+.lm-ko-sec { margin-top: 14px; }
+.lm-ko-sec > h4 { margin: 0 0 8px; font-size: 12.5px; font-weight: 600; color: var(--lm-muted); }
+.lm-ko-node { margin-bottom: 8px; padding: 12px 14px; border: 1px solid var(--lm-line); border-radius: var(--lm-r); background: var(--lm-card); }
+.lm-ko-node > header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 6px; }
+.lm-ko-node p { margin: 0 0 4px; line-height: 1.7; }
+.lm-ko-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.lm-ko-list li { padding: 8px 12px; border: 1px solid var(--lm-line); border-radius: 10px; background: var(--lm-card); line-height: 1.6; }
+.lm-ko-sec > p { margin: 0; padding: 12px 14px; border: 1px solid var(--lm-line); border-left: 3px solid var(--lm-tier-saga); border-radius: var(--lm-r); background: var(--lm-card); line-height: 1.7; }
