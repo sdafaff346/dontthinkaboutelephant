@@ -84,6 +84,9 @@ const FRAME_MODES = {
 const defaultSettings = Object.freeze({
     enabled: true,
     profileId: '',
+    fallbackProfileId: '',
+    softenSensitive: false,
+    splitOnBlock: true,
     includePreset: true,
     systemAsUser: false,
     language: 'chat',
@@ -131,6 +134,12 @@ const defaultSettings = Object.freeze({
     remindAt: 80,
     maxUndo: 10,
     extraRules: '',
+    promptRules: '',
+    promptSystemPrefix: '',
+    promptUserPrefix: '',
+    promptUserSuffix: '',
+    promptPrefill: '',
+    promptMemoryHeader: '',
     uiSettingsOpen: false,
     previewBeforeSave: false,
     autoCompress: false,
@@ -170,12 +179,18 @@ function getSettings() {
     if (!extensionSettings[MODULE]) {
         extensionSettings[MODULE] = structuredClone(defaultSettings);
     }
+    const settings = extensionSettings[MODULE];
+    // v1.8.1 turned softening on by default; summaries must record scenes as written unless the user opts in.
+    if (!settings.softenMigrated) {
+        settings.softenSensitive = false;
+        settings.softenMigrated = true;
+    }
     for (const key of Object.keys(defaultSettings)) {
-        if (!Object.hasOwn(extensionSettings[MODULE], key)) {
-            extensionSettings[MODULE][key] = structuredClone(defaultSettings[key]);
+        if (!Object.hasOwn(settings, key)) {
+            settings[key] = structuredClone(defaultSettings[key]);
         }
     }
-    return extensionSettings[MODULE];
+    return settings;
 }
 
 // ---------------------------------------------------------------- memory model
@@ -950,11 +965,17 @@ function buildMemoryText(memory) {
     const covered = memory.cursor >= 0 ? `messages #0-#${memory.cursor}` : 'earlier messages';
     return [
         '<story_memory>',
-        `This is the authoritative record of the earlier part of this story (${covered}), compressed because the original messages are no longer shown. Treat everything here as established canon of this story: keep names, facts, relationships, injuries, promises and open threads consistent with it. Older events are condensed; the most recent messages continue directly after the last timeline entry. Characters only know secrets they are listed as knowing. This memory records what happened; it does not redefine who the characters are. Their personalities and ways of speaking come from the character description${cast ? ' and the [Characters] notes' : ''}: keep them consistent, write their dialogue in their own voice rather than the neutral tone of these notes, and show change only where the record shows growth, gradually and without losing core traits. Use it silently; do not repeat or summarize it in replies.`,
+        getSettings().promptMemoryHeader.trim() ? fillPlaceholders(getSettings().promptMemoryHeader.trim()).replace(/\{\{covered\}\}/gi, covered) : defaultMemoryHeader(covered, !!cast),
         '',
         sections.join('\n\n'),
         '</story_memory>',
     ].join('\n');
+}
+
+function defaultMemoryHeader(covered, cast) {
+    return [
+        `This is the authoritative record of the earlier part of this story (${covered}), compressed because the original messages are no longer shown. Treat everything here as established canon of this story: keep names, facts, relationships, injuries, promises and open threads consistent with it. Older events are condensed; the most recent messages continue directly after the last timeline entry. Characters only know secrets they are listed as knowing. This memory records what happened; it does not redefine who the characters are. Their personalities and ways of speaking come from the character description${cast ? ' and the [Characters] notes' : ''}: keep them consistent, write their dialogue in their own voice rather than the neutral tone of these notes, and show change only where the record shows growth, gradually and without losing core traits. Use it silently; do not repeat or summarize it in replies.`,
+    ].join('');
 }
 
 function buildAnchorText(memory) {
@@ -1614,22 +1635,72 @@ globalThis.longMemoryInterceptor = async function (chat, _contextSize, _abort, t
 let busy = false;
 let abortController = null;
 
-async function callModel(systemText, userText, { retries = null } = {}) {
+// Gemini and other providers sometimes block a request or answer with a refusal instead
+// of the summary. Those must never be saved as memory, and are worth retrying elsewhere.
+const BLOCK_RE = /prompt was blocked|blockreason|prohibited_content|prohibited content|candidate text empty|no candidate|finish_?reason\W+(safety|prohibited|blocklist|spii|other)|\bsafety\b|blocklist|content.?filter|content_filter|moderation|flagged/i;
+const REFUSAL_RE = /^(?:\s*[*_"']*)?(?:i'?m sorry|i am sorry|sorry,|i can(?:'|no)t|i cannot|i won'?t|i'm unable|i am unable|unable to (?:assist|help|comply)|as an ai|i must decline|this (?:request|content) (?:violates|is not)|죄송(?:합니다|하지만)|요청하신 내용은|도와드릴 수 없|申し訳|できません|抱歉|我无法|我不能)/i;
+
+class BlockedError extends Error {
+    constructor(message, kind = 'blocked') {
+        super(message);
+        this.blocked = true;
+        this.kind = kind;
+    }
+}
+
+function isBlockError(err) {
+    if (err?.blocked) return true;
+    return BLOCK_RE.test(errorDetail(err));
+}
+
+function looksRefused(text, expectTag) {
+    const t = String(text || '').trim();
+    if (!t) return false;
+    if (expectTag && new RegExp(`<${expectTag}[\\s>]`, 'i').test(t)) return false;
+    return t.length < 1200 && REFUSAL_RE.test(t);
+}
+
+function profileName(id) {
+    if (!id) return '현재 연결';
+    return (ctx().extensionSettings.connectionManager?.profiles ?? []).find(p => p.id === id)?.name || id;
+}
+
+async function callModel(systemText, userText, { retries = null, expectTag = null, profileId = undefined, noFallback = false } = {}) {
+    const s = getSettings();
+    const primary = profileId === undefined ? s.profileId : profileId;
+    try {
+        return await callModelOnce(systemText, userText, { retries, expectTag, profileId: primary });
+    } catch (err) {
+        const fallback = s.fallbackProfileId;
+        if (noFallback || !fallback || fallback === primary || !isBlockError(err) || abortController?.signal.aborted) throw err;
+        logActivity('model', `${profileName(primary)}이(가) 거부해서 ${profileName(fallback)}(으)로 다시 보냈어요`, 'warn');
+        return callModelOnce(systemText, userText, { retries, expectTag, profileId: fallback });
+    }
+}
+
+async function callModelOnce(systemText, userText, { retries = null, expectTag = null, profileId = '' } = {}) {
     const s = getSettings();
     const c = ctx();
     const maxRetries = retries ?? s.retries;
+    const sysPrefix = fillPlaceholders(s.promptSystemPrefix).trim();
+    const userPrefix = fillPlaceholders(s.promptUserPrefix).trim();
+    const userSuffix = fillPlaceholders(s.promptUserSuffix).trim();
+    const prefill = fillPlaceholders(s.promptPrefill);
+    systemText = sysPrefix ? `${sysPrefix}\n\n${systemText}` : systemText;
+    userText = [userPrefix, userText, userSuffix].filter(Boolean).join('\n\n');
     const messages = s.systemAsUser
         ? [{ role: 'user', content: `${systemText}\n\n${userText}` }]
         : [{ role: 'system', content: systemText }, { role: 'user', content: userText }];
+    if (prefill.trim()) messages.push({ role: 'assistant', content: prefill });
     let lastError = null;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         if (abortController?.signal.aborted) throw new Error('aborted');
         try {
             let raw;
-            if (s.profileId) {
+            if (profileId) {
                 if (!c.ConnectionManagerRequestService) throw new Error('Connection Manager를 사용할 수 없습니다.');
                 const result = await c.ConnectionManagerRequestService.sendRequest(
-                    s.profileId,
+                    profileId,
                     messages,
                     s.maxOutputTokens,
                     { stream: false, signal: abortController?.signal ?? null, extractData: true, includePreset: s.includePreset },
@@ -1640,14 +1711,20 @@ async function callModel(systemText, userText, { retries = null } = {}) {
                     systemPrompt: s.systemAsUser ? '' : systemText,
                     prompt: s.systemAsUser ? `${systemText}\n\n${userText}` : userText,
                     responseLength: s.maxOutputTokens,
+                    prefill: prefill.trim() ? prefill : '',
                 });
             }
+            // Providers return only the continuation; put an opening tag from the prefill back.
+            if (prefill.includes('<') && !String(raw).trimStart().startsWith(prefill.trim())) raw = `${prefill}${raw}`;
             const cleaned = cleanOutput(raw);
             if (!cleaned) throw new Error('빈 응답');
+            if (looksRefused(cleaned, expectTag)) throw new BlockedError(`모델이 요약을 거절했어요: "${cleaned.slice(0, 80)}"`, 'refused');
             return cleaned;
         } catch (err) {
             lastError = err;
             if (abortController?.signal.aborted) throw new Error('aborted');
+            // A blocked request fails the same way every time; do not burn retries on it.
+            if (isBlockError(err)) break;
             console.warn(LOG_PREFIX, `request failed (attempt ${attempt + 1})`, err);
             if (attempt < maxRetries) await sleep(1500 * (attempt + 1));
         }
@@ -1661,6 +1738,12 @@ function languageRule() {
 }
 
 function baseArchivistRules() {
+    const custom = getSettings().promptRules.trim();
+    if (custom) return fillPlaceholders(custom);
+    return defaultArchivistRules();
+}
+
+function defaultArchivistRules() {
     const { name1 } = ctx();
     return [
         `You are the continuity archivist for a long-running interactive story. "${name1}" is the user's character; everyone else is played by the AI.`,
@@ -1668,6 +1751,8 @@ function baseArchivistRules() {
         '',
         'Rules:',
         '- Record only what the transcript actually shows or states. Do not invent, guess or add commentary. Summarize all story content neutrally as plain narrative facts.',
+        ...(getSettings().softenSensitive ? [] : ['- Record every scene as it actually happened, including sexual or violent content, at the same level of detail as the rest. Do not omit, soften, censor, euphemize or moralize.']),
+        ...(getSettings().softenSensitive ? ['- This is the user\'s own fictional story, kept as private continuity notes. Describe sexual content and graphic violence only briefly in plain, non-explicit terms (for example "they spent the night together", "he was badly wounded"), keeping only what matters for continuity: who was involved, what changed between them, injuries and consequences. Never reproduce explicit wording.'] : []),
         '- Preserve characterization: note the manner in which characters act and speak when it shows who they are (teasing, curt, formal, flustered, deadpan). Never soften, exaggerate, or reinterpret a personality, and do not turn one scene into a lasting personality change.',
         '- Be concrete: names, places, dates and times, numbers, objects, injuries and physical states, decisions and their reasons, promises and deadlines, secrets and exactly who knows them, emotional turning points, and changes in relationships.',
         '- Keep cause and effect, and keep unresolved questions unresolved.',
@@ -1676,6 +1761,18 @@ function baseArchivistRules() {
         '- Third person, past tense, chronological order.',
         `- Language: ${languageRule()}`,
     ].join('\n');
+}
+
+// ---------------------------------------------------------------- user-editable prompts
+// The output formats (<episode>, <ledger>, ...) stay fixed so parsing never breaks;
+// everything around them can be rewritten in the settings "프롬프트" tab.
+
+function fillPlaceholders(text) {
+    const { name1, name2 } = ctx();
+    return String(text || '')
+        .replace(/\{\{user\}\}/gi, name1 || 'User')
+        .replace(/\{\{char\}\}/gi, name2 || 'Character')
+        .replace(/\{\{language\}\}/gi, languageRule());
 }
 
 function extraRules() {
@@ -1704,7 +1801,11 @@ function errorHint(detail) {
     if (d.includes('not supported') || d.includes('has an api')) return '이 프로필의 API 종류는 쓸 수 없어요. Chat Completion이나 Text Completion 프로필을 골라주세요.';
     if (/\b(401|403)\b|unauthori|permission|api key|api_key|invalid.*key|forbidden|credential/.test(d)) return 'API 키가 없거나 맞지 않아요. API 연결 화면에서 이 프로필이 쓰는 소스의 키를 확인해주세요.';
     if (/\b429\b|quota|rate.?limit|resource.?exhausted|too many requests/.test(d)) return '사용량 한도에 걸렸어요. 잠시 뒤에 다시 하거나 다른 모델이나 키를 써주세요.';
-    if (/safety|blocked|prohibited|content.?filter|moderation|policy/.test(d)) return '모델의 안전 필터가 이 내용을 막았어요. 요약 모델을 다른 모델로 바꿔보세요.';
+    if (/safety|blocked|prohibited|content.?filter|moderation|policy|candidate text empty|no candidate|거절|거부/.test(d)) {
+        return getSettings().fallbackProfileId
+            ? '요약 모델과 대신 쓸 모델 모두 이 구간을 거부했어요. 설정 → 요약 탭에서 다른 모델(예: DeepSeek, GLM, Claude)을 "검열되면 대신 쓸 모델"로 골라보세요.'
+            : '모델의 검열 필터가 이 구간을 막았어요. 설정 → 요약 탭의 "검열되면 대신 쓸 모델"에 다른 모델 프로필(예: DeepSeek, GLM)을 골라두면 막힐 때만 자동으로 넘겨요.';
+    }
     if (/context|too long|maximum.*token|token.*(limit|exceed)|length/.test(d)) return '보낸 내용이 모델 한도보다 길어요. 범위 탭의 "한 구간 최대 토큰"을 줄여보세요.';
     if (/\b404\b|not found|no such model|unknown model/.test(d)) return '모델이나 주소를 찾지 못했어요. 프로필에 저장된 모델 이름을 확인해주세요.';
     if (d.includes('빈 응답')) return '모델이 빈 답을 보냈어요. 생각(추론) 모델이라면 요약 탭의 "응답 최대 토큰"을 8000 이상으로 늘려보세요.';
@@ -1794,7 +1895,7 @@ async function extractCast(memory) {
         ...cards.map(c => `<character_card name="${esc(c.name)}">\n${c.text}\n</character_card>`),
         'Write the <cast> block now. One object per character above, plus any other important recurring character named in the notes.',
     ].filter(Boolean).join('\n\n');
-    const out = await callModel(system, user);
+    const out = await callModel(system, user, { expectTag: 'cast' });
     const list = (parseJsonLenient(extractTag(out, 'cast') || '') || []).filter(x => x && typeof x === 'object' && String(x.name || '').trim());
     if (!list.length) throw new Error('캐해 정리 응답을 해석하지 못했습니다.');
     const source = cards.map(c => c.text).join('\n');
@@ -2063,7 +2164,63 @@ function pushHistory(memory, label) {
     while (memory.history.length > max) memory.history.shift();
 }
 
-async function summarizeBatch(memory, batch) {
+// When a model blocks a batch, the trigger is usually one scene. Halving the batch
+// isolates it, so the rest of the story still gets remembered.
+async function summarizeBatch(memory, batch, depth = 0) {
+    try {
+        return await summarizeBatchOnce(memory, batch);
+    } catch (err) {
+        const s = getSettings();
+        if (isBlockError(err) && depth > 0 && (depth >= 3 || batch.lines.length < 4)) {
+            // Keep a marked gap instead of losing the whole batch; it can be re-summarized
+            // later with another model from the timeline ("다시 요약").
+            logActivity('compress', `#${batch.from}~#${batch.to}는 모델이 끝내 거부해서 빈칸으로 표시했어요`, 'warn');
+            return {
+                node: { title: `#${batch.from}-#${batch.to}`, when: '', importance: 2, keywords: [], text: `(Messages #${batch.from}-#${batch.to} could not be summarized by the model.)`, blocked: true },
+                ops: [], events: [], voices: [],
+            };
+        }
+        if (!isBlockError(err) || !s.splitOnBlock || depth >= 3 || batch.lines.length < 4 || abortController?.signal.aborted) {
+            if (isBlockError(err)) {
+                const e = new BlockedError(`#${batch.from}~#${batch.to} 구간을 모델이 거부했어요. ${errorDetail(err)}`);
+                e.cause = err;
+                throw e;
+            }
+            throw err;
+        }
+        const mid = Math.ceil(batch.lines.length / 2);
+        const part = (lines, indices, from, to) => ({ ...batch, lines, indices, from, to });
+        const a = part(batch.lines.slice(0, mid), batch.indices.slice(0, mid), batch.from, batch.indices[mid] - 1);
+        const b = part(batch.lines.slice(mid), batch.indices.slice(mid), batch.indices[mid], batch.to);
+        logActivity('compress', `#${batch.from}~#${batch.to}가 거부돼서 둘로 나눠 다시 요약해요`, 'warn');
+        setProgress(`거부된 구간을 나눠서 다시 요약 중 (#${a.from}~#${a.to})`);
+        const ra = await summarizeBatch(memory, a, depth + 1);
+        setProgress(`거부된 구간을 나눠서 다시 요약 중 (#${b.from}~#${b.to})`);
+        const rb = await summarizeBatch(memory, b, depth + 1);
+        if (ra.node.blocked && rb.node.blocked && depth === 0) {
+            const e = new BlockedError(`#${batch.from}~#${batch.to} 구간을 모델이 전부 거부했어요. ${errorDetail(err)}`);
+            e.cause = err;
+            throw e;
+        }
+        const real = [ra, rb].filter(r => !r.node.blocked);
+        return {
+            node: {
+                blocked: real.length === 0,
+                stale: ra.node.blocked || rb.node.blocked || !!ra.node.stale || !!rb.node.stale,
+                title: (real[0] || ra).node.title,
+                when: [ra.node.when, rb.node.when].filter(Boolean).join(' ~ '),
+                importance: Math.max(ra.node.importance, rb.node.importance),
+                keywords: [...new Set([...ra.node.keywords, ...rb.node.keywords])].slice(0, 16),
+                text: `${ra.node.text}\n\n${rb.node.text}`,
+            },
+            ops: [...(ra.ops || []), ...(rb.ops || [])],
+            events: [...(ra.events || []), ...(rb.events || [])],
+            voices: [...(ra.voices || []), ...(rb.voices || [])],
+        };
+    }
+}
+
+async function summarizeBatchOnce(memory, batch) {
     const system = summarySystemPrompt();
     const user = summaryUserPrompt(memory, batch, await loreFor(batch.lines.join('\n')));
     let node = null;
@@ -2072,12 +2229,13 @@ async function summarizeBatch(memory, batch) {
     let voices = null;
     for (let attempt = 0; attempt < 2 && !node; attempt++) {
         const reminder = attempt > 0 ? '\n\nIMPORTANT: your previous reply could not be parsed. Output only the <episode> block and the <ledger> block in the exact format described.' : '';
-        const out = await callModel(system, user + reminder);
+        const out = await callModel(system, user + reminder, { expectTag: 'episode' });
         node = parseNodeBlock(extractTag(out, 'episode'));
         if (!node && attempt > 0) {
-            // Fall back to treating the whole reply as the summary text.
-            const fallback = out.replace(/<ledger>[\s\S]*?(<\/ledger>|$)/i, '').trim();
-            if (fallback) node = { title: `#${batch.from}-#${batch.to}`, importance: 3, keywords: [], text: fallback };
+            // Fall back to treating the whole reply as the summary text, unless it is a refusal.
+            const fallback = out.replace(/<(ledger|events|voices)>[\s\S]*?(<\/\1>|$)/gi, '').trim();
+            if (looksRefused(fallback)) throw new BlockedError(`모델이 요약을 거절했어요: "${fallback.slice(0, 80)}"`, 'refused');
+            if (fallback.length >= 40) node = { title: `#${batch.from}-#${batch.to}`, importance: 3, keywords: [], text: fallback };
         }
         ops = parseJsonLenient(extractTag(out, 'ledger') || '');
         events = parseEvents(extractTag(out, 'events'));
@@ -2139,6 +2297,7 @@ async function runCompress({ all = false, auto = false } = {}) {
     abortController = new AbortController();
     setBusyUI(true);
     let done = 0;
+    let gaps = 0;
     try {
         await maybeSeedCast(chatId);
         for (const batch of batches) {
@@ -2179,7 +2338,9 @@ async function runCompress({ all = false, auto = false } = {}) {
                 pinned: false,
                 condensed: 0,
                 includeHidden,
+                stale: !!node.stale,
             });
+            if (node.stale) gaps++;
             applyLedgerOps(memory, ops, batch.to);
             if (s.voiceEnabled) applyVoices(memory, voices, batch);
             memory.cursor = batch.to;
@@ -2202,6 +2363,7 @@ async function runCompress({ all = false, auto = false } = {}) {
         }
         if (done) {
             toastr.success(auto ? `자동 압축: ${done}개 구간을 기억했어요.` : `${done}개 구간을 기억에 저장했습니다.`, auto ? APP_NAME : undefined);
+            if (gaps) toastr.warning(`모델이 거부한 장면 ${gaps}곳은 빈칸으로 남겼어요. 기억장 → 타임라인의 "다시 요약"으로 다른 모델에 다시 맡길 수 있어요.`, APP_NAME, { timeOut: 12000 });
             const last = batches[done - 1];
             logActivity(auto ? 'auto' : 'compress', `#${batches[0].from}~#${last.to} · ${done}개 구간 기억함`);
         }
@@ -2307,7 +2469,7 @@ async function resummarizeNode(nodeId) {
             text: fresh.text,
             keywords: fresh.keywords,
             importance: fresh.importance,
-            stale: false,
+            stale: !!fresh.stale,
             condensed: 0,
             from: batch.from,
             to: batch.to,
@@ -3232,7 +3394,7 @@ Reply with one block per note, using the same id, and nothing else:
     const user = candidates
         .map(n => `<note id="${n.id}" importance="${n.importance}" messages="#${n.from}-#${n.to}">\n${n.text}\n</note>`)
         .join('\n\n');
-    const out = await callModel(compactSystemPrompt(task), user);
+    const out = await callModel(compactSystemPrompt(task), user, { expectTag: 'note' });
     const results = extractAllTags(out, 'note');
     let changed = 0;
     for (const { id, text } of results) {
@@ -3280,7 +3442,7 @@ summary:
     const user = run
         .map(n => `<episode importance="${n.importance}" messages="#${n.from}-#${n.to}" title="${esc(n.title)}">\n${n.text}\n</episode>`)
         .join('\n\n');
-    const out = await callModel(compactSystemPrompt(task), user);
+    const out = await callModel(compactSystemPrompt(task), user, { expectTag: 'chapter' });
     const parsed = parseNodeBlock(extractTag(out, 'chapter'));
     if (!parsed) throw new Error('챕터 병합 응답을 해석하지 못했습니다.');
     const chapterId = newId();
@@ -3328,7 +3490,7 @@ Reply with exactly this block and nothing else:
         `<story_so_far>\n${memory.saga.text.trim() || '(empty)'}\n</story_so_far>`,
         ...run.map(n => `<chapter messages="#${n.from}-#${n.to}" title="${esc(n.title)}">\n${n.text}\n</chapter>`),
     ].join('\n\n');
-    const out = await callModel(compactSystemPrompt(task), user);
+    const out = await callModel(compactSystemPrompt(task), user, { expectTag: 'saga' });
     const saga = extractTag(out, 'saga');
     if (!saga) throw new Error('전체 줄거리 갱신 응답을 해석하지 못했습니다.');
     const runIds = run.map(n => n.id);
@@ -3526,9 +3688,9 @@ function icon(name) {
 
 // ---------------------------------------------------------------- settings panel
 
-function profileOptions(selected) {
+function profileOptions(selected, emptyLabel = '현재 연결 사용') {
     const profiles = ctx().extensionSettings.connectionManager?.profiles ?? [];
-    const opts = [`<option value="">현재 연결 사용</option>`];
+    const opts = [`<option value="">${esc(emptyLabel)}</option>`];
     for (const p of [...profiles].sort((a, b) => String(a.name).localeCompare(String(b.name)))) {
         opts.push(`<option value="${esc(p.id)}" ${p.id === selected ? 'selected' : ''}>${esc(p.name)}</option>`);
     }
@@ -3741,12 +3903,15 @@ function settingsHtml() {
           <button type="button" class="lm-tab" data-lm-tab="lore" role="tab">${icon('wiki')}<span>로어북</span></button>
           <button type="button" class="lm-tab" data-lm-tab="tidy" role="tab">${icon('archive')}<span>용량</span></button>
           <button type="button" class="lm-tab" data-lm-tab="inject" role="tab">${icon('plug')}<span>주입</span></button>
+          <button type="button" class="lm-tab" data-lm-tab="prompt" role="tab">${icon('frame')}<span>프롬프트</span></button>
         </div>
         <div class="lm-panes">
 
         <section class="lm-pane active" data-lm-pane="summary" role="tabpanel">
           ${selectRow('', '요약 모델', profileOptions(s.profileId), s.profileId, 'Connection Manager에 저장한 프로필. 비우면 지금 쓰는 API를 써요', 'lm_profile')}
           <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_test">${icon('plug')}<span>연결 테스트</span></button><span class="lm-hint">요약 모델이 응답하는지 바로 확인해요</span></div>
+          ${selectRow('', '검열되면 대신 쓸 모델', profileOptions(s.fallbackProfileId, '사용 안 함'), s.fallbackProfileId, '요약 모델이 거부하거나 막힐 때만 이 프로필로 다시 보내요. Gemini를 쓴다면 DeepSeek·GLM 같은 다른 회사 모델을 추천해요', 'lm_fallback')}
+          ${checkRow('softenSensitive', '민감한 장면 순화 (기본 꺼짐)', '꺼져 있으면 모든 장면을 있는 그대로 요약해요. 켜면 야하거나 잔인한 장면을 짧고 덤덤하게 줄여 적어서 검열에 덜 걸리지만, 그만큼 덜 자세히 기억해요')}
           ${selectRow('language', '요약 언어', selectOptions(LANGUAGES, s.language), s.language, 'English가 토큰을 가장 적게 써요')}
           ${selectRow('detail', '상세도', selectOptions({ concise: '간결', standard: '보통', detailed: '상세' }, s.detail), s.detail, '상세할수록 오래 기억하지만 토큰이 늘어요')}
           ${numberRow('keepRecent', '최근 원본 유지', 0, 5000, '이만큼의 최근 메시지는 요약하지 않고 그대로 둬요')}
@@ -3760,12 +3925,10 @@ function settingsHtml() {
             ${checkRow('hideSummarized', '요약한 원본은 AI에게서 숨기기', '채팅창에는 흐리게 남고, 되돌리기로 복구돼요')}
             ${checkRow('stripHtml', 'HTML과 상태창 태그 빼고 요약')}
             ${checkRow('eventsEnabled', '사건도 따로 추출', '누가, 어디서, 무엇을, 왜. 회상 검색의 기본 단위가 돼요')}
-            ${checkRow('includePreset', '프로필의 샘플링 설정 사용')}
+            ${checkRow('splitOnBlock', '거부된 구간은 나눠서 다시 요약', '문제 되는 장면만 따로 떼어내서 나머지는 기억되게 해요')}
+            ${checkRow('includePreset', '프로필의 샘플링 설정 사용', '프롬프트는 늘 이 확장 전용이에요. 프리셋의 온도 같은 생성 설정만 가져와요')}
             ${checkRow('systemAsUser', '지시를 유저 메시지로 보내기', 'system 역할을 받지 않는 모델일 때만 켜세요')}
-            <div class="lm-field lm-field-stack">
-              <div class="lm-field-text"><span class="lm-field-label">추가 요약 규칙</span><span class="lm-hint">요약 AI에게 덧붙일 지시. 영어로 쓰면 가장 정확해요</span></div>
-              <textarea class="text_pole lm-textarea" data-lm-setting="extraRules" rows="3" placeholder="Always track the in-story date."></textarea>
-            </div>`)}
+`)}
           ${resetFoot()}
         </section>
 
@@ -3855,6 +4018,43 @@ function settingsHtml() {
             ${numberRow('recallDepth', '회상 넣을 깊이', 0, 10000, '0이면 마지막 메시지 바로 뒤')}`)}
           ${resetFoot()}
         </section>
+        <section class="lm-pane" data-lm-pane="prompt" role="tabpanel">
+          <p class="lm-hint lm-note">이 확장이 요약 모델에게 보내는 지시문을 직접 고칠 수 있어요. 요약·정리·위키·질문·점검 요청 모두에 적용돼요. 결과 형식(&lt;episode&gt; 같은 블록)은 고정이라 고쳐도 요약이 깨지지 않아요. <b>{{user}}</b>, <b>{{char}}</b>, <b>{{language}}</b>(요약 언어 지시)를 쓸 수 있어요.</p>
+          <div class="lm-field lm-field-stack">
+            <div class="lm-field-text"><span class="lm-field-label">요약 지시문</span><span class="lm-hint">요약 AI의 역할과 규칙. 비워두면 기본 지시문을 써요</span></div>
+            <textarea class="text_pole lm-textarea lm-prompt-area" data-lm-setting="promptRules" rows="8" placeholder="비어 있음: 기본 지시문 사용"></textarea>
+            <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_prompt_load_rules">${icon('import')}<span>기본 지시문 불러오기</span></button><span class="lm-hint">기본 문구를 채운 뒤 필요한 부분만 고치세요</span></div>
+          </div>
+          <div class="lm-field lm-field-stack">
+            <div class="lm-field-text"><span class="lm-field-label">추가 요약 규칙</span><span class="lm-hint">요약 지시문 뒤에 덧붙여요. 영어로 쓰면 가장 정확해요</span></div>
+            <textarea class="text_pole lm-textarea lm-prompt-area" data-lm-setting="extraRules" rows="3" placeholder="Always track the in-story date."></textarea>
+          </div>
+          <div class="lm-field lm-field-stack">
+            <div class="lm-field-text"><span class="lm-field-label">시스템 맨 앞에 붙일 문구</span><span class="lm-hint">모든 요청의 시스템 지시 앞에 붙여요</span></div>
+            <textarea class="text_pole lm-textarea lm-prompt-area" data-lm-setting="promptSystemPrefix" rows="3" placeholder=""></textarea>
+          </div>
+          <div class="lm-field lm-field-stack">
+            <div class="lm-field-text"><span class="lm-field-label">요청 내용 앞에 붙일 문구</span><span class="lm-hint">보낼 대화 내용 바로 앞에 붙여요</span></div>
+            <textarea class="text_pole lm-textarea lm-prompt-area" data-lm-setting="promptUserPrefix" rows="2" placeholder=""></textarea>
+          </div>
+          <div class="lm-field lm-field-stack">
+            <div class="lm-field-text"><span class="lm-field-label">요청 내용 뒤에 붙일 문구</span><span class="lm-hint">보낼 내용 맨 끝에 붙여요</span></div>
+            <textarea class="text_pole lm-textarea lm-prompt-area" data-lm-setting="promptUserSuffix" rows="2" placeholder=""></textarea>
+          </div>
+          <div class="lm-field lm-field-stack">
+            <div class="lm-field-text"><span class="lm-field-label">어시스턴트 첫마디 (prefill)</span><span class="lm-hint">AI 답변이 이 말로 시작하게 해요. 지원하지 않는 모델도 있어요</span></div>
+            <textarea class="text_pole lm-textarea lm-prompt-area" data-lm-setting="promptPrefill" rows="2" placeholder=""></textarea>
+          </div>
+          <div class="lm-field lm-field-stack">
+            <div class="lm-field-text"><span class="lm-field-label">기억 주입 머리말</span><span class="lm-hint">대화할 때 기억 앞에 붙는 설명. 비워두면 기본 문구. {{covered}}는 기억한 메시지 범위로 바뀌어요</span></div>
+            <textarea class="text_pole lm-textarea lm-prompt-area" data-lm-setting="promptMemoryHeader" rows="4" placeholder="비어 있음: 기본 머리말 사용"></textarea>
+            <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_prompt_load_header">${icon('import')}<span>기본 머리말 불러오기</span></button></div>
+          </div>
+          <div class="lm-actions lm-actions-inline">
+            <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_prompt_peek">${icon('search')}<span>실제로 보내는 요약 프롬프트 보기</span></button>
+          </div>
+          ${resetFoot()}
+        </section>
         </div>
       </details>
     </div>
@@ -3922,6 +4122,15 @@ function bindSettings(root) {
         s.profileId = profile.value;
         saveSettingsDebounced();
     });
+    const fallback = root.querySelector('#lm_fallback');
+    fallback.addEventListener('focus', () => {
+        fallback.innerHTML = profileOptions(s.fallbackProfileId, '사용 안 함');
+    });
+    fallback.addEventListener('change', () => {
+        s.fallbackProfileId = fallback.value;
+        saveSettingsDebounced();
+        if (fallback.value && fallback.value === s.profileId) toastr.info('요약 모델과 같은 프로필이에요. 다른 회사 모델을 고르면 효과가 있어요.');
+    });
     root.querySelector('#lm_btn_compress').addEventListener('click', () => runCompress({ all: false }));
     root.querySelector('#lm_btn_all').addEventListener('click', () => runCompress({ all: true }));
     root.querySelector('#lm_btn_compact').addEventListener('click', () => runCompact());
@@ -3961,6 +4170,16 @@ function bindSettings(root) {
     root.querySelector('#lm_apply_preset').addEventListener('click', () => applyPreset(presetSelect.value));
     root.querySelector('#lm_btn_search').addEventListener('click', () => openSearchTest());
     root.querySelector('#lm_btn_test').addEventListener('click', () => testConnection());
+    const loadDefault = async (key, text) => {
+        const el = root.querySelector(`[data-lm-setting="${key}"]`);
+        if (el.value.trim() && !await ctx().Popup.show.confirm('기본 문구 불러오기', '지금 적힌 내용을 기본 문구로 바꿀까요?')) return;
+        el.value = text;
+        el.dispatchEvent(new Event('input'));
+    };
+    root.querySelector('#lm_prompt_load_rules').addEventListener('click', () => loadDefault('promptRules', defaultArchivistRules()
+        .replace(`"${ctx().name1}"`, '"{{user}}"').replace(languageRule(), '{{language}}')));
+    root.querySelector('#lm_prompt_load_header').addEventListener('click', () => loadDefault('promptMemoryHeader', defaultMemoryHeader('{{covered}}', true)));
+    root.querySelector('#lm_prompt_peek').addEventListener('click', () => openPromptPeek());
 }
 
 function renderLoreList() {
@@ -4176,6 +4395,32 @@ async function openActivityLog() {
       <ul class="lm-log">${body}</ul></div>`;
     applyThemeMode(wrap.firstElementChild);
     await new c.Popup(wrap, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, allowVerticalScrolling: true, leftAlign: true }).show();
+}
+
+async function openPromptPeek() {
+    const c = ctx();
+    const s = getSettings();
+    const memory = hasChat() ? getMemory(true) : null;
+    const wrapSys = (t) => [fillPlaceholders(s.promptSystemPrefix).trim(), t].filter(Boolean).join('\n\n');
+    const wrapUser = (t) => [fillPlaceholders(s.promptUserPrefix).trim(), t, fillPlaceholders(s.promptUserSuffix).trim()].filter(Boolean).join('\n\n');
+    let user = '(채팅을 열면 실제 내용으로 보여줘요)';
+    if (memory) {
+        const { start, end } = unsummarizedRange();
+        const batch = planBatches(Math.max(0, start), Math.max(start, end), { includeHidden: true })[0];
+        const sample = batch ? { ...batch, lines: batch.lines.slice(0, 6).concat(batch.lines.length > 6 ? [`… (${batch.lines.length - 6}개 메시지 더)`] : []) } : null;
+        user = sample ? summaryUserPrompt(memory, sample, '') : '(요약할 메시지가 없어요)';
+    }
+    const prefill = fillPlaceholders(s.promptPrefill);
+    const block = (title, text) => `<section class="lm-peek"><header><b>${title}</b><span class="lm-chip">약 ${estTokens(text).toLocaleString()}토큰</span></header><pre class="lm-peek-text">${esc(text)}</pre></section>`;
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>요약 프롬프트</h3></div>
+      <p class="lm-hint lm-pane-intro">압축할 때 요약 모델에게 이렇게 보내요. 대화 내용은 앞부분만 보여줘요.</p>
+      ${block(s.systemAsUser ? '지시 (유저 메시지에 합쳐서 보냄)' : '시스템', wrapSys(summarySystemPrompt()))}
+      ${block('유저', wrapUser(user))}
+      ${prefill.trim() ? block('어시스턴트 첫마디', prefill) : ''}
+    </div>`;
+    applyThemeMode(wrap.firstElementChild);
+    await new c.Popup(wrap, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, large: true, allowVerticalScrolling: true, leftAlign: true }).show();
 }
 
 const POSITION_LABELS = { in_prompt: '캐릭터 설정 뒤', before_prompt: '프롬프트 맨 앞', in_chat: '채팅 안' };

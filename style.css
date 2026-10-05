@@ -516,7 +516,7 @@
 /* settings: segmented control */
 #lm_settings .lm-tabs-pill {
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(7, minmax(0, 1fr));
     gap: 2px;
     margin: 4px 0 12px;
     padding: 3px;
@@ -1502,7 +1502,7 @@
 }
 
 @media (max-width: 380px) {
-    #lm_settings .lm-tabs-pill { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    #lm_settings .lm-tabs-pill { grid-template-columns: repeat(4, minmax(0, 1fr)); }
     .lm-modes { grid-template-columns: 1fr; }
 }
 
@@ -1533,3 +1533,8 @@
 }
 
 .lm-cast .lm-entry-top .lm-ctl { flex-basis: auto; }
+
+.lm-root .lm-prompt-area { font-size: 12.5px; line-height: 1.6; resize: vertical; }
+@media (max-width: 600px) {
+    #lm_settings .lm-tabs-pill { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
