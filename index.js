@@ -1873,6 +1873,19 @@ Rules:
         hint: '"돌려 말해도 찾기"에서 최근 대화를 검색어로 바꿀 때',
         text: 'You help a memory system find earlier moments of a long story. Given the latest messages, write 2-4 short search queries (names, places, objects, earlier events) for the past moments needed to write the next reply well. Turn vague references such as "that time" or "what you promised" into concrete terms when the known terms allow it. Write the queries in the same language as the messages.',
     },
+    voice: {
+        label: '원본에서 말투 모으기 지시문',
+        hint: '기억장 → 캐릭터의 "원본 대사에서 말투 다시 모으기"에서 한 인물의 실제 대사를 보고 말투를 정리할 때. {{name}}은 그 인물 이름',
+        text: `You study how one character of a long interactive story talks. From the sample messages written as {{name}}, describe how they speak and pick their most characteristic lines.
+- "speech": speech level and politeness, first-person pronoun, typical sentence endings, verbal tics, and how they address the other characters. Describe only what the samples show.
+- "quotes": up to 6 short lines of {{name}}'s own dialogue, copied exactly, character for character, in the original language. Prefer lines that show personality and manner over plot exposition. Each under 120 characters.
+- Language for "speech": {{language}}`,
+    },
+    charClean: {
+        label: '인물 기록 정리 지시문',
+        hint: '기억장 → 캐릭터의 "인물 기록 정리"에서 기록부 인물 항목의 성격 재해석을 걷어낼 때',
+        text: 'You tidy the character section of a story\'s memory ledger. Each entry should hold appearance, abilities, role, situation and current condition (injuries, whereabouts, mood right now). Remove phrases that redefine or relabel a character\'s personality or temperament (for example "has become gentle", "is now cold-hearted"), because personality is kept separately in the character sheet. Keep concrete events and facts. If a personality change is a real, lasting development of the story, rewrite it as a concrete fact with its cause instead of a trait label. Do not add anything new. Write each value in the same language as the original entry.',
+    },
     header: {
         label: '기억 주입 머리말',
         hint: '대화할 때 기억 앞에 붙는 설명. {{covered}}는 기억한 메시지 범위',
@@ -2045,6 +2058,234 @@ function mergeCast(memory, list, { overwrite = false } = {}) {
         touched++;
     }
     return touched;
+}
+
+// ---------------------------------------------------------------- characterization repair for existing chats
+// Summarized messages are hidden from the AI but still in the chat file, so the real
+// voice of each character can be collected again without re-summarizing anything.
+
+function speakerSamples(maxPerSpeaker = 30) {
+    const { chat, name1 } = ctx();
+    const by = new Map();
+    chat.forEach((m, i) => {
+        if (!m || m.is_user || m.extra?.isSmallSys || m.extra?.type === 'narrator') return;
+        const name = String(m.name || '').trim();
+        if (!name || normName(name) === normName(name1)) return;
+        const text = stripMessage(m.mes);
+        if (text.length < 8) return;
+        const k = normName(name);
+        if (!by.has(k)) by.set(k, { name, items: [] });
+        by.get(k).items.push({ i, text: text.slice(0, 500) });
+    });
+    return [...by.values()]
+        .filter(x => x.items.length >= 3)
+        .sort((a, b) => b.items.length - a.items.length)
+        .slice(0, 8)
+        .map(x => {
+            if (x.items.length <= maxPerSpeaker) return x;
+            const step = x.items.length / maxPerSpeaker;
+            return { ...x, total: x.items.length, items: Array.from({ length: maxPerSpeaker }, (_, k) => x.items[Math.floor(k * step)]) };
+        });
+}
+
+// Like addQuotes, but remembers which message each verified line came from.
+function addQuotesFromSamples(member, quotes, items) {
+    const keep = getSettings().voiceKeep;
+    let added = 0;
+    for (const raw of (Array.isArray(quotes) ? quotes : []).slice(0, 8)) {
+        const text = String(raw || '').replace(/^\[#\d+\]\s*/, '').trim().replace(/^["“「『]+|["”」』]+$/g, '').trim();
+        const norm = normQuote(text);
+        if (norm.length < 4 || text.length > 240) continue;
+        const src = items.find(it => normQuote(it.text).includes(norm));
+        if (!src || member.quotes.some(q => normQuote(q.text) === norm)) continue;
+        member.quotes.push({ text, at: src.i, pinned: false });
+        added++;
+    }
+    while (member.quotes.length > keep) {
+        const idx = member.quotes.findIndex(q => !q.pinned);
+        if (idx === -1) break;
+        member.quotes.splice(idx, 1);
+    }
+    return added;
+}
+
+async function harvestVoices() {
+    if (busy) return toastr.warning('이미 작업 중입니다.');
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    const speakers = speakerSamples();
+    if (!speakers.length) return toastr.info('말투를 모을 만큼 대사가 쌓인 캐릭터가 없어요.');
+    const memory = getMemory(true);
+    const existing = speakers.map(sp => castFind(memory, sp.name)).filter(m => m && m.speech && !m.lockSpeech);
+    let overwrite = false;
+    if (existing.length) {
+        overwrite = await ctx().Popup.show.confirm('말투 다시 모으기',
+            `이미 말투 설명이 있는 인물 ${existing.length}명(${existing.map(m => m.name).join(', ')})도 원본 대사를 보고 새로 고칠까요?\n\n"아니요"를 누르면 비어 있는 칸만 채우고 대사 샘플만 더해요. 잠근 인물은 어느 쪽이든 건드리지 않아요.`);
+    }
+    const chatId = ctx().getCurrentChatId();
+    busy = true;
+    abortController = new AbortController();
+    setBusyUI(true);
+    pushHistory(memory, '말투 다시 모으기');
+    let speechDone = 0;
+    let quotesDone = 0;
+    const names = [];
+    try {
+        for (let k = 0; k < speakers.length; k++) {
+            if (abortController.signal.aborted || !stillSameChat(chatId)) break;
+            const sp = speakers[k];
+            setProgress(`원본 대사에서 말투 모으는 중 ${k + 1}/${speakers.length} (${sp.name})`);
+            const system = `${getPrompt('voice', { name: sp.name })}
+
+Reply with only:
+<voice>
+{"speech":"...","quotes":["..."]}
+</voice>`;
+            const user = `<samples character="${esc(sp.name)}"${sp.total ? ` note="${sp.items.length} of ${sp.total} messages, spread across the whole story"` : ''}>
+${sp.items.map(it => `[#${it.i}] ${it.text}`).join('\n\n')}
+</samples>`;
+            let parsed = null;
+            try {
+                const out = await callModel(system, user, { expectTag: 'voice' });
+                parsed = (parseJsonLenient(extractTag(out, 'voice') || '') || [])[0];
+            } catch (err) {
+                if (String(err?.message) === 'aborted') throw err;
+                logActivity('compress', `${sp.name}의 말투를 모으지 못했어요: ${errorDetail(err)}`, 'warn');
+                continue;
+            }
+            if (!parsed || typeof parsed !== 'object') continue;
+            const member = castGet(memory, sp.name);
+            const speech = typeof parsed.speech === 'string' ? parsed.speech.trim() : '';
+            if (speech.length >= 6 && !member.lockSpeech && (!member.speech || overwrite)) {
+                member.speech = speech.slice(0, 600);
+                speechDone++;
+            }
+            quotesDone += addQuotesFromSamples(member, parsed.quotes, sp.items);
+            names.push(sp.name);
+        }
+        if (!stillSameChat(chatId)) return;
+        memory.castSeeded = true;
+        await ctx().saveMetadata();
+        refreshInjection();
+        const msg = `${names.join(', ') || '없음'} · 말투 ${speechDone}명 · 대사 샘플 ${quotesDone}줄`;
+        logActivity('compress', `원본에서 말투 다시 모음: ${msg}`);
+        toastr.success(msg, '말투를 다시 모았어요');
+    } catch (err) {
+        if (String(err?.message) === 'aborted') toastr.info('중지했어요. 그때까지 모은 건 저장되지 않았어요.');
+        else reportError('말투 모으기 실패', err);
+        // Nothing half-done is kept: roll back to the snapshot taken above.
+        const last = memory.history.pop();
+        if (last) Object.assign(memory, JSON.parse(last.snap));
+    } finally {
+        busy = false;
+        abortController = null;
+        setBusyUI(false);
+        setProgress('');
+        updateStatus();
+    }
+}
+
+const PERSONALITY_RE = /personality|temperament|became (?:more |much )?(?:kind|gentle|soft|cold|warm|sweet|caring|cheerful|shy|bold|open)|is now (?:more )?(?:kind|gentle|soft|cold|warm|sweet|caring|cheerful|shy|bold)|성격|다정해|상냥해|부드러워|차가워|냉정해|변했|性格|優しく|冷たく|变得/i;
+
+function characterEntries(memory) {
+    return memory.ledger.entries.filter(e => e.cat === 'character' && !e.pinned && e.value);
+}
+
+async function proposeCharacterClean(memory) {
+    const entries = characterEntries(memory);
+    const changes = [];
+    const cast = castText(memory, { quotes: false });
+    for (let i = 0; i < entries.length; i += 30) {
+        if (abortController?.signal.aborted) throw new Error('aborted');
+        const chunk = entries.slice(i, i + 30);
+        setProgress(`인물 기록 살펴보는 중 ${Math.min(i + 30, entries.length)}/${entries.length}`);
+        const system = `${getPrompt('charClean')}
+
+Reply with only the entries you changed (leave out the ones that are already fine):
+<entries>
+[{"key":"<exact key>","value":"<the complete tidied value>"}]
+</entries>`;
+        const user = [
+            cast && `<character_sheet>\n${cast}\n</character_sheet>`,
+            `<character_entries>\n${JSON.stringify(chunk.map(e => ({ key: e.key, value: e.value })), null, 1)}\n</character_entries>`,
+        ].filter(Boolean).join('\n\n');
+        const out = await callModel(system, user, { expectTag: 'entries' });
+        for (const x of parseJsonLenient(extractTag(out, 'entries') || '') || []) {
+            const e = chunk.find(en => en.key.toLowerCase() === String(x?.key || '').toLowerCase());
+            const value = String(x?.value || '').trim();
+            if (e && value && value !== e.value && value.length >= 4) changes.push({ id: e.id, key: e.key, before: e.value, after: value });
+        }
+    }
+    return changes;
+}
+
+async function cleanCharacterEntries() {
+    if (busy) return toastr.warning('이미 작업 중입니다.');
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    const memory = getMemory(true);
+    if (!characterEntries(memory).length) return toastr.info('기록부에 정리할 인물 항목이 없어요. (고정한 항목은 건드리지 않아요)');
+    const chatId = ctx().getCurrentChatId();
+    const c = ctx();
+    busy = true;
+    abortController = new AbortController();
+    setBusyUI(true);
+    let changes = [];
+    try {
+        changes = await proposeCharacterClean(memory);
+    } catch (err) {
+        if (String(err?.message) === 'aborted') toastr.info('중지했어요.');
+        else reportError('인물 기록 정리 실패', err);
+        return;
+    } finally {
+        busy = false;
+        abortController = null;
+        setBusyUI(false);
+        setProgress('');
+    }
+    if (!stillSameChat(chatId)) return;
+    if (!changes.length) return toastr.success('인물 기록에 성격을 다시 쓴 부분이 없어요. 그대로 둘게요.', APP_NAME);
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>인물 기록 정리 미리보기</h3></div>
+      <p class="lm-hint lm-pane-intro">성격을 새로 규정한 표현을 걷어내고, 상태·상황·실제 사건은 남겼어요. 적용해도 되돌리기로 원래대로 돌릴 수 있어요.</p>
+      <div class="lm-results">${changes.map(ch => `<article class="lm-result lm-diff"><header><b>${esc(ch.key)}</b></header><p class="lm-diff-before">${esc(ch.before)}</p><p class="lm-diff-after">${esc(ch.after)}</p></article>`).join('')}</div></div>`;
+    applyThemeMode(wrap.firstElementChild);
+    const ok = await new c.Popup(wrap, c.POPUP_TYPE.CONFIRM, '', { okButton: `${changes.length}개 적용`, cancelButton: '취소', wide: true, allowVerticalScrolling: true, leftAlign: true }).show();
+    if (ok !== c.POPUP_RESULT.AFFIRMATIVE || !stillSameChat(chatId)) return;
+    pushHistory(memory, '인물 기록 정리');
+    for (const ch of changes) {
+        const e = memory.ledger.entries.find(en => en.id === ch.id);
+        if (e) e.value = ch.after;
+    }
+    await ctx().saveMetadata();
+    refreshInjection();
+    updateStatus();
+    logActivity('compress', `인물 기록 ${changes.length}개 정리`);
+    toastr.success(`인물 기록 ${changes.length}개를 정리했어요.`, APP_NAME);
+}
+
+function castHealth(memory) {
+    const s = getSettings();
+    const cast = (memory.cast || []).filter(m => m.name);
+    const withCore = cast.filter(m => m.core).length;
+    const withSpeech = cast.filter(m => m.speech).length;
+    const quoteAvg = cast.length ? cast.reduce((n, m) => n + m.quotes.length, 0) / cast.length : 0;
+    const charEntries = characterEntries(memory);
+    const suspicious = charEntries.filter(e => PERSONALITY_RE.test(e.value)).length;
+    return [
+        { ok: s.voiceEnabled, label: '캐해 보존', detail: s.voiceEnabled ? '켜짐' : '꺼져 있어서 캐해가 AI에게 안 가요', fix: s.voiceEnabled ? null : ['voiceOn', '켜기'] },
+        { ok: cast.length > 0 && withCore === cast.length, label: '핵심 캐해', detail: cast.length ? `${withCore}/${cast.length}명 채워짐` : '아직 정리된 인물이 없어요', fix: cast.length && withCore === cast.length ? null : ['extract', '카드에서 정리'] },
+        { ok: cast.length > 0 && withSpeech === cast.length, label: '말투 · 호칭', detail: cast.length ? `${withSpeech}/${cast.length}명 채워짐` : '비어 있어요', fix: ['harvest', '원본에서 모으기'] },
+        { ok: quoteAvg >= 3, label: '대사 샘플', detail: cast.length ? `인물당 평균 ${quoteAvg.toFixed(1)}줄` : '비어 있어요', fix: quoteAvg >= 3 ? null : ['harvest', '원본에서 모으기'] },
+        { ok: s.keepRecent >= 40, label: '최근 원본 유지', detail: `${s.keepRecent}개 · 40개 이상이면 AI가 실제 대사를 더 많이 봐요`, fix: s.keepRecent >= 40 ? null : ['keep40', '40개로'] },
+        { ok: s.checkContradictions && s.checkCharacter, label: '캐해 검사', detail: s.checkContradictions && s.checkCharacter ? '켜짐' : '꺼짐 · 켜면 답변마다 요약 모델을 1번 더 불러요', fix: s.checkContradictions && s.checkCharacter ? null : ['checkOn', '켜기'] },
+        { ok: suspicious === 0, label: '인물 기록', detail: charEntries.length ? `${charEntries.length}개 중 성격을 다시 쓴 것 같은 항목 ${suspicious}개` : '인물 항목 없음', fix: charEntries.length ? ['clean', '정리하기'] : null },
+    ];
+}
+
+function castHealthHtml(memory) {
+    const rows = castHealth(memory);
+    const bad = rows.filter(r => !r.ok).length;
+    return `<div class="lm-health-head"><b>캐해 점검</b><span class="lm-hint">${bad ? `손볼 곳 ${bad}개` : '모두 좋아요'}</span></div>
+      ${rows.map(r => `<div class="lm-health-row ${r.ok ? 'ok' : 'bad'}"><i class="lm-dot" aria-hidden="true"></i><span class="lm-health-label">${r.label}</span><span class="lm-health-detail">${esc(r.detail)}</span>${r.fix ? `<button type="button" class="lm-chipbtn" data-cast-fix="${r.fix[0]}">${r.fix[1]}</button>` : ''}</div>`).join('')}`;
 }
 
 async function maybeSeedCast(chatId) {
@@ -5034,8 +5275,11 @@ function managerHtml(memory) {
   <section class="lm-pane" data-lm-pane="cast" role="tabpanel">
     <div class="lm-wiki-tools">
       ${tool('lm_cast_extract', 'sparkle', '캐릭터 카드에서 캐해 정리', 'lm-toolbtn-accent', '카드 설명·성격·예시 대화를 읽고 핵심 캐해와 말투를 채워요. 이미 적힌 칸은 건드리지 않아요')}
+      ${tool('lm_cast_harvest', 'ask', '원본 대사에서 말투 다시 모으기', '', '숨겨진 원본 메시지에서 캐릭터마다 대사를 골고루 뽑아 말투 설명과 대사 샘플을 채워요. 다시 요약하지 않아요')}
+      ${tool('lm_cast_clean', 'ledger', '인물 기록 정리', '', '기록부 인물 항목에서 성격을 새로 규정한 표현을 걷어내요. 적용 전에 미리 보여줘요')}
       ${tool('lm_cast_add', 'plus', '인물 추가')}
     </div>
+    <div class="lm-health" id="lm_cast_health">${castHealthHtml(memory)}</div>
     <p class="lm-hint lm-pane-intro">요약은 사건만 기록하고, 성격과 말투는 여기 적힌 대로 지켜요. 장면에 있는 인물은 대사 샘플까지 함께 AI에게 보여줘요.${getSettings().voiceEnabled ? '' : ' <b>지금은 설정 → 요약 탭의 "캐해 보존"이 꺼져 있어요.</b>'}</p>
     ${memory.cast.length ? bulkBar('cast') : ''}
     <div id="lm_cast" class="lm-list">${memory.cast.map(castCard).join('') || '<div class="lm-empty lm-cast-empty">아직 정리된 캐릭터가 없어요. 위 버튼으로 캐릭터 카드에서 정리하거나, 첫 압축 때 자동으로 정리돼요.</div>'}</div>
@@ -5230,6 +5474,14 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
         await popup?.completeCancelled();
         await action();
     };
+    // Saves the edits made in the manager first, then runs the action and reopens.
+    let afterSave = null;
+    const saveThen = async (action) => {
+        if (typeof popup?.completeAffirmative !== 'function') return closeThen(action);
+        afterSave = action;
+        await popup.completeAffirmative();
+    };
+    const saveManagerEdits = () => saveManagerEditsImpl({ root, memory, chatId });
 
     const lastPicked = new WeakMap();
     const paneOf = (el) => el.closest('.lm-pane');
@@ -5321,6 +5573,32 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
             list.lastElementChild.querySelector('.lm-cast-name').focus();
             return;
         }
+        const fix = event.target.closest('[data-cast-fix]');
+        if (fix) {
+            const s = getSettings();
+            const kind = fix.dataset.castFix;
+            if (kind === 'extract') { root.querySelector('#lm_cast_extract')?.click(); return; }
+            if (kind === 'harvest') { await saveThen(async () => { await harvestVoices(); openManager({ tab: 'cast' }); }); return; }
+            if (kind === 'clean') { await saveThen(async () => { await cleanCharacterEntries(); openManager({ tab: 'cast' }); }); return; }
+            if (kind === 'voiceOn') s.voiceEnabled = true;
+            if (kind === 'keep40') s.keepRecent = Math.max(40, s.keepRecent);
+            if (kind === 'checkOn') { s.checkContradictions = true; s.checkCharacter = true; }
+            ctx().saveSettingsDebounced();
+            syncSettingInputs();
+            refreshInjection();
+            updateStatus();
+            root.querySelector('#lm_cast_health').innerHTML = castHealthHtml(collectManager(root, memory));
+            toastr.success('설정을 바꿨어요.', '', { timeOut: 1800 });
+            return;
+        }
+        if (event.target.closest('#lm_cast_harvest')) {
+            await saveThen(async () => { await harvestVoices(); openManager({ tab: 'cast' }); });
+            return;
+        }
+        if (event.target.closest('#lm_cast_clean')) {
+            await saveThen(async () => { await cleanCharacterEntries(); openManager({ tab: 'cast' }); });
+            return;
+        }
         const extractBtn = event.target.closest('#lm_cast_extract');
         if (extractBtn) {
             if (extractBtn.disabled) return;
@@ -5335,6 +5613,7 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
                 const n = mergeCast(draft, list);
                 root.__castQuotes = new Map(draft.cast.map(m => [m.id, m.quotes]));
                 root.querySelector('#lm_cast').innerHTML = draft.cast.map(castCard).join('');
+                root.querySelector('#lm_cast_health').innerHTML = castHealthHtml(draft);
                 toastr.success(`${list.map(x => x.name).join(', ')} · 빈 칸만 채웠어요. 확인하고 저장을 눌러주세요.`, `캐해 정리 (${n}명)`);
             } catch (err) {
                 reportError('캐해 정리 실패', err);
@@ -5490,6 +5769,11 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
     }
     const result = await showing;
     if (result !== c.POPUP_RESULT.AFFIRMATIVE) return;
+    const saved = await saveManagerEdits();
+    if (saved && afterSave) await afterSave();
+}
+
+async function saveManagerEditsImpl({ root, memory, chatId }) {
     if (!stillSameChat(chatId)) return toastr.warning('채팅이 바뀌어서 저장하지 않았습니다.');
     const current = getMemory(true);
     if (current !== memory) return toastr.warning('기억이 바뀌어서 저장하지 않았습니다. 다시 열어주세요.');
@@ -5511,6 +5795,7 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
     updateStatus();
     toastr.success('기억을 저장했습니다.');
     syncAfter();
+    return true;
 }
 
 // ---------------------------------------------------------------- slash commands
@@ -5612,6 +5897,22 @@ function registerCommands() {
             return '';
         },
         helpString: '<div>코끼리를 생각하지마: 기억을 위키로 정리합니다.</div>',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lm-voice',
+        callback: async () => {
+            await harvestVoices();
+            return '';
+        },
+        helpString: '<div>코끼리를 생각하지마: 숨겨진 원본 대사에서 캐릭터 말투와 대사 샘플을 다시 모읍니다.</div>',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lm-tidy-cast',
+        callback: async () => {
+            await cleanCharacterEntries();
+            return '';
+        },
+        helpString: '<div>코끼리를 생각하지마: 기록부 인물 항목에서 성격을 새로 규정한 표현을 걷어냅니다 (미리보기 후 적용).</div>',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lm-autoindex',
