@@ -6,6 +6,7 @@
 const MODULE = 'long_memory';
 const META_KEY = 'long_memory';
 const CHAR_FIELD = 'long_memory_frame';
+const CHAR_CAST_FIELD = 'long_memory_cast';
 const PROMPT_KEY_MAIN = 'long_memory_main';
 const PROMPT_KEY_ANCHOR = 'long_memory_anchor';
 const PROMPT_KEY_RECALL = 'long_memory_recall';
@@ -143,6 +144,10 @@ const defaultSettings = Object.freeze({
     backupKeep: 5,
     injectPreset: 'stable',
     indexAllMessages: true,
+    voiceEnabled: true,
+    voiceQuotes: 3,
+    voiceKeep: 12,
+    checkCharacter: true,
     autoIndex: true,
     loreEnabled: true,
     loreUseCharacter: true,
@@ -262,6 +267,8 @@ function emptyMemory() {
         opsSinceBackup: 0,
         wiki: { updatedAt: 0, pages: [] },
         qna: [],
+        cast: [],
+        castSeeded: false,
     };
 }
 
@@ -287,6 +294,7 @@ function getMemory(create = true) {
     memory.frame = { ...emptyFrame(), ...memory.frame };
     memory.ledger.scene = { ...base.ledger.scene, ...memory.ledger.scene };
     if (!Array.isArray(memory.ledger.entries)) memory.ledger.entries = [];
+    if (!Array.isArray(memory.cast)) memory.cast = [];
     return memory;
 }
 
@@ -762,6 +770,123 @@ async function loreFor(text, budget = getSettings().loreTokenBudget) {
     return out.join('\n');
 }
 
+// ---------------------------------------------------------------- cast: characterization that must not drift
+// Summaries are written in a neutral narrator voice, and once the original messages are
+// hidden the model no longer sees how each character actually talks. The cast keeps, per
+// character: a core personality sheet that summaries never rewrite, a speech description,
+// story-driven growth with its cause, and verbatim sample lines checked against the source.
+
+function emptyCastMember(name) {
+    return { id: newId(), name: String(name || '').trim(), core: '', speech: '', growth: [], quotes: [], lockSpeech: false };
+}
+
+function normName(name) {
+    return String(name || '').toLowerCase().replace(/\s+/g, '');
+}
+
+function castFind(memory, name) {
+    const n = normName(name);
+    if (!n) return null;
+    return memory.cast.find(m => normName(m.name) === n) || null;
+}
+
+function castGet(memory, name) {
+    let member = castFind(memory, name);
+    if (!member) {
+        member = emptyCastMember(name);
+        memory.cast.push(member);
+    }
+    return member;
+}
+
+function normQuote(text) {
+    return String(text || '').toLowerCase().replace(/[\s"'`“”‘’「」『』《》〈〉()[\]{}…·.,!?~\-—–:;。、！？，＊*_]/g, '');
+}
+
+// Keeps only quotes that really appear in the source text, so the model never imitates
+// a line the character did not say.
+function addQuotes(member, quotes, sourceText, at) {
+    const keep = getSettings().voiceKeep;
+    const source = normQuote(sourceText);
+    let added = 0;
+    for (const raw of (Array.isArray(quotes) ? quotes : []).slice(0, 4)) {
+        const text = String(raw || '').trim().replace(/^["“「『]+|["”」』]+$/g, '').trim();
+        const norm = normQuote(text);
+        if (norm.length < 4 || text.length > 240 || !source.includes(norm)) continue;
+        if (member.quotes.some(q => normQuote(q.text) === norm)) continue;
+        member.quotes.push({ text, at, pinned: false });
+        added++;
+    }
+    while (member.quotes.length > keep) {
+        const idx = member.quotes.findIndex(q => !q.pinned);
+        if (idx === -1) break;
+        member.quotes.splice(idx, 1);
+    }
+    return added;
+}
+
+function linesBy(lines, name) {
+    const n = normName(name);
+    const own = lines.filter(line => {
+        const m = line.match(/^\[#\d+\]\s*([^:]+):/);
+        return m && normName(m[1]) === n;
+    });
+    return own.length ? own : lines;
+}
+
+function applyVoices(memory, voices, batch) {
+    if (!Array.isArray(voices)) return 0;
+    const { name1 } = ctx();
+    let changed = 0;
+    for (const v of voices) {
+        if (!v || typeof v !== 'object') continue;
+        const name = String(v.name || '').trim();
+        if (!name || normName(name) === normName(name1)) continue;
+        const exists = castFind(memory, name);
+        const quotes = Array.isArray(v.quotes) ? v.quotes : [];
+        const speech = typeof v.speech === 'string' ? v.speech.trim() : '';
+        const growth = typeof v.growth === 'string' ? v.growth.trim() : '';
+        if (!exists && !quotes.length && !speech) continue;
+        const member = castGet(memory, name);
+        changed += addQuotes(member, quotes, linesBy(batch.lines, name).join('\n'), batch.to);
+        if (speech && !member.lockSpeech && speech.length >= 6) {
+            member.speech = speech.slice(0, 500);
+            changed++;
+        }
+        if (growth && growth.length >= 6) {
+            member.growth.push({ text: growth.slice(0, 300), at: batch.to });
+            if (member.growth.length > 8) member.growth.splice(0, member.growth.length - 8);
+            changed++;
+        }
+    }
+    return changed;
+}
+
+function presentNames(memory) {
+    return String(memory.ledger.scene?.present || '').split(/[,，、/&]| and | 와 | 과 /).map(normName).filter(Boolean);
+}
+
+function castText(memory, { quotes = true } = {}) {
+    const s = getSettings();
+    const members = (memory.cast || []).filter(m => m.name && (m.core || m.speech || m.quotes.length || m.growth.length));
+    if (!members.length) return '';
+    const present = new Set(presentNames(memory));
+    const isPresent = (m) => present.has(normName(m.name)) || [...present].some(p => p.includes(normName(m.name)));
+    const ordered = [...members.filter(isPresent), ...members.filter(m => !isPresent(m))];
+    return ordered.map(m => {
+        const lines = [`${m.name}`];
+        if (m.core) lines.push(`- Core personality (constant; the story does not change it): ${m.core.replace(/\n+/g, ' / ')}`);
+        if (m.speech) lines.push(`- Speech: ${m.speech.replace(/\n+/g, ' / ')}`);
+        if (m.growth.length) lines.push(`- Development in this story (gradual, keeps the core): ${m.growth.slice(-4).map(g => g.text).join('; ')}`);
+        if (quotes && s.voiceQuotes > 0 && m.quotes.length) {
+            const n = isPresent(m) || members.length <= 2 ? s.voiceQuotes : 1;
+            const picked = [...m.quotes.filter(q => q.pinned), ...m.quotes.filter(q => !q.pinned).reverse()].slice(0, n);
+            lines.push(`- Voice samples (their real earlier lines; match this voice, never repeat them): ${picked.map(q => `"${q.text}"`).join(' / ')}`);
+        }
+        return lines.join('\n');
+    }).join('\n\n');
+}
+
 function ledgerText(ledger, { includeClosed = false } = {}) {
     const lines = [];
     const sc = ledger.scene || {};
@@ -815,6 +940,8 @@ function buildMemoryText(memory) {
     const sections = [];
     const frame = frameText(memory.frame);
     if (frame) sections.push(`[Story frame]\n${frame}`);
+    const cast = getSettings().voiceEnabled ? castText(memory) : '';
+    if (cast) sections.push(`[Characters: personality and voice]\n${cast}`);
     if (memory.saga.text.trim()) sections.push(`[The story so far]\n${memory.saga.text.trim()}`);
     if (memory.timeline.length) sections.push(`[Timeline, oldest to newest]\n${timelineText(memory)}`);
     const ledger = ledgerText(memory.ledger);
@@ -823,7 +950,7 @@ function buildMemoryText(memory) {
     const covered = memory.cursor >= 0 ? `messages #0-#${memory.cursor}` : 'earlier messages';
     return [
         '<story_memory>',
-        `This is the authoritative record of the earlier part of this story (${covered}), compressed because the original messages are no longer shown. Treat everything here as established canon of this story: keep names, facts, relationships, injuries, promises and open threads consistent with it. Older events are condensed; the most recent messages continue directly after the last timeline entry. Characters only know secrets they are listed as knowing. Use it silently; do not repeat or summarize it in replies.`,
+        `This is the authoritative record of the earlier part of this story (${covered}), compressed because the original messages are no longer shown. Treat everything here as established canon of this story: keep names, facts, relationships, injuries, promises and open threads consistent with it. Older events are condensed; the most recent messages continue directly after the last timeline entry. Characters only know secrets they are listed as knowing. This memory records what happened; it does not redefine who the characters are. Their personalities and ways of speaking come from the character description${cast ? ' and the [Characters] notes' : ''}: keep them consistent, write their dialogue in their own voice rather than the neutral tone of these notes, and show change only where the record shows growth, gradually and without losing core traits. Use it silently; do not repeat or summarize it in replies.`,
         '',
         sections.join('\n\n'),
         '</story_memory>',
@@ -844,6 +971,11 @@ function buildAnchorText(memory) {
     if (threads.length) bits.push(`Open threads: ${threads.join('; ')}`);
     const divergences = memory.ledger.entries.filter(e => e.cat === 'divergence').slice(0, 4).map(e => e.key);
     if (divergences.length) bits.push(`Story overrides canon on: ${divergences.join('; ')}`);
+    if (getSettings().voiceEnabled) {
+        const present = new Set(presentNames(memory));
+        const voiced = (memory.cast || []).filter(m => m.speech && (present.has(normName(m.name)) || memory.cast.length <= 2)).slice(0, 3);
+        if (voiced.length) bits.push(`Stay in character. ${voiced.map(m => `${m.name} speaks: ${m.speech.replace(/\s+/g, ' ').slice(0, 140)}`).join(' | ')}`);
+    }
     if (!bits.length && !memory.timeline.length && !memory.saga.text) return '';
     return `[Continuity check: stay consistent with <story_memory>. ${bits.join(' / ')}]`;
 }
@@ -1536,6 +1668,7 @@ function baseArchivistRules() {
         '',
         'Rules:',
         '- Record only what the transcript actually shows or states. Do not invent, guess or add commentary. Summarize all story content neutrally as plain narrative facts.',
+        '- Preserve characterization: note the manner in which characters act and speak when it shows who they are (teasing, curt, formal, flustered, deadpan). Never soften, exaggerate, or reinterpret a personality, and do not turn one scene into a lasting personality change.',
         '- Be concrete: names, places, dates and times, numbers, objects, injuries and physical states, decisions and their reasons, promises and deadlines, secrets and exactly who knows them, emotional turning points, and changes in relationships.',
         '- Keep cause and effect, and keep unresolved questions unresolved.',
         '- When a character believes something false, record both the belief and the truth, labelled.',
@@ -1605,6 +1738,110 @@ async function testConnection() {
     }
 }
 
+// ---------------------------------------------------------------- characterization sheet from the character card
+
+function cardCharacters() {
+    const c = ctx();
+    let list = [];
+    if (c.groupId) {
+        const group = (c.groups || []).find(g => g.id === c.groupId);
+        list = (group?.members || []).map(avatar => (c.characters || []).find(ch => ch.avatar === avatar)).filter(Boolean);
+    } else if (c.characterId !== undefined && c.characterId !== null) {
+        const ch = c.characters?.[c.characterId];
+        if (ch) list = [ch];
+    }
+    return list.map(ch => {
+        const name = String(ch.name || ch.data?.name || '').trim();
+        const sub = (t) => String(t || '').replace(/\{\{char\}\}/gi, name).replace(/\{\{user\}\}/gi, c.name1 || 'User').trim();
+        const d = ch.data || {};
+        const fields = [
+            ['Description', ch.description ?? d.description],
+            ['Personality', ch.personality ?? d.personality],
+            ['Scenario', ch.scenario ?? d.scenario],
+            ['First message', ch.first_mes ?? d.first_mes],
+            ['Example dialogue', ch.mes_example ?? d.mes_example],
+        ].map(([k, v]) => [k, sub(v)]).filter(([, v]) => v);
+        const text = fields.map(([k, v]) => `[${k}]\n${v.slice(0, 5000)}`).join('\n\n').slice(0, 12000);
+        return { name, text };
+    }).filter(x => x.name && x.text);
+}
+
+async function extractCast(memory) {
+    const cards = cardCharacters();
+    const frameNotes = frameText(memory.frame);
+    if (!cards.length && !memory.frame.characters.trim()) throw new Error('캐릭터 카드나 캐릭터 소개가 없어요.');
+    const canon = ['canon', 'au', 'free'].includes(memory.frame.mode) && memory.frame.work.trim();
+    const system = [
+        'You are a character analyst for a long-running interactive story. Write a compact characterization sheet that lets a writer keep each character consistent, in personality and in voice, across thousands of messages.',
+        '',
+        'Rules:',
+        '- Base it on the character card and the user\'s notes. Do not invent traits they do not support.',
+        canon ? `- This is fanfiction of "${memory.frame.work.trim()}". Where the card is silent you may use well-established canon characterization; the card and the user's notes always win.` : '',
+        '- "core": 4-8 short lines covering temperament, values and motivations, flaws, emotional range, how they treat others and the user\'s character, and what they would never do. No plot summary.',
+        '- "speech": speech level and politeness, first-person pronoun, typical sentence endings, verbal tics, how they address others. Describe it so the voice survives translation into the story language.',
+        '- "quotes": up to 3 lines copied exactly from the card\'s first message or example dialogue that best show the voice. Empty if none.',
+        `- Language for core and speech: ${languageRule()}`,
+        '',
+        'Reply with only:',
+        '<cast>',
+        '[{"name":"...","core":"...","speech":"...","quotes":["..."]}]',
+        '</cast>',
+    ].filter(line => line !== '').join('\n');
+    const lore = await loreFor(cards.map(c => c.text).join('\n'), 1500);
+    const user = [
+        frameNotes && `<story_frame>\n${frameNotes}\n</story_frame>`,
+        lore && `<lorebook_reference>\n${lore}\n</lorebook_reference>`,
+        ...cards.map(c => `<character_card name="${esc(c.name)}">\n${c.text}\n</character_card>`),
+        'Write the <cast> block now. One object per character above, plus any other important recurring character named in the notes.',
+    ].filter(Boolean).join('\n\n');
+    const out = await callModel(system, user);
+    const list = (parseJsonLenient(extractTag(out, 'cast') || '') || []).filter(x => x && typeof x === 'object' && String(x.name || '').trim());
+    if (!list.length) throw new Error('캐해 정리 응답을 해석하지 못했습니다.');
+    const source = cards.map(c => c.text).join('\n');
+    return list.map(x => ({
+        name: String(x.name).trim().slice(0, 60),
+        core: String(x.core || '').trim().slice(0, 1500),
+        speech: String(x.speech || '').trim().slice(0, 600),
+        quotes: Array.isArray(x.quotes) ? x.quotes : [],
+        source,
+    }));
+}
+
+// Fills empty fields only, so nothing the user wrote is overwritten.
+function mergeCast(memory, list, { overwrite = false } = {}) {
+    const { name1 } = ctx();
+    let touched = 0;
+    for (const x of list) {
+        if (normName(x.name) === normName(name1)) continue;
+        const member = castGet(memory, x.name);
+        if (x.core && (overwrite || !member.core)) member.core = x.core;
+        if (x.speech && (overwrite || !member.speech)) member.speech = x.speech;
+        addQuotes(member, x.quotes, x.source, -1);
+        touched++;
+    }
+    return touched;
+}
+
+async function maybeSeedCast(chatId) {
+    const s = getSettings();
+    const memory = getMemory(true);
+    if (!s.voiceEnabled || memory.castSeeded || memory.cast.some(m => m.core)) return;
+    memory.castSeeded = true;
+    if (!cardCharacters().length) return;
+    try {
+        setProgress('캐릭터 카드에서 캐해 정리 중…');
+        const list = await extractCast(memory);
+        if (!stillSameChat(chatId)) return;
+        const n = mergeCast(memory, list);
+        await ctx().saveMetadata();
+        logActivity('compress', `캐해 정리: ${list.map(x => x.name).join(', ')} (${n}명)`);
+    } catch (err) {
+        if (String(err?.message) === 'aborted') throw err;
+        console.warn(LOG_PREFIX, 'cast seed skipped', err);
+        logActivity('compress', `캐해 정리를 건너뛰었어요: ${errorDetail(err)}`, 'warn');
+    }
+}
+
 // ---------------------------------------------------------------- summarize a batch
 
 const EVENTS_FORMAT = `
@@ -1615,6 +1852,18 @@ const EVENTS_FORMAT = `
 Each event is one retrievable memory: {"text":"<1-3 sentences: what happened, including cause and result>","when":"<in-story time if known>","characters":["..."],"place":"...","items":["..."],"keywords":["..."],"importance":<1-5>}
 Extract as many events as actually happened (zero for pure small talk, several for eventful scenes). Make each event self-contained: name the characters instead of using pronouns, so it is understandable on its own months later.
 `;
+
+function voicesFormat() {
+    const { name1 } = ctx();
+    return `
+<voices>
+[JSON array, one object per AI-played character who speaks in this transcript; [] if none]
+</voices>
+
+Each object: {"name":"<character name as written in the transcript>","quotes":["<1-2 lines copied EXACTLY, character for character, from this character's own dialogue in the transcript, in the original language. Pick lines that best show their personal voice and manner, not plot exposition. Each under 120 characters>"],"speech":"<only if the transcript shows something new: the complete updated description of how this character talks, merging what <cast> already says: speech level and politeness, first-person pronoun, sentence endings, verbal tics, what they call the other characters>","growth":"<only if this transcript shows a lasting change in how this character behaves toward someone or talks, as a concrete change with its cause; otherwise omit>"}
+Do not include "${name1}" (the user's character). Never paraphrase or translate quotes; if no line fits, use an empty array.
+`;
+}
 
 function summarySystemPrompt() {
     const s = getSettings();
@@ -1635,7 +1884,7 @@ summary:
 <ledger>
 [JSON array of update operations]
 </ledger>
-${s.eventsEnabled ? EVENTS_FORMAT : ''}
+${s.eventsEnabled ? EVENTS_FORMAT : ''}${s.voiceEnabled ? voicesFormat() : ''}
 The ledger is a structured fact sheet (shown as <current_ledger>). Operations:
 {"op":"set","cat":"<category>","key":"<entity or short label>","value":"<concise current fact>","importance":<1-5>}
   Creates or replaces the entry with this cat + key. Write the complete updated value, merging old and new information.
@@ -1645,8 +1894,8 @@ The ledger is a structured fact sheet (shown as <current_ledger>). Operations:
 {"op":"scene","time":"...","place":"...","present":"...","mood":"..."}  The situation at the END of this transcript.
 
 Categories:
-- character: appearance, personality, abilities, role and current condition of each character (including the user's character)
-- relation: how one character feels about or relates to another; key format "A -> B"
+- character: appearance, abilities, role and current condition (injuries, situation, mood) of each character, including the user's character. Do not rewrite a character's personality from a single scene: lasting personality and speech belong to <cast> and the character card${s.voiceEnabled ? ', and story-driven change goes in <voices> growth' : ''}.
+- relation: key format "A -> B". The current stage of the relationship with concrete evidence, and how A addresses B (name, nickname, honorific, speech level). Do not escalate feelings beyond what was actually shown.
 - thread: open plot threads, goals, plans, promises, debts, deadlines, pending questions
 - fact: world rules, established facts, secrets (always give knownBy for secrets)
 - item: significant objects, who holds them, why they matter
@@ -1667,8 +1916,14 @@ function summaryUserPrompt(memory, batch, lore = '') {
     if (before.length) parts.push(`<story_so_far>\n${before.join('\n\n')}\n</story_so_far>`);
     const ledger = ledgerText(memory.ledger, { includeClosed: false });
     parts.push(`<current_ledger>\n${ledger || '(empty)'}\n</current_ledger>`);
+    const s = getSettings();
+    if (s.voiceEnabled) {
+        const cast = castText(memory, { quotes: false });
+        parts.push(`<cast>\nEstablished personality and speech of each character. Reference only; keep summaries faithful to it.\n${cast || '(empty)'}\n</cast>`);
+    }
     parts.push(`<transcript messages="#${batch.from}-#${batch.to}">\n${batch.lines.join('\n\n')}\n</transcript>`);
-    parts.push(`Write the <episode>, <ledger>${getSettings().eventsEnabled ? ' and <events>' : ''} blocks for this transcript now.`);
+    const blocks = ['<episode>', '<ledger>', s.eventsEnabled && '<events>', s.voiceEnabled && '<voices>'].filter(Boolean);
+    parts.push(`Write the ${blocks.join(', ')} blocks for this transcript now.`);
     return parts.join('\n\n');
 }
 
@@ -1814,6 +2069,7 @@ async function summarizeBatch(memory, batch) {
     let node = null;
     let ops = null;
     let events = [];
+    let voices = null;
     for (let attempt = 0; attempt < 2 && !node; attempt++) {
         const reminder = attempt > 0 ? '\n\nIMPORTANT: your previous reply could not be parsed. Output only the <episode> block and the <ledger> block in the exact format described.' : '';
         const out = await callModel(system, user + reminder);
@@ -1825,9 +2081,10 @@ async function summarizeBatch(memory, batch) {
         }
         ops = parseJsonLenient(extractTag(out, 'ledger') || '');
         events = parseEvents(extractTag(out, 'events'));
+        voices = parseJsonLenient(extractTag(out, 'voices') || '');
     }
     if (!node) throw new Error('요약 응답을 해석하지 못했습니다.');
-    return { node, ops, events };
+    return { node, ops, events, voices };
 }
 
 // ---------------------------------------------------------------- compress command
@@ -1883,6 +2140,7 @@ async function runCompress({ all = false, auto = false } = {}) {
     setBusyUI(true);
     let done = 0;
     try {
+        await maybeSeedCast(chatId);
         for (const batch of batches) {
             if (abortController.signal.aborted || !stillSameChat(chatId)) break;
             setProgress(`요약 중 ${done + 1}/${batches.length} (#${batch.from}~#${batch.to})`);
@@ -1903,7 +2161,7 @@ async function runCompress({ all = false, auto = false } = {}) {
                 }
                 if (stop) break;
             }
-            const { node, ops, events } = summary;
+            const { node, ops, events, voices } = summary;
             if (!stillSameChat(chatId)) break;
             pushHistory(memory, `압축 #${batch.from}-#${batch.to}`);
             const episodeId = newId();
@@ -1923,6 +2181,7 @@ async function runCompress({ all = false, auto = false } = {}) {
                 includeHidden,
             });
             applyLedgerOps(memory, ops, batch.to);
+            if (s.voiceEnabled) applyVoices(memory, voices, batch);
             memory.cursor = batch.to;
             tagMessages(rangeIndices(batch.from, batch.to), episodeId);
             memory.timeline[memory.timeline.length - 1].msgCount = batch.to - batch.from + 1;
@@ -2079,7 +2338,7 @@ let turnBusy = false;
 const CHECK_SWIPE = 1002;
 const CHECK_CLEAR = 1003;
 
-function afterTurnSystemPrompt(doCheck, doState) {
+function afterTurnSystemPrompt(doCheck, doState, doVoice = false) {
     const parts = ['You review one new reply of an ongoing interactive story against its established memory.', ''];
     parts.push('Reply with only these blocks:');
     if (doCheck) {
@@ -2088,7 +2347,8 @@ function afterTurnSystemPrompt(doCheck, doState) {
 [JSON array; [] if none]
 </issues>
 Each issue: {"quote":"<short quote from the new reply>","problem":"<what it contradicts and what the established fact is>"}
-Report only real contradictions of established facts: dead or absent characters acting, wrong names, forgotten injuries, items in the wrong hands, characters knowing secrets they are not listed as knowing, broken promises with no explanation, wrong relationships or timeline. Do not report style, new information or plausible developments. Write each "problem" in Korean.`);
+Report only real contradictions of established facts: dead or absent characters acting, wrong names, forgotten injuries, items in the wrong hands, characters knowing secrets they are not listed as knowing, broken promises with no explanation, wrong relationships or timeline. Do not report style, new information or plausible developments. Write each "problem" in Korean.${doVoice ? `
+Also report clear out-of-character slips against <cast>: the wrong speech level, first-person pronoun or form of address, or behaviour that flatly contradicts a character's core personality with no story reason. Do not report gradual growth that the development notes support, mood shifts with a clear cause, or small wording differences. Start the "problem" of such an issue with "[캐해]".` : ''}`);
     }
     if (doState) {
         parts.push(`
@@ -2107,6 +2367,7 @@ async function afterTurn(messageId) {
     if (!s.enabled || (!doCheck && !doState) || turnBusy || !hasChat()) return;
     const memory = getMemory(false);
     if (!memory) return;
+    const doVoice = doCheck && s.voiceEnabled && s.checkCharacter && memory.cast.some(m => m.core || m.speech);
     const { chat } = ctx();
     const msg = chat[messageId];
     if (!msg || msg.is_user || msg.is_system) return;
@@ -2125,10 +2386,11 @@ async function afterTurn(messageId) {
             frameText(memory.frame) && `<story_frame>\n${frameText(memory.frame)}\n</story_frame>`,
             lore && `<lorebook_reference>\n${lore}\n</lorebook_reference>`,
             `<established_memory>\n${ledgerText(memory.ledger) || '(empty)'}\n\n${timelineText(memory, { lastN: 1 })}\n</established_memory>`,
+            doVoice && `<cast>\n${castText(memory, { quotes: true })}\n</cast>`,
             recent.length && `<recent_messages>\n${recent.slice(-4).join('\n\n')}\n</recent_messages>`,
             `<new_reply>\n${messageLine(msg, messageId)}\n</new_reply>`,
         ].filter(Boolean).join('\n\n');
-        const out = await callModel(afterTurnSystemPrompt(doCheck, doState), user, { retries: 0 });
+        const out = await callModel(afterTurnSystemPrompt(doCheck, doState, doVoice), user, { retries: 0 });
         if (!stillSameChat(chatId) || ctx().chat[messageId] !== msg) return;
         if (doCheck) {
             const issues = (parseJsonLenient(extractTag(out, 'issues') || '') || [])
@@ -2140,7 +2402,10 @@ async function afterTurn(messageId) {
             decorateMessage(messageId);
             await ctx().saveChat();
             if (issues.length) toastr.warning(`기억과 다른 부분 ${issues.length}개를 찾았어요. 메시지 이름 옆 ⚠ 표시를 눌러 확인하세요.`, APP_NAME);
-            turnNotes.push(issues.length ? `#${messageId} 모순 ${issues.length}개` : `#${messageId} 모순 없음`);
+            const ooc = issues.filter(i => i.problem.startsWith('[캐해]')).length;
+            turnNotes.push(issues.length
+                ? `#${messageId} 모순 ${issues.length - ooc}개${ooc ? ` · 캐해 어긋남 ${ooc}개` : ''}`
+                : `#${messageId} 모순 없음${doVoice ? ' · 캐해 유지' : ''}`);
             if (issues.length) turnLevel = 'warn';
         }
         if (doState) {
@@ -2401,6 +2666,10 @@ function carryOver(memory) {
     m.archive.forEach(mark);
     m.saga.coversTo = -1;
     m.ledger.entries.forEach(e => { e.updatedAt = -1; });
+    (m.cast || []).forEach(member => {
+        member.quotes.forEach(q => { if (q.at >= 0) q.at = -2; });
+        member.growth.forEach(g => { g.at = -1; });
+    });
     Object.assign(m, { cursor: -1, hiddenRanges: [], history: [], opsSinceBackup: 0, tagVersion: 1 });
     return m;
 }
@@ -2474,6 +2743,10 @@ function buildWorldInfo(memory) {
     };
     const frame = frameText(memory.frame);
     if (frame) add({ comment: '코끼리: 작품 설정', content: frame, constant: true, order: 90 });
+    for (const m of memory.cast || []) {
+        const body = castText({ ...memory, cast: [m] });
+        if (body) add({ comment: `코끼리: 캐해 ${m.name}`, key: [m.name], content: body, constant: false, order: 92 });
+    }
     if (memory.saga.text.trim()) add({ comment: '코끼리: 지금까지의 이야기', content: memory.saga.text.trim(), constant: true, order: 95 });
     for (const n of memory.timeline) {
         const keys = (n.keywords || []).slice(0, 10);
@@ -2491,6 +2764,17 @@ function buildMarkdown(memory) {
     const out = [`# 코끼리의 기억장`, '', `채팅: ${ctx().getCurrentChatId()}`, `기억된 지점: #${memory.cursor}`, ''];
     const frame = frameText(memory.frame);
     if (frame) out.push('## 작품 설정', '', frame, '');
+    if (memory.cast?.length) {
+        out.push('## 캐릭터', '');
+        for (const m of memory.cast) {
+            out.push(`### ${m.name}`, '');
+            if (m.core) out.push(`- 핵심 캐해: ${m.core}`);
+            if (m.speech) out.push(`- 말투 · 호칭: ${m.speech}`);
+            for (const g of m.growth) out.push(`- 변화: ${g.text}`);
+            for (const q of m.quotes) out.push(`> ${q.text}`);
+            out.push('');
+        }
+    }
     if (memory.saga.text.trim()) out.push('## 지금까지의 이야기', '', memory.saga.text.trim(), '');
     if (memory.timeline.length) {
         out.push('## 타임라인', '');
@@ -2927,7 +3211,9 @@ function maybeAutoCompress() {
 function compactSystemPrompt(task) {
     return `${baseArchivistRules()}
 
-${task}${extraRules()}`;
+${task}
+
+Whatever you shorten, keep the moments that show how characters behave and speak, and the current stage of each relationship. Do not flatten or reinterpret personalities.${extraRules()}`;
 }
 
 async function stepCondense(memory) {
@@ -3259,7 +3545,7 @@ const UNITS = {
     keepRecent: '개', batchMessages: '개', batchTokens: '토큰', maxOutputTokens: '토큰', retries: '회',
     remindAt: '개', autoBackupEvery: '번', backupKeep: '개', expansionTimeoutMs: 'ms', memoryBudget: '토큰', protectRecent: '개', maxEpisodes: '개', chapterSize: '개',
     maxChapters: '개', sagaMaxWords: '단어', staleAfter: '메시지', archiveMax: '개', maxUndo: '회',
-    recallTopK: '개', recallTokenBudget: '토큰', recallScan: '개', vectorThreshold: '%', rawChunkMessages: '개',
+    voiceQuotes: '줄', voiceKeep: '줄', recallTopK: '개', recallTokenBudget: '토큰', recallScan: '개', vectorThreshold: '%', rawChunkMessages: '개',
     rawChunkChars: '자', eventMax: '개', queryTimeoutMs: 'ms', loreTokenBudget: '토큰',
 };
 
@@ -3464,6 +3750,7 @@ function settingsHtml() {
           ${selectRow('language', '요약 언어', selectOptions(LANGUAGES, s.language), s.language, 'English가 토큰을 가장 적게 써요')}
           ${selectRow('detail', '상세도', selectOptions({ concise: '간결', standard: '보통', detailed: '상세' }, s.detail), s.detail, '상세할수록 오래 기억하지만 토큰이 늘어요')}
           ${numberRow('keepRecent', '최근 원본 유지', 0, 5000, '이만큼의 최근 메시지는 요약하지 않고 그대로 둬요')}
+          ${checkRow('voiceEnabled', '캐해 보존', '캐릭터 카드로 핵심 성격과 말투를 정리해 고정하고, 요약할 때 실제 대사 샘플을 모아 AI에게 함께 보여줘요. 기억장 → 캐릭터 탭에서 고칠 수 있어요')}
           ${checkRow('previewBeforeSave', '저장 전에 미리보기', '압축할 때마다 결과를 보고 고치거나 다시 요약해요')}
           ${advanced(`
             ${numberRow('batchTokens', '한 구간 최대 토큰', 1000, 2000000, '요약 모델이 감당하는 만큼 크게 잡으면 호출이 줄어요')}
@@ -3486,6 +3773,7 @@ function settingsHtml() {
           ${checkRow('autoCompress', '자동 압축', '답변이 끝날 때 미요약이 기준만큼 쌓였으면 한 구간을 압축해요')}
           ${numberRow('autoCompressAt', '자동 압축 기준', 5, 100000, '미요약 메시지가 이만큼 쌓이면')}
           ${checkRow('checkContradictions', '모순 검사', '답변이 기억과 다르면 메시지 이름 옆에 ⚠ 표시를 해요')}
+          ${checkRow('checkCharacter', '캐해 검사', '모순 검사를 할 때 말투·호칭·성격이 캐해와 어긋나는지도 같이 봐요 (추가 호출 없음)')}
           ${checkRow('liveStateUpdate', '현재 상태 실시간 갱신', '시간·장소·함께 있는 인물·약속을 답변마다 기록부에 반영해요')}
           ${checkRow('autoForgetDeleted', '메시지를 지우면 그 기억도 지우기', '일부만 지우면 "다시 요약" 표시를 해요')}
           <p class="lm-hint lm-note">모순 검사와 실시간 갱신은 둘 다 켜도 답변마다 요약 모델을 1번만 불러요. 요약 모델 프로필을 따로 지정하면 대화와 겹치지 않아요.</p>
@@ -3548,6 +3836,7 @@ function settingsHtml() {
             ${numberRow('sagaMaxWords', '지금까지의 이야기 최대 단어', 200, 100000)}
             ${numberRow('staleAfter', '오래된 사소한 기록 정리', 10, 1000000, '중요도 1인 기록이 이만큼 갱신되지 않으면 보관함으로')}
             ${numberRow('archiveMax', '보관함 최대 항목', 0, 100000)}
+            ${numberRow('voiceKeep', '인물당 대사 샘플 보관', 1, 100, '고정한 샘플은 지우지 않아요')}
             ${numberRow('maxUndo', '되돌리기 기록', 0, 50)}
             ${numberRow('backupKeep', '백업 보관 개수', 1, 50)}`)}
           ${resetFoot()}
@@ -3556,7 +3845,8 @@ function settingsHtml() {
         <section class="lm-pane" data-lm-pane="inject" role="tabpanel">
           ${selectRow('injectPreset', '주입 프리셋', selectOptions(Object.fromEntries(Object.entries(INJECT_PRESETS).map(([k, v]) => [k, v.label])), s.injectPreset), s.injectPreset, '')}
           <div class="lm-preset-row"><span class="lm-hint" id="lm_preset_desc">${esc(INJECT_PRESETS[s.injectPreset]?.desc || '')}</span><button type="button" class="lm-chipbtn" id="lm_apply_preset">${icon('check')}<span>적용</span></button></div>
-          ${checkRow('anchorEnabled', '현재 상태 리마인더', '최근 대화 근처에 짧게 넣어 긴 채팅에서도 흐름을 놓치지 않게 해요')}
+          ${checkRow('anchorEnabled', '현재 상태 리마인더', '최근 대화 근처에 짧게 넣어 긴 채팅에서도 흐름과 말투를 놓치지 않게 해요')}
+          ${numberRow('voiceQuotes', '대사 샘플 (장면 속 인물당)', 0, 10, '캐릭터의 실제 대사를 몇 줄 보여줄지. 0이면 넣지 않아요')}
           ${advanced(`
             ${selectRow('injectPosition', '기억 넣을 위치', selectOptions({ in_prompt: '캐릭터 설정 뒤', before_prompt: '프롬프트 맨 앞', in_chat: '채팅 안 (깊이 지정)' }, s.injectPosition), s.injectPosition, '대부분 캐릭터 설정 뒤가 가장 안정적이에요')}
             ${numberRow('injectDepth', '채팅 안 깊이', 0, 10000, '위치가 채팅 안일 때만 써요')}
@@ -3855,7 +4145,7 @@ function renderLive() {
         rows.push(liveRow('on', '자동 압축', `미요약 ${pending.toLocaleString()} / ${s.autoCompressAt.toLocaleString()}${au ? ` · 최근 ${esc(au.text)}` : ''}`, au?.t, 'autoCompress'));
     }
 
-    const checks = [s.checkContradictions && '모순 검사', s.liveStateUpdate && '상태 갱신'].filter(Boolean);
+    const checks = [s.checkContradictions && '모순 검사', s.checkContradictions && s.voiceEnabled && s.checkCharacter && '캐해 검사', s.liveStateUpdate && '상태 갱신'].filter(Boolean);
     if (!checks.length) rows.push(liveRow('off', '답변 점검', '꺼짐'));
     else {
         const ck = activity.last.check;
@@ -4061,6 +4351,37 @@ function nodeCard(node) {
 </div>`;
 }
 
+function quoteRow(q, i) {
+    return `<div class="lm-quote-row ${q.pinned ? 'lm-q-pinned' : ''}" data-q="${i}">
+      <span class="lm-quote-text">“${esc(q.text)}”</span>
+      <span class="lm-range">${q.at === -1 ? '카드' : q.at === -2 ? '이전 채팅' : `#${q.at}`}</span>
+      <button type="button" class="lm-icon-btn lm-quote-pin ${q.pinned ? 'on' : ''}" title="고정 (자동으로 지우지 않고 늘 먼저 보여줘요)" aria-label="고정">${icon('pin')}</button>
+      <button type="button" class="lm-icon-btn lm-quote-del" title="삭제 (다시 누르면 취소)" aria-label="삭제">${icon('trash')}</button>
+    </div>`;
+}
+
+function castCard(m) {
+    return `
+<div class="lm-cast lm-item" data-cast-id="${esc(m.id)}">
+  <div class="lm-entry-top">
+    ${selBox()}
+    <input class="text_pole lm-cast-name lm-quiet lm-title" value="${esc(m.name)}" placeholder="이름" aria-label="이름">
+    <span class="lm-ctl">
+      ${iconToggle('lm-lock', 'shield', '말투 자동 갱신 막기 (요약이 말투 설명을 바꾸지 않아요)', m.lockSpeech)}
+      ${deleteButton()}
+    </span>
+  </div>
+  <label class="lm-cast-field"><span class="lm-quiet-k">핵심 캐해</span><span class="lm-hint">요약이 절대 바꾸지 않는 기준이에요. AI가 늘 이 성격을 지켜요</span>
+    <textarea class="text_pole lm-cast-core lm-quiet" rows="${m.core ? 4 : 2}" placeholder="성격, 가치관, 결점, 사람을 대하는 방식, 절대 하지 않을 일">${esc(m.core)}</textarea></label>
+  <label class="lm-cast-field"><span class="lm-quiet-k">말투 · 호칭</span>
+    <textarea class="text_pole lm-cast-speech lm-quiet" rows="2" placeholder="예: 반말, 1인칭 '나', 끝을 흐리는 버릇, 유저를 '선배'라고 부름">${esc(m.speech)}</textarea></label>
+  <label class="lm-cast-field"><span class="lm-quiet-k">이야기 속 변화</span><span class="lm-hint">한 줄에 하나. 핵심 캐해는 그대로 두고 천천히 반영해요</span>
+    <textarea class="text_pole lm-cast-growth lm-quiet" rows="${Math.max(1, Math.min(4, m.growth.length))}" placeholder="예: 유저에게 처음으로 약한 모습을 보인 뒤 조금 더 솔직해짐">${esc(m.growth.map(g => g.text).join('\n'))}</textarea></label>
+  <div class="lm-cast-field"><span class="lm-quiet-k">대사 샘플 ${m.quotes.length ? `<em>${m.quotes.length}</em>` : ''}</span><span class="lm-hint">실제로 한 말만 모아요. AI는 이 말투를 따라가되 그대로 반복하지 않아요</span>
+    <div class="lm-quotes">${m.quotes.map(quoteRow).join('') || '<span class="lm-hint">압축하면 자동으로 모여요.</span>'}</div></div>
+</div>`;
+}
+
 function entryRow(entry) {
     return `
 <div class="lm-entry lm-item" data-entry-id="${esc(entry.id)}">
@@ -4139,6 +4460,7 @@ function managerHtml(memory) {
 
   <div class="lm-tabs lm-tabs-line lm-tabs-sticky" role="tablist">
     ${tab('frame', 'frame', '작품 설정', null, true)}
+    ${tab('cast', 'userpen', '캐릭터', memory.cast.length)}
     ${tab('timeline', 'timeline', '타임라인', memory.timeline.length)}
     ${tab('ledger', 'ledger', '기록부', memory.ledger.entries.length)}
     ${tab('events', 'events', '사건', memory.events.length)}
@@ -4197,6 +4519,16 @@ function managerHtml(memory) {
       </div>
     </div>
     ${tool('lm_f_save_char', 'userpen', '이 캐릭터의 기본값으로 저장', 'lm-toolbtn-wide', '이 캐릭터로 새 채팅을 열 때 자동으로 불러와요')}
+  </section>
+
+  <section class="lm-pane" data-lm-pane="cast" role="tabpanel">
+    <div class="lm-wiki-tools">
+      ${tool('lm_cast_extract', 'sparkle', '캐릭터 카드에서 캐해 정리', 'lm-toolbtn-accent', '카드 설명·성격·예시 대화를 읽고 핵심 캐해와 말투를 채워요. 이미 적힌 칸은 건드리지 않아요')}
+      ${tool('lm_cast_add', 'plus', '인물 추가')}
+    </div>
+    <p class="lm-hint lm-pane-intro">요약은 사건만 기록하고, 성격과 말투는 여기 적힌 대로 지켜요. 장면에 있는 인물은 대사 샘플까지 함께 AI에게 보여줘요.${getSettings().voiceEnabled ? '' : ' <b>지금은 설정 → 요약 탭의 "캐해 보존"이 꺼져 있어요.</b>'}</p>
+    ${memory.cast.length ? bulkBar('cast') : ''}
+    <div id="lm_cast" class="lm-list">${memory.cast.map(castCard).join('') || '<div class="lm-empty lm-cast-empty">아직 정리된 캐릭터가 없어요. 위 버튼으로 캐릭터 카드에서 정리하거나, 첫 압축 때 자동으로 정리돼요.</div>'}</div>
   </section>
 
   <section class="lm-pane" data-lm-pane="timeline" role="tabpanel">
@@ -4316,6 +4648,32 @@ function collectManager(root, memory) {
             return { ...e, text: row.querySelector('.lm-text').value.trim(), importance: readImp(row) };
         })
         .filter(e => e && e.text);
+    const castById = new Map((memory.cast || []).map(m => [m.id, m]));
+    out.cast = [...root.querySelectorAll('#lm_cast .lm-cast')]
+        .filter(card => !card.classList.contains('lm-deleted'))
+        .map(card => {
+            const original = castById.get(card.dataset.castId) || emptyCastMember('');
+            const oldGrowth = new Map(original.growth.map(g => [g.text, g.at]));
+            const quotes = [...card.querySelectorAll('.lm-quote-row')]
+                .filter(row => !row.classList.contains('lm-deleted'))
+                .map(row => {
+                    const q = (root.__castQuotes?.get(card.dataset.castId) || original.quotes)[Number(row.dataset.q)];
+                    return q ? { ...q, pinned: row.classList.contains('lm-q-pinned') } : null;
+                })
+                .filter(Boolean);
+            return {
+                ...original,
+                id: card.dataset.castId,
+                name: card.querySelector('.lm-cast-name').value.trim(),
+                core: card.querySelector('.lm-cast-core').value.trim(),
+                speech: card.querySelector('.lm-cast-speech').value.trim(),
+                lockSpeech: card.querySelector('.lm-lock').checked,
+                growth: card.querySelector('.lm-cast-growth').value.split('\n').map(t => t.trim()).filter(Boolean)
+                    .map(text => ({ text, at: oldGrowth.get(text) ?? memory.cursor })),
+                quotes,
+            };
+        })
+        .filter(m => m.name);
     const deletedArchive = new Set([...root.querySelectorAll('#lm_archive .lm-arch.lm-deleted')].map(el => el.dataset.archiveId));
     out.archive = memory.archive.filter(a => !deletedArchive.has(a.id));
     const deletedWiki = new Set([...root.querySelectorAll('#lm_wiki .lm-wiki-page.lm-deleted')].map(el => el.dataset.wikiId));
@@ -4433,6 +4791,49 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
             updateBulk(paneOf(del));
             return;
         }
+        const qDel = event.target.closest('.lm-quote-del');
+        if (qDel) {
+            qDel.closest('.lm-quote-row').classList.toggle('lm-deleted');
+            return;
+        }
+        const qPin = event.target.closest('.lm-quote-pin');
+        if (qPin) {
+            const row = qPin.closest('.lm-quote-row');
+            row.classList.toggle('lm-q-pinned');
+            qPin.classList.toggle('on', row.classList.contains('lm-q-pinned'));
+            return;
+        }
+        if (event.target.closest('#lm_cast_add')) {
+            const member = emptyCastMember('');
+            const list = root.querySelector('#lm_cast');
+            list.querySelector('.lm-cast-empty')?.remove();
+            list.insertAdjacentHTML('beforeend', castCard(member));
+            list.lastElementChild.querySelector('.lm-cast-name').focus();
+            return;
+        }
+        const extractBtn = event.target.closest('#lm_cast_extract');
+        if (extractBtn) {
+            if (extractBtn.disabled) return;
+            extractBtn.disabled = true;
+            const label = extractBtn.querySelector('span');
+            const before = label.textContent;
+            label.textContent = '정리하는 중…';
+            try {
+                // Work on the edited copy so unsaved changes in the manager are kept.
+                const draft = collectManager(root, memory);
+                const list = await extractCast(draft);
+                const n = mergeCast(draft, list);
+                root.__castQuotes = new Map(draft.cast.map(m => [m.id, m.quotes]));
+                root.querySelector('#lm_cast').innerHTML = draft.cast.map(castCard).join('');
+                toastr.success(`${list.map(x => x.name).join(', ')} · 빈 칸만 채웠어요. 확인하고 저장을 눌러주세요.`, `캐해 정리 (${n}명)`);
+            } catch (err) {
+                reportError('캐해 정리 실패', err);
+            } finally {
+                extractBtn.disabled = false;
+                label.textContent = before;
+            }
+            return;
+        }
         const add = event.target.closest('.lm-add-entry');
         if (add) {
             const cat = add.dataset.cat;
@@ -4517,9 +4918,15 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
     root.querySelector('#lm_f_save_char').addEventListener('click', async () => {
         const { characterId, writeExtensionField } = ctx();
         if (characterId === undefined || characterId === null) return toastr.warning('그룹 채팅이거나 캐릭터가 선택되지 않았습니다.');
-        const frame = collectManager(root, memory).frame;
-        await writeExtensionField(characterId, CHAR_FIELD, frame);
-        toastr.success('이 캐릭터의 기본 설정으로 저장했습니다.');
+        const edited = collectManager(root, memory);
+        await writeExtensionField(characterId, CHAR_FIELD, edited.frame);
+        // Core personality, speech and pinned lines carry into every new chat with this character.
+        const cast = edited.cast.filter(m => m.core || m.speech).map(m => ({
+            name: m.name, core: m.core, speech: m.speech, lockSpeech: m.lockSpeech,
+            quotes: m.quotes.filter(q => q.pinned || q.at === -1).map(q => ({ text: q.text, at: -1, pinned: q.pinned })),
+        }));
+        await writeExtensionField(characterId, CHAR_CAST_FIELD, cast);
+        toastr.success(`작품 설정${cast.length ? `과 캐해 ${cast.length}명` : ''}을 이 캐릭터의 기본값으로 저장했습니다.`);
     });
     const fileInput = root.querySelector('#lm_import_file');
     root.querySelector('#lm_import').addEventListener('click', () => fileInput.click());
@@ -4581,7 +4988,7 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
         edited.events = edited.events.filter(e => !removedIds.has(e.episodeId));
         edited.archive = edited.archive.filter(a => !removedIds.has(a.ownerId));
     }
-    for (const key of ['frame', 'saga', 'timeline', 'ledger', 'events', 'archive', 'wiki']) current[key] = edited[key];
+    for (const key of ['frame', 'cast', 'saga', 'timeline', 'ledger', 'events', 'archive', 'wiki']) current[key] = edited[key];
     if (removedIds.size && root.querySelector('#lm_restore_src')?.checked) {
         restoreSources(current, removedIds);
         await ctx().saveChat();
@@ -4794,10 +5201,16 @@ function onChatChanged() {
     remindedFor = null;
     const c = ctx();
     if (hasChat() && !c.chatMetadata?.[META_KEY] && c.characterId !== undefined && c.characterId !== null) {
-        const frame = c.characters?.[c.characterId]?.data?.extensions?.[CHAR_FIELD];
-        if (frame && typeof frame === 'object') {
+        const ext = c.characters?.[c.characterId]?.data?.extensions || {};
+        const frame = ext[CHAR_FIELD];
+        const cast = ext[CHAR_CAST_FIELD];
+        if ((frame && typeof frame === 'object') || (Array.isArray(cast) && cast.length)) {
             const memory = getMemory(true);
-            memory.frame = { ...emptyFrame(), ...frame };
+            if (frame && typeof frame === 'object') memory.frame = { ...emptyFrame(), ...frame };
+            if (Array.isArray(cast) && cast.length) {
+                memory.cast = cast.filter(x => x?.name).map(x => ({ ...emptyCastMember(x.name), ...x, growth: [], quotes: Array.isArray(x.quotes) ? x.quotes : [] }));
+                memory.castSeeded = true;
+            }
             c.saveMetadataDebounced?.();
         }
     }
