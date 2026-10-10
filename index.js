@@ -135,6 +135,8 @@ const defaultSettings = Object.freeze({
     maxUndo: 10,
     extraRules: '',
     prompts: {},
+    promptStyle: 'default',
+    userStyles: [],
     promptSystemPrefix: '',
     promptUserPrefix: '',
     promptUserSuffix: '',
@@ -1915,6 +1917,296 @@ function fillPlaceholders(text) {
         .replace(/\{\{user\}\}/gi, name1 || 'User')
         .replace(/\{\{char\}\}/gi, name2 || 'Character')
         .replace(/\{\{language\}\}/gi, languageRule());
+}
+
+// ---------------------------------------------------------------- prompt styles ("지시문 방식")
+// Built-in sets of prompt templates tuned for a goal. A style only lists the templates it
+// changes; everything else stays at the default. Applying one replaces settings.prompts.
+
+const STYLE_RULES_HEAD = 'You are the continuity archivist for a long-running interactive story. "{{user}}" is the user\'s character; everyone else is played by the AI.';
+
+const PROMPT_STYLES = {
+    default: {
+        label: '기본 (균형)',
+        desc: '기억과 캐해를 고르게 챙기는 처음 설정이에요.',
+        prompts: {},
+        settings: {},
+    },
+    character: {
+        label: '캐해 최우선',
+        desc: '말투·호칭·행동 방식을 가장 꼼꼼히 남기고, AI에게도 그대로 쓰라고 강하게 일러요. 캐붕이 걱정될 때 추천해요.',
+        settings: { voiceQuotes: 4 },
+        prompts: {
+            rules: `${STYLE_RULES_HEAD}
+Your notes replace the original messages once they are hidden, so a future writer must be able to continue with perfect continuity and write every character exactly as they were written here.
+
+Rules:
+- Record only what the transcript actually shows or states. Do not invent, guess or add commentary.
+{{sensitive}}
+- Characterization comes first. For every character who acts, note how they did it: tone of voice, word choice, gestures, habits, what they avoided saying. Describe behaviour, not labels ("snapped and looked away", not "was angry").
+- Never soften, exaggerate or reinterpret a personality. One scene is never a personality change; record a lasting change only when the transcript clearly shows it, together with its cause.
+- Record how characters address each other (names, nicknames, honorifics, speech level) whenever it appears or changes.
+- Keep short exact quotes of lines that define a character's voice or a relationship, in the original language.
+- Be concrete about events: names, places, times, objects, injuries, decisions and their reasons, promises, secrets and exactly who knows them.
+- Keep cause and effect, and keep unresolved questions unresolved.
+- Third person, past tense, chronological order.
+- Language: {{language}}`,
+            chapter: 'Task: merge the consecutive episodes below into one chapter summary. Keep every detail from importance 4-5 episodes and the essentials of the rest, in chronological order with cause and effect. Above all keep what shows each character\'s manner and voice, the short quotes that define them, how they address each other, and the current stage of each relationship. Aim for about half of their combined length. Never flatten or reinterpret personalities.',
+            voice: `You study how one character of a long interactive story talks. From the sample messages written as {{name}}, describe how they speak and pick their most characteristic lines.
+- "speech": speech level and politeness, first-person pronoun, typical sentence endings, verbal tics, favourite expressions, how they show emotion in words, and how they address each of the other characters. Describe only what the samples show, as concretely as possible.
+- "quotes": up to 8 short lines of {{name}}'s own dialogue, copied exactly, character for character, in the original language. Prefer lines that show temperament, humour, affection or irritation, and lines addressed to other characters. Avoid plot exposition. Each under 120 characters.
+- Language for "speech": {{language}}`,
+            voiceCheck: 'Also report out-of-character slips against <cast>: the wrong speech level, first-person pronoun or form of address; a tone that does not fit the character (suddenly too polite, too sweet, too talkative or too formal); phrasing the character would not use; or behaviour that contradicts their core personality with no story reason. Do not report gradual growth that the development notes support or mood shifts with a clear cause. Start the "problem" of such an issue with "[캐해]".',
+            header: 'This is the authoritative record of the earlier part of this story ({{covered}}), compressed because the original messages are no longer shown. Keep every fact in it consistent. It records events only; it never redefines the characters. Write each character from their character description and the [Characters] notes: the same speech level, pronouns, verbal habits, forms of address and temperament as before. Match the voice samples closely without copying them. Let characters change only as far as the record shows, gradually, and never drop core traits. Characters only know secrets they are listed as knowing. Use it silently; do not repeat or summarize it in replies.',
+        },
+    },
+    detail: {
+        label: '꼼꼼한 기억',
+        desc: '숫자·시간·물건 위치·약속 문구 같은 작은 사실까지 최대한 남기고, 합칠 때도 덜 줄여요. 토큰이 더 들어요.',
+        settings: { detail: 'detailed' },
+        prompts: {
+            rules: `${STYLE_RULES_HEAD}
+Your notes are the only thing that survives after the original messages are removed. Prefer completeness over brevity: a future writer must be able to answer any question about what happened.
+
+Rules:
+- Record only what the transcript actually shows or states. Do not invent, guess or add commentary. Summarize all story content neutrally as plain narrative facts.
+{{sensitive}}
+- Keep concrete details: exact numbers, dates and times, how long things took, places and how they are laid out, who was present, objects and who holds them or where they were left, clothing and physical states, injuries and how they were treated.
+- Keep every promise, deal, deadline, rule and codeword with its exact wording.
+- Keep names of minor characters and places once they are introduced, and what they did.
+- Keep clues, foreshadowing and anything a character noticed but did not act on.
+- Preserve characterization: note the manner in which characters act and speak. Never reinterpret a personality.
+- Keep cause and effect, secrets and exactly who knows them, and keep unresolved questions unresolved.
+- When a character believes something false, record both the belief and the truth, labelled.
+- Third person, past tense, chronological order.
+- Language: {{language}}`,
+            condense: 'Task: condense each memory note below to about 60% of its length. These are the less important parts of the story. Remove only atmosphere and repetition; keep every name, number, time, place, item, promise, secret, injury and relationship change.',
+            chapter: 'Task: merge the consecutive episodes below into one chapter summary. Keep every concrete fact from importance 3-5 episodes and the essentials of the rest, in chronological order with cause and effect. Aim for about 70% of their combined length. Keep names, numbers, items and exact promises.',
+            saga: 'Task: update "the story so far" by folding in the chapters below, which come right after it in time. Keep the result under {{sagaWords}} words. Compress the oldest and least important material first, but never drop: names of everyone who still matters, who the characters are to each other, major turning points, items and who holds them, promises, secrets, deaths, and anything still unresolved.',
+            ledger: `Categories:
+- character: appearance, clothing, abilities, role, whereabouts and current condition (injuries, health, situation, mood) of each character, including the user's character. Update the condition every time it changes. Do not rewrite a personality from a single scene.
+- relation: key format "A -> B". The current stage of the relationship with concrete evidence, and how A addresses B. Do not escalate feelings beyond what was shown.
+- thread: open plot threads, goals, plans, promises, debts, deadlines with exact dates or times, pending questions
+- fact: world rules, established facts, secrets (always give knownBy for secrets); note where a fact came from when it matters
+- item: significant objects, exactly who holds them or where they are, their condition, why they matter
+- divergence: only for fanfiction; where this story departs from the original work's canon
+Entries in the "note" category are pinned by the user: never change or delete them.
+Reuse existing keys exactly when updating. Only emit operations for things that are new or changed. If nothing changed, output [].`,
+        },
+    },
+    lean: {
+        label: '토큰 절약',
+        desc: '짧고 압축된 메모로 적어서 기억이 차지하는 자리를 줄여요. 컨텍스트가 작은 모델이나 비용을 아끼고 싶을 때.',
+        settings: { detail: 'concise', voiceQuotes: 1 },
+        prompts: {
+            rules: `${STYLE_RULES_HEAD}
+Write the notes a future writer needs to continue the story, and nothing more.
+
+Rules:
+- Record only what the transcript actually shows or states. No commentary.
+{{sensitive}}
+- Write dense, compact notes: short clauses, no filler, no atmosphere, no repetition.
+- Keep only what changes the story or will be referenced later: who, what changed, decisions, promises and deadlines, secrets and who knows them, injuries, items, relationship shifts.
+- Keep each character's manner in a word or two when it shows who they are. Never reinterpret a personality.
+- Chronological order.
+- Language: {{language}}`,
+            condense: 'Task: condense each memory note below to about 30% of its length, at least one full sentence. Keep only details with lasting consequences.',
+            chapter: 'Task: merge the consecutive episodes below into one compact chapter summary of about a third of their combined length. Keep turning points, promises, secrets, injuries, items and relationship shifts in chronological order.',
+            header: 'Earlier story ({{covered}}), compressed. Keep these facts consistent; characters keep their usual personality and voice and know only the secrets listed for them. Use silently; do not repeat it.',
+        },
+    },
+    canon: {
+        label: '원작 충실 (2차 창작)',
+        desc: '원작 이름·용어·호칭을 정확히 쓰고, 원작과 달라진 점을 따로 분명히 기록해요. 2차 창작에 추천해요.',
+        settings: {},
+        prompts: {
+            rules: `${STYLE_RULES_HEAD}
+This story may be fanfiction of an existing work. Your notes replace the original messages once they are hidden.
+
+Rules:
+- Record only what the transcript actually shows or states. Do not invent, guess or add commentary. Summarize all story content neutrally as plain narrative facts.
+{{sensitive}}
+- Use the exact canon spellings of names, places, techniques, organisations and terms. Do not translate or paraphrase established names.
+- Keep canon-consistent forms of address and honorifics, and note when the story changes them.
+- When the story departs from canon (different events, relationships, settings or abilities), state the departure plainly so it is never mistaken for canon.
+- Preserve characterization: note the manner in which characters act and speak. Never reinterpret a personality; canon temperament stays unless the story clearly changes it.
+- Be concrete: names, places, times, objects, injuries, decisions and reasons, promises, secrets and exactly who knows them.
+- Keep cause and effect, and keep unresolved questions unresolved.
+- Third person, past tense, chronological order.
+- Language: {{language}}`,
+            ledger: `Categories:
+- character: appearance, abilities, role (including their canon role if it matters) and current condition of each character, including the user's character. Do not rewrite a personality from a single scene: lasting personality and speech belong to <cast>, the character card and canon.
+- relation: key format "A -> B". The current stage of the relationship with concrete evidence, how A addresses B, and whether it differs from canon.
+- thread: open plot threads, goals, plans, promises, debts, deadlines, pending questions
+- fact: world rules, established facts, secrets (always give knownBy for secrets)
+- item: significant objects, who holds them, why they matter
+- divergence: every place where this story departs from the original work's canon: what canon says, what this story says instead, and since when. Keep these precise.
+Entries in the "note" category are pinned by the user: never change or delete them.
+Reuse existing keys exactly when updating. Only emit operations for things that are new or changed. If nothing changed, output [].`,
+            cast: `You are a character analyst for a long-running interactive story. Write a compact characterization sheet that lets a writer keep each character consistent, in personality and in voice, across thousands of messages.
+
+Rules:
+- Base it on the character card and the user's notes, and on well-established canon characterization of the original work where the card is thin. When they conflict, the card and the user's notes win.
+{{canon}}
+- "core": 4-8 short lines covering temperament, values and motivations, flaws, emotional range, how they treat others and the user's character, and what they would never do. No plot summary.
+- "speech": speech level and politeness, first-person pronoun, typical sentence endings, verbal tics, catchphrases and canon forms of address.
+- "quotes": up to 3 lines copied exactly from the card's first message or example dialogue that best show the voice. Empty if none.
+- Language for core and speech: {{language}}`,
+            header: 'This is the authoritative record of the earlier part of this story ({{covered}}), compressed because the original messages are no longer shown. Keep every fact in it consistent. Characters keep their canon personalities, speech styles, forms of address and relationships, except where this record lists a canon divergence; divergences always override canon. Use canon names and terms exactly. Characters only know secrets they are listed as knowing. Use it silently; do not repeat or summarize it in replies.',
+        },
+    },
+    bond: {
+        label: '감정선 · 관계 중심',
+        desc: '누가 먼저 다가갔는지, 신뢰와 거리감, 풀리지 않은 감정, 둘만의 호칭과 농담까지 관계의 흐름을 촘촘히 남겨요.',
+        settings: {},
+        prompts: {
+            rules: `${STYLE_RULES_HEAD}
+Your notes replace the original messages once they are hidden, so a future writer must be able to continue every relationship exactly where it stands.
+
+Rules:
+- Record only what the transcript actually shows or states. Do not invent, guess or add commentary.
+{{sensitive}}
+- Track relationships closely: emotional turning points and what exactly caused them, who reached out first, changes in trust and distance, things left unsaid, apologies, confessions and promises (with their exact words), private jokes, nicknames and how characters address each other.
+- Show feelings through evidence (what was said or done), not labels. Never escalate a relationship beyond what the transcript shows, and never skip stages.
+- Preserve characterization: note the manner in which characters act and speak. Never reinterpret a personality.
+- Be concrete about events: names, places, times, objects, injuries, decisions, secrets and exactly who knows them.
+- Keep cause and effect, and keep unresolved feelings and questions unresolved.
+- Third person, past tense, chronological order.
+- Language: {{language}}`,
+            ledger: `Categories:
+- character: appearance, abilities, role and current condition (injuries, situation, mood) of each character, including the user's character. Do not rewrite a personality from a single scene.
+- relation: key format "A -> B". Write: current stage of the relationship, trust and distance, how A addresses B, the last significant moment between them (with what was said or done), and any unresolved tension or unanswered feeling. Do not escalate beyond what was shown.
+- thread: open plot threads, goals, plans, promises between characters, debts, deadlines, pending questions and unresolved conversations
+- fact: world rules, established facts, secrets (always give knownBy for secrets)
+- item: significant objects (including gifts and keepsakes), who holds them, why they matter
+- divergence: only for fanfiction; where this story departs from the original work's canon
+Entries in the "note" category are pinned by the user: never change or delete them.
+Reuse existing keys exactly when updating. Only emit operations for things that are new or changed. If nothing changed, output [].`,
+            chapter: 'Task: merge the consecutive episodes below into one chapter summary. Keep every emotional turning point and what caused it, every promise and confession with its key words, and the stage each relationship reached, in chronological order. Keep the essentials of the plot. Aim for about half of their combined length. Never flatten or reinterpret personalities.',
+            saga: 'Task: update "the story so far" by folding in the chapters below, which come right after it in time. Keep the result under {{sagaWords}} words. Compress the oldest material first, but never drop: how each relationship began and every stage it went through, lasting promises and confessions, secrets, major turning points, and feelings still unresolved.',
+        },
+    },
+    mystery: {
+        label: '사건 · 추리 · 모험',
+        desc: '단서, 누가 무엇을 봤는지, 확인된 사실과 추측, 지도와 소지품, 아직 못 푼 수수께끼를 따로 정확히 남겨요.',
+        settings: {},
+        prompts: {
+            rules: `${STYLE_RULES_HEAD}
+Your notes replace the original messages once they are hidden, so a future writer must be able to continue every investigation, quest and plan without losing a single clue.
+
+Rules:
+- Record only what the transcript actually shows or states. Do not invent, guess or solve anything yourself.
+{{sensitive}}
+- Keep every clue, piece of evidence and odd detail, who found or noticed it, and where.
+- Separate confirmed facts from suspicions, theories and lies; label each.
+- Track exactly who knows what, who saw what, and who was where and when.
+- Track routes, places visited, maps, inventory, money, resources and who holds each item.
+- Keep plans, deals, deadlines and open questions with their exact wording.
+- Preserve characterization: note the manner in which characters act and speak. Never reinterpret a personality.
+- Keep cause and effect, and keep unresolved questions unresolved.
+- Third person, past tense, chronological order.
+- Language: {{language}}`,
+            ledger: `Categories:
+- character: appearance, abilities, role, whereabouts and current condition of each character, including the user's character. Do not rewrite a personality from a single scene.
+- relation: key format "A -> B". The current stage of the relationship with concrete evidence (alliance, suspicion, debt), and how A addresses B.
+- thread: open mysteries, quests, goals, plans, deals, deadlines and pending questions; say what is still unknown
+- fact: world rules, confirmed facts, clues and evidence (say who found them), secrets (always give knownBy). Mark suspicions as "unconfirmed".
+- item: significant objects and resources, exactly who holds them or where they are, and why they matter
+- divergence: only for fanfiction; where this story departs from the original work's canon
+Entries in the "note" category are pinned by the user: never change or delete them.
+Reuse existing keys exactly when updating. Only emit operations for things that are new or changed. If nothing changed, output [].`,
+            saga: 'Task: update "the story so far" by folding in the chapters below, which come right after it in time. Keep the result under {{sagaWords}} words. Compress the oldest material first, but never drop: unsolved mysteries and every clue that bears on them, who knows which secret, open quests and deadlines, items and who holds them, major turning points and deaths.',
+        },
+    },
+};
+
+const STYLE_SETTING_LABELS = {
+    voiceQuotes: (v) => `장면 속 인물 대사 샘플 ${v}줄`,
+    detail: (v) => `요약 상세도 "${({ concise: '간결', standard: '보통', detailed: '상세' })[v] || v}"`,
+};
+
+function allStyles() {
+    const s = getSettings();
+    const mine = Object.fromEntries((s.userStyles || []).map(u => [u.id, { ...u, mine: true }]));
+    return { ...PROMPT_STYLES, ...mine };
+}
+
+function styleSettingsText(style) {
+    return Object.entries(style.settings || {}).map(([k, v]) => STYLE_SETTING_LABELS[k]?.(v)).filter(Boolean).join(', ');
+}
+
+// Counts templates the user edited after choosing the current style.
+function editedSinceStyle() {
+    const s = getSettings();
+    const style = allStyles()[s.promptStyle] || PROMPT_STYLES.default;
+    const keys = new Set([...Object.keys(s.prompts || {}), ...Object.keys(style.prompts || {})]);
+    let n = 0;
+    for (const k of keys) {
+        const mine = (s.prompts?.[k] || '').trim();
+        const theirs = (style.prompts?.[k] || '').trim();
+        if (mine !== theirs) n++;
+    }
+    return n;
+}
+
+function applyPromptStyle(id) {
+    const s = getSettings();
+    const style = allStyles()[id];
+    if (!style) return false;
+    s.prompts = { ...(style.prompts || {}) };
+    for (const [k, v] of Object.entries(style.settings || {})) {
+        if (k in defaultSettings) s[k] = v;
+    }
+    s.promptStyle = id;
+    ctx().saveSettingsDebounced();
+    syncSettingInputs();
+    refreshInjection();
+    return true;
+}
+
+function saveCurrentAsStyle(label) {
+    const s = getSettings();
+    const id = `mine_${newId()}`;
+    s.userStyles = [...(s.userStyles || []), { id, label: label.slice(0, 40), desc: '직접 만든 지시문 방식이에요.', prompts: { ...(s.prompts || {}) }, settings: {}, createdAt: Date.now() }];
+    s.promptStyle = id;
+    ctx().saveSettingsDebounced();
+    return id;
+}
+
+function deleteUserStyle(id) {
+    const s = getSettings();
+    s.userStyles = (s.userStyles || []).filter(u => u.id !== id);
+    if (s.promptStyle === id) s.promptStyle = 'default';
+    ctx().saveSettingsDebounced();
+}
+
+function exportStyle(id) {
+    const style = allStyles()[id];
+    if (!style) return;
+    const data = { type: 'elephant-prompt-style', version: 1, label: style.label, desc: style.desc || '', prompts: style.prompts || {}, settings: style.settings || {} };
+    downloadFile(`elephant-style-${String(style.label).replace(/[^\p{L}\p{N}_-]+/gu, '_')}.json`, JSON.stringify(data, null, 2));
+}
+
+function importStyle(text) {
+    let data;
+    try {
+        data = JSON.parse(text);
+    } catch {
+        throw new Error('JSON 파일이 아니에요.');
+    }
+    if (data?.type !== 'elephant-prompt-style' || typeof data.prompts !== 'object') throw new Error('코끼리 지시문 방식 파일이 아니에요.');
+    const prompts = {};
+    for (const [k, v] of Object.entries(data.prompts || {})) {
+        if (PROMPT_DEFS[k] && typeof v === 'string' && v.trim()) prompts[k] = v.slice(0, 20000);
+    }
+    const settings = {};
+    if (Number.isInteger(data.settings?.voiceQuotes)) settings.voiceQuotes = Math.min(10, Math.max(0, data.settings.voiceQuotes));
+    if (['concise', 'standard', 'detailed'].includes(data.settings?.detail)) settings.detail = data.settings.detail;
+    const s = getSettings();
+    const id = `mine_${newId()}`;
+    s.userStyles = [...(s.userStyles || []), { id, label: String(data.label || '가져온 방식').slice(0, 40), desc: String(data.desc || '가져온 지시문 방식이에요.').slice(0, 200), prompts, settings, createdAt: Date.now() }];
+    ctx().saveSettingsDebounced();
+    return id;
 }
 
 function baseArchivistRules() {
@@ -4385,6 +4677,19 @@ function settingsHtml() {
         </section>
         <section class="lm-pane" data-lm-pane="prompt" role="tabpanel">
           <p class="lm-hint lm-note">이 확장이 AI에게 보내는 기본 프롬프트를 전부 여기서 고칠 수 있어요. 칸에 적힌 게 지금 쓰는 프롬프트고, 고치면 그게 새 기본값이 돼요. 결과 형식(&lt;episode&gt; 같은 블록)은 뒤에 자동으로 붙어서 고쳐도 요약이 깨지지 않아요. <b>{{user}}</b>, <b>{{char}}</b>, <b>{{language}}</b>(요약 언어 지시)를 어디서든 쓸 수 있어요.</p>
+          <div class="lm-style">
+            <div class="lm-field-text"><span class="lm-field-label">지시문 방식</span><span class="lm-hint">목적에 맞게 미리 다듬어 둔 지시문 묶음이에요. 하나를 고르고 적용하면 아래 프롬프트가 그 방식으로 바뀌어요. 적용한 뒤에도 칸마다 더 고칠 수 있어요.</span></div>
+            <div class="lm-style-list" id="lm_style_list" role="radiogroup" aria-label="지시문 방식"></div>
+            <div class="lm-style-actions">
+              <button type="button" class="menu_button lm-btn lm-btn-primary" id="lm_style_apply">${icon('check')}<span>이 방식 적용</span></button>
+              <button type="button" class="lm-chipbtn" id="lm_style_save">${icon('save')}<span>지금 프롬프트를 내 방식으로 저장</span></button>
+              <button type="button" class="lm-chipbtn" id="lm_style_export">${icon('export')}<span>내보내기</span></button>
+              <button type="button" class="lm-chipbtn" id="lm_style_import">${icon('import')}<span>가져오기</span></button>
+              <button type="button" class="lm-chipbtn lm-chipbtn-danger" id="lm_style_delete" hidden>${icon('trash')}<span>삭제</span></button>
+              <input type="file" id="lm_style_file" accept=".json,application/json" hidden>
+            </div>
+          </div>
+          <h4 class="lm-subhead">프롬프트 하나씩 고치기</h4>
           <div class="lm-prompt-list" id="lm_prompt_list"></div>
           <h4 class="lm-subhead">덧붙이는 문구</h4>
           <div class="lm-field lm-field-stack">
@@ -4528,27 +4833,91 @@ function bindSettings(root) {
     root.querySelector('#lm_btn_search').addEventListener('click', () => openSearchTest());
     root.querySelector('#lm_btn_test').addEventListener('click', () => testConnection());
     renderPromptEditors(root);
+    let pickedStyle = s.promptStyle || 'default';
+    renderStyleList(root, pickedStyle);
+    root.querySelector('#lm_style_list').addEventListener('click', (event) => {
+        const card = event.target.closest('[data-style]');
+        if (!card) return;
+        pickedStyle = card.dataset.style;
+        renderStyleList(root, pickedStyle);
+    });
+    root.querySelector('#lm_style_apply').addEventListener('click', async () => {
+        const style = allStyles()[pickedStyle];
+        if (!style) return;
+        const edited = editedSinceStyle();
+        const changes = styleSettingsText(style);
+        const msg = [
+            `"${style.label}" 방식을 적용할까요?`,
+            edited ? `지금 직접 고쳐 둔 프롬프트 ${edited}개는 이 방식의 문구로 바뀌어요. 남겨 두고 싶으면 먼저 "내 방식으로 저장"을 눌러 주세요.` : '',
+            changes ? `함께 바뀌는 설정: ${changes}` : '',
+        ].filter(Boolean).join('\n\n');
+        if ((edited || changes || pickedStyle !== s.promptStyle) && !await ctx().Popup.show.confirm('지시문 방식', msg)) return;
+        applyPromptStyle(pickedStyle);
+        renderPromptEditors(root);
+        renderStyleList(root, pickedStyle);
+        logActivity('model', `지시문 방식: ${style.label}`);
+        toastr.success(`"${style.label}" 방식을 적용했어요. 다음 압축부터 이 지시문으로 요약해요.`, APP_NAME);
+    });
+    root.querySelector('#lm_style_save').addEventListener('click', async () => {
+        const label = await ctx().Popup.show.input('내 방식으로 저장', '지금 프롬프트 탭의 지시문을 이름을 붙여 저장해요. 언제든 다시 고를 수 있어요.', '');
+        if (!label || !String(label).trim()) return;
+        pickedStyle = saveCurrentAsStyle(String(label).trim());
+        renderStyleList(root, pickedStyle);
+        renderPromptEditors(root);
+        toastr.success(`"${String(label).trim()}"(으)로 저장했어요.`, APP_NAME);
+    });
+    root.querySelector('#lm_style_export').addEventListener('click', () => exportStyle(pickedStyle));
+    const styleFile = root.querySelector('#lm_style_file');
+    root.querySelector('#lm_style_import').addEventListener('click', () => styleFile.click());
+    styleFile.addEventListener('change', async () => {
+        const file = styleFile.files?.[0];
+        styleFile.value = '';
+        if (!file) return;
+        try {
+            pickedStyle = importStyle(await file.text());
+            renderStyleList(root, pickedStyle);
+            toastr.success('지시문 방식을 가져왔어요. "이 방식 적용"을 눌러 쓰세요.', APP_NAME);
+        } catch (err) {
+            toastr.error(esc(err.message), '가져오기 실패');
+        }
+    });
+    root.querySelector('#lm_style_delete').addEventListener('click', async () => {
+        const style = allStyles()[pickedStyle];
+        if (!style?.mine) return;
+        if (!await ctx().Popup.show.confirm('삭제', `"${style.label}" 방식을 지울까요? 지금 쓰는 프롬프트는 그대로 남아요.`)) return;
+        deleteUserStyle(pickedStyle);
+        pickedStyle = s.promptStyle || 'default';
+        renderStyleList(root, pickedStyle);
+    });
     root.querySelector('#lm_prompt_list').addEventListener('input', (event) => {
         const area = event.target.closest('textarea[data-prompt-key]');
         if (!area) return;
         setPromptOverride(area.dataset.promptKey, area.value);
-        area.closest('.lm-prompt-item').classList.toggle('lm-modified', !!s.prompts[area.dataset.promptKey]);
+        const item = area.closest('.lm-prompt-item');
+        const st = promptState(area.dataset.promptKey);
+        item.classList.toggle('lm-modified', st === 'edited');
+        item.classList.toggle('lm-styled', st === 'style');
+        renderStyleList(root);
     });
     root.querySelector('#lm_prompt_list').addEventListener('click', async (event) => {
         const btn = event.target.closest('[data-prompt-reset]');
         if (!btn) return;
         const key = btn.dataset.promptReset;
-        if (!await ctx().Popup.show.confirm('원래대로', `"${PROMPT_DEFS[key].label}"을(를) 처음 기본값으로 되돌릴까요?`)) return;
-        setPromptOverride(key, '');
+        const styleText = (allStyles()[s.promptStyle]?.prompts || {})[key] || '';
+        if (!await ctx().Popup.show.confirm('원래대로', `"${PROMPT_DEFS[key].label}"을(를) ${styleText ? '지금 지시문 방식의 문구로' : '처음 기본값으로'} 되돌릴까요?`)) return;
+        setPromptOverride(key, styleText);
         renderPromptEditors(root);
+        renderStyleList(root);
     });
     root.querySelector('#lm_prompt_reset_all').addEventListener('click', async () => {
         if (!await ctx().Popup.show.confirm('프롬프트 전부 원래대로', '고친 프롬프트와 덧붙이는 문구를 모두 처음 기본값으로 되돌릴까요?')) return;
         s.prompts = {};
+        s.promptStyle = 'default';
         for (const key of ['extraRules', 'promptSystemPrefix', 'promptUserPrefix', 'promptUserSuffix', 'promptPrefill']) s[key] = '';
         saveSettingsDebounced();
         syncSettingInputs();
         renderPromptEditors(root);
+        renderStyleList(root, 'default');
         refreshInjection();
         toastr.success('프롬프트를 모두 원래대로 되돌렸어요.');
     });
@@ -4770,6 +5139,37 @@ async function openActivityLog() {
     await new c.Popup(wrap, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, allowVerticalScrolling: true, leftAlign: true }).show();
 }
 
+// 'style' = text from the chosen style, 'edited' = changed by the user, '' = plain default.
+function promptState(key) {
+    const s = getSettings();
+    const mine = (s.prompts?.[key] || '').trim();
+    const styleText = ((allStyles()[s.promptStyle]?.prompts || {})[key] || '').trim();
+    if (!mine) return styleText ? 'edited' : '';
+    if (styleText && mine === styleText) return 'style';
+    return 'edited';
+}
+
+function renderStyleList(root, picked = null) {
+    const host = root.querySelector('#lm_style_list');
+    if (!host) return;
+    const s = getSettings();
+    const current = s.promptStyle || 'default';
+    const sel = (picked && allStyles()[picked]) ? picked : (allStyles()[host.dataset.picked] ? host.dataset.picked : current);
+    host.dataset.picked = sel;
+    const edited = editedSinceStyle();
+    host.innerHTML = Object.entries(allStyles()).map(([id, st]) => {
+        const extra = styleSettingsText(st);
+        const inUse = id === current;
+        return `<button type="button" class="lm-style-card ${id === sel ? 'picked' : ''} ${inUse ? 'in-use' : ''}" data-style="${esc(id)}" role="radio" aria-checked="${id === sel}">
+          <span class="lm-style-name">${esc(st.label)}${st.mine ? '<em>내 방식</em>' : ''}${inUse ? `<em class="use">사용 중${edited ? `, 고친 칸 ${edited}개` : ''}</em>` : ''}</span>
+          <span class="lm-style-desc">${esc(st.desc || '')}</span>
+          ${extra ? `<span class="lm-style-extra">함께 바뀜: ${esc(extra)}</span>` : ''}
+        </button>`;
+    }).join('');
+    const del = root.querySelector('#lm_style_delete');
+    if (del) del.hidden = !allStyles()[sel]?.mine;
+}
+
 function setPromptOverride(key, value) {
     const s = getSettings();
     s.prompts = s.prompts || {};
@@ -4786,8 +5186,8 @@ function renderPromptEditors(root) {
     const s = getSettings();
     const open = new Set([...host.querySelectorAll('.lm-prompt-item[open]')].map(d => d.dataset.promptKey));
     host.innerHTML = Object.entries(PROMPT_DEFS).map(([key, def]) => `
-      <details class="lm-prompt-item ${s.prompts?.[key] ? 'lm-modified' : ''}" data-prompt-key="${key}" ${open.has(key) ? 'open' : ''}>
-        <summary><span class="lm-prompt-name">${esc(def.label)}</span><span class="lm-prompt-mod">수정됨</span><span class="lm-fold-chev">${icon('chevron')}</span></summary>
+      <details class="lm-prompt-item ${promptState(key) === 'edited' ? 'lm-modified' : ''} ${promptState(key) === 'style' ? 'lm-styled' : ''}" data-prompt-key="${key}" ${open.has(key) ? 'open' : ''}>
+        <summary><span class="lm-prompt-name">${esc(def.label)}</span><span class="lm-prompt-mod">수정됨</span><span class="lm-prompt-style">방식</span><span class="lm-fold-chev">${icon('chevron')}</span></summary>
         <p class="lm-hint">${esc(def.hint)}</p>
         <textarea class="text_pole lm-textarea lm-prompt-area" data-prompt-key="${key}" rows="${Math.min(14, Math.max(3, Math.ceil(promptTemplate(key).length / 70)))}" spellcheck="false"></textarea>
         <div class="lm-inline-action"><button type="button" class="lm-chipbtn" data-prompt-reset="${key}">${icon('rotate')}<span>원래대로</span></button></div>
