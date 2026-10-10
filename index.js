@@ -158,6 +158,8 @@ const defaultSettings = Object.freeze({
     voiceQuotes: 3,
     voiceKeep: 12,
     checkCharacter: true,
+    verifySummaries: 'off',
+    hooksEnabled: true,
     autoIndex: true,
     loreEnabled: true,
     loreUseCharacter: true,
@@ -293,6 +295,8 @@ function emptyMemory() {
         qna: [],
         cast: [],
         castSeeded: false,
+        hooks: [],
+        merged: [],
     };
 }
 
@@ -319,6 +323,7 @@ function getMemory(create = true) {
     memory.ledger.scene = { ...base.ledger.scene, ...memory.ledger.scene };
     if (!Array.isArray(memory.ledger.entries)) memory.ledger.entries = [];
     if (!Array.isArray(memory.cast)) memory.cast = [];
+    if (!Array.isArray(memory.hooks)) memory.hooks = [];
     return memory;
 }
 
@@ -587,7 +592,7 @@ function isSummarizable(msg) {
 function messageLine(msg, index) {
     const { name1, name2 } = ctx();
     const name = msg.name || (msg.is_user ? name1 : name2);
-    return `[#${index}] ${name}: ${stripMessage(msg.mes)}`;
+    return `[#${index}${msg.extra?.lm_star ? ' ★' : ''}] ${name}: ${stripMessage(msg.mes)}`;
 }
 
 // Removes reasoning blocks and code fences that different providers add.
@@ -970,6 +975,8 @@ function buildMemoryText(memory) {
     if (memory.timeline.length) sections.push(`[Timeline, oldest to newest]\n${timelineText(memory)}`);
     const ledger = ledgerText(memory.ledger);
     if (ledger) sections.push(ledger);
+    const hooks = getSettings().hooksEnabled ? hooksMemoryText(memory) : '';
+    if (hooks) sections.push(hooks);
     if (!sections.length) return '';
     const covered = memory.cursor >= 0 ? `messages #0-#${memory.cursor}` : 'earlier messages';
     return [
@@ -1072,7 +1079,8 @@ function buildCorpus(memory) {
         const flush = () => {
             if (!group.length) return;
             const text = group.map(g => g.line).join('\n').slice(0, s.rawChunkChars);
-            items.push({ hash: hashString(`raw|${group[0].i}|${text}`), kind: 'raw', text, display: text, importance: 3, from: group[0].i, to: group[group.length - 1].i });
+            const starred = group.some(g => isStarred(chat[g.i]));
+            items.push({ hash: hashString(`raw|${group[0].i}|${text}`), kind: 'raw', text, display: text, importance: starred ? 5 : 3, from: group[0].i, to: group[group.length - 1].i });
             group = [];
         };
         for (let i = 0; i <= rawEnd; i++) {
@@ -1888,6 +1896,16 @@ Rules:
         hint: '기억장 → 캐릭터의 "인물 기록 정리"에서 기록부 인물 항목의 성격 재해석을 걷어낼 때',
         text: 'You tidy the character section of a story\'s memory ledger. Each entry should hold appearance, abilities, role, situation and current condition (injuries, whereabouts, mood right now). Remove phrases that redefine or relabel a character\'s personality or temperament (for example "has become gentle", "is now cold-hearted"), because personality is kept separately in the character sheet. Keep concrete events and facts. If a personality change is a real, lasting development of the story, rewrite it as a concrete fact with its cause instead of a trait label. Do not add anything new. Write each value in the same language as the original entry.',
     },
+    hooks: {
+        label: '복선 추적 기준',
+        hint: '요약할 때 나중에 회수될 복선을 모으고, 풀린 복선을 닫는 기준',
+        text: 'Add a hook only for a genuine setup the story may pay off later: a hint or omen, an unexplained detail or mystery, a promise or threat not yet fulfilled, a planted object or skill, a secret someone is hiding. Do not add ordinary plans or tasks (they belong to ledger threads) or anything already resolved within the same transcript. Resolve a hook only when the transcript clearly pays it off or explains it, and say how. Write hook text in the same language as the summary. Usually there are zero to three new hooks per transcript.',
+    },
+    verify: {
+        label: '요약 검수 기준',
+        hint: '"요약 자동 검수"를 켰을 때 요약을 원본과 대조하는 기준. 지적은 한국어로 나와요',
+        text: 'You are a strict fact checker for the continuity notes of an interactive story. Compare the summary with the transcript and report only real errors: events, statements or details the transcript does not show; the wrong character doing or saying something; wrong names, places, numbers or times; reversed cause and effect; a lie or belief recorded as fact; and story-defining moments (confessions, deaths, betrayals, vows, major reveals) that the summary leaves out. Lines marked with a star were flagged by the user as important, so a missing or blurred starred moment is an error. Do not report style, length, wording, or reasonable omission of minor details. Write "problem" and "fix" in Korean.',
+    },
     header: {
         label: '기억 주입 머리말',
         hint: '대화할 때 기억 앞에 붙는 설명. {{covered}}는 기억한 메시지 범위',
@@ -2642,7 +2660,7 @@ summary:
 <ledger>
 [JSON array of update operations]
 </ledger>
-${s.eventsEnabled ? EVENTS_FORMAT : ''}${s.voiceEnabled ? voicesFormat() : ''}
+${s.eventsEnabled ? EVENTS_FORMAT : ''}${s.voiceEnabled ? voicesFormat() : ''}${s.hooksEnabled ? hooksFormat() : ''}
 The ledger is a structured fact sheet (shown as <current_ledger>). Operations:
 {"op":"set","cat":"<category>","key":"<entity or short label>","value":"<concise current fact>","importance":<1-5>}
   Creates or replaces the entry with this cat + key. Write the complete updated value, merging old and new information.
@@ -2671,8 +2689,11 @@ function summaryUserPrompt(memory, batch, lore = '') {
         const cast = castText(memory, { quotes: false });
         parts.push(`<cast>\nEstablished personality and speech of each character. Reference only; keep summaries faithful to it.\n${cast || '(empty)'}\n</cast>`);
     }
+    if (s.hooksEnabled) parts.push(`<open_hooks>\nSetups from earlier that have not been paid off yet. Resolve one only if this transcript pays it off.\n${openHooksText(memory) || '(none)'}\n</open_hooks>`);
     parts.push(`<transcript messages="#${batch.from}-#${batch.to}">\n${batch.lines.join('\n\n')}\n</transcript>`);
-    const blocks = ['<episode>', '<ledger>', s.eventsEnabled && '<events>', s.voiceEnabled && '<voices>'].filter(Boolean);
+    if (batchHasStar(batch)) parts.push('Messages marked ★ were flagged by the user as important. Record what happens in them in full detail, keep their key lines word for word, and rate this episode importance 4 or higher.');
+    if (batch.notes) parts.push(`<reviewer_notes>\nA fact check of an earlier summary of this transcript found these mistakes. Avoid them and stay strictly faithful to the transcript:\n${batch.notes}\n</reviewer_notes>`);
+    const blocks = ['<episode>', '<ledger>', s.eventsEnabled && '<events>', s.voiceEnabled && '<voices>', s.hooksEnabled && '<hooks>'].filter(Boolean);
     parts.push(`Write the ${blocks.join(', ')} blocks for this transcript now.`);
     return parts.join('\n\n');
 }
@@ -2826,7 +2847,7 @@ async function summarizeBatch(memory, batch, depth = 0) {
             logActivity('compress', `#${batch.from}~#${batch.to}는 모델이 끝내 거부해서 빈칸으로 표시했어요`, 'warn');
             return {
                 node: { title: `#${batch.from}-#${batch.to}`, when: '', importance: 2, keywords: [], text: `(Messages #${batch.from}-#${batch.to} could not be summarized by the model.)`, blocked: true },
-                ops: [], events: [], voices: [],
+                ops: [], events: [], voices: [], hooks: [],
             };
         }
         if (!isBlockError(err) || !s.splitOnBlock || depth >= 3 || batch.lines.length < 4 || abortController?.signal.aborted) {
@@ -2865,6 +2886,7 @@ async function summarizeBatch(memory, batch, depth = 0) {
             ops: [...(ra.ops || []), ...(rb.ops || [])],
             events: [...(ra.events || []), ...(rb.events || [])],
             voices: [...(ra.voices || []), ...(rb.voices || [])],
+            hooks: [...(ra.hooks || []), ...(rb.hooks || [])],
         };
     }
 }
@@ -2876,22 +2898,24 @@ async function summarizeBatchOnce(memory, batch) {
     let ops = null;
     let events = [];
     let voices = null;
+    let hooks = null;
     for (let attempt = 0; attempt < 2 && !node; attempt++) {
         const reminder = attempt > 0 ? '\n\nIMPORTANT: your previous reply could not be parsed. Output only the <episode> block and the <ledger> block in the exact format described.' : '';
         const out = await callModel(system, user + reminder, { expectTag: 'episode' });
         node = parseNodeBlock(extractTag(out, 'episode'));
         if (!node && attempt > 0) {
             // Fall back to treating the whole reply as the summary text, unless it is a refusal.
-            const fallback = out.replace(/<(ledger|events|voices)>[\s\S]*?(<\/\1>|$)/gi, '').trim();
+            const fallback = out.replace(/<(ledger|events|voices|hooks)>[\s\S]*?(<\/\1>|$)/gi, '').trim();
             if (looksRefused(fallback)) throw new BlockedError(`모델이 요약을 거절했어요: "${fallback.slice(0, 80)}"`, 'refused');
             if (fallback.length >= 40) node = { title: `#${batch.from}-#${batch.to}`, importance: 3, keywords: [], text: fallback };
         }
         ops = parseJsonLenient(extractTag(out, 'ledger') || '');
         events = parseEvents(extractTag(out, 'events'));
         voices = parseJsonLenient(extractTag(out, 'voices') || '');
+        hooks = getSettings().hooksEnabled ? parseJsonLenient(extractTag(out, 'hooks') || '') : null;
     }
     if (!node) throw new Error('요약 응답을 해석하지 못했습니다.');
-    return { node, ops, events, voices };
+    return { node, ops, events, voices, hooks: Array.isArray(hooks) ? hooks : [] };
 }
 
 // ---------------------------------------------------------------- compress command
@@ -2934,9 +2958,10 @@ async function runCompress({ all = false, auto = false } = {}) {
     }
     if (!all || auto) batches = batches.slice(0, 1);
     if (batches.length > 1) {
+        const est = estimateCompress(batches);
         const ok = await ctx().Popup.show.confirm(
             '전체 압축',
-            `메시지 #${start}~#${end}를 ${batches.length}번에 나눠 요약합니다. API를 ${batches.length}회 이상 호출해요. 진행할까요?`,
+            `메시지 #${start}~#${end}를 ${batches.length}번에 나눠 요약합니다.\n\n예상: ${estimateText(est)}\n(글자 수로 어림한 값이라 실제와 조금 달라요. 1M 토큰당 요금을 곱하면 대략의 비용이에요.)\n\n진행할까요?`,
         );
         if (!ok) return;
     }
@@ -2947,6 +2972,7 @@ async function runCompress({ all = false, auto = false } = {}) {
     setBusyUI(true);
     let done = 0;
     let gaps = 0;
+    let reviews = 0;
     try {
         await maybeSeedCast(chatId);
         for (const batch of batches) {
@@ -2954,6 +2980,7 @@ async function runCompress({ all = false, auto = false } = {}) {
             setProgress(`요약 중 ${done + 1}/${batches.length} (#${batch.from}~#${batch.to})`);
             const memory = getMemory(true);
             let summary = await summarizeBatch(memory, batch);
+            summary = await verifyAfterSummary(memory, batch, summary);
             if (s.previewBeforeSave && !auto) {
                 let stop = false;
                 for (;;) {
@@ -2969,8 +2996,9 @@ async function runCompress({ all = false, auto = false } = {}) {
                 }
                 if (stop) break;
             }
-            const { node, ops, events, voices } = summary;
+            const { node, ops, events, voices, hooks } = summary;
             if (!stillSameChat(chatId)) break;
+            markStarredNode(node, batch);
             pushHistory(memory, `압축 #${batch.from}-#${batch.to}`);
             const episodeId = newId();
             addEvents(memory, events, batch, episodeId);
@@ -2988,9 +3016,14 @@ async function runCompress({ all = false, auto = false } = {}) {
                 condensed: 0,
                 includeHidden,
                 stale: !!node.stale,
+                starred: !!node.starred,
+                review: node.review || null,
+                verified: !!node.verified,
             });
             if (node.stale) gaps++;
+            if (node.review) reviews++;
             applyLedgerOps(memory, ops, batch.to);
+            if (s.hooksEnabled) applyHookOps(memory, hooks, batch);
             if (s.voiceEnabled) applyVoices(memory, voices, batch);
             memory.cursor = batch.to;
             tagMessages(rangeIndices(batch.from, batch.to), episodeId);
@@ -3012,6 +3045,7 @@ async function runCompress({ all = false, auto = false } = {}) {
         }
         if (done) {
             toastr.success(auto ? `자동 압축: ${done}개 구간을 기억했어요.` : `${done}개 구간을 기억에 저장했습니다.`, auto ? APP_NAME : undefined);
+            if (reviews) toastr.warning(`검수에서 원본과 다른 곳이 나온 요약 ${reviews}개에 "검토 필요"를 표시했어요. 기억장 → 타임라인에서 확인할 수 있어요.`, APP_NAME, { timeOut: 10000 });
             if (gaps) toastr.warning(`모델이 거부한 장면 ${gaps}곳은 빈칸으로 남겼어요. 기억장 → 타임라인의 "다시 요약"으로 다른 모델에 다시 맡길 수 있어요.`, APP_NAME, { timeOut: 12000 });
             const last = batches[done - 1];
             logActivity(auto ? 'auto' : 'compress', `#${batches[0].from}~#${last.to} · ${done}개 구간 기억함`);
@@ -3088,7 +3122,7 @@ async function previewEpisode(summary, batch) {
 
 // ---------------------------------------------------------------- re-summarize one memory
 
-async function resummarizeNode(nodeId) {
+async function resummarizeNode(nodeId, { notes = '' } = {}) {
     if (busy) return toastr.warning('이미 작업 중입니다.');
     const s = getSettings();
     const memory = getMemory(false);
@@ -3102,15 +3136,16 @@ async function resummarizeNode(nodeId) {
     if (estTokens(lines.join('\n')) > s.batchTokens) {
         return toastr.warning('이 구간은 한 번에 다시 요약하기엔 길어요. 설정의 "한 구간 최대 토큰"을 늘려주세요.');
     }
-    const batch = { from: indices[0], to: indices[indices.length - 1], lines, indices };
+    const batch = { from: indices[0], to: indices[indices.length - 1], lines, indices, notes };
     const chatId = ctx().getCurrentChatId();
     busy = true;
     abortController = new AbortController();
     setBusyUI(true);
     setProgress(`다시 요약 중 (#${batch.from}~#${batch.to})`);
     try {
-        const { node: fresh, ops, events } = await summarizeBatch(memory, batch);
+        const { node: fresh, ops, events, hooks } = await summarizeBatch(memory, batch);
         if (!stillSameChat(chatId)) return;
+        markStarredNode(fresh, batch);
         pushHistory(memory, `다시 요약 #${batch.from}-#${batch.to}`);
         Object.assign(node, {
             title: fresh.title,
@@ -3123,8 +3158,12 @@ async function resummarizeNode(nodeId) {
             from: batch.from,
             to: batch.to,
             msgCount: indices.length,
+            starred: !!fresh.starred || !!node.starred,
+            review: null,
+            verified: false,
         });
         memory.events = memory.events.filter(e => e.episodeId !== nodeId);
+        if (getSettings().hooksEnabled) applyHookOps(memory, hooks, batch);
         addEvents(memory, events, batch, nodeId);
         applyLedgerOps(memory, ops, batch.to);
         await ctx().saveMetadata();
@@ -3285,8 +3324,30 @@ function decorateMessage(id) {
         pin.className = 'mes_button lm-mes-pin fa-solid fa-thumbtack';
         pin.title = '코끼리: 기억에 새기기';
         pin.tabIndex = 0;
+        const star = document.createElement('div');
+        star.className = 'mes_button lm-mes-star fa-regular fa-star';
+        star.title = '코끼리: 중요 장면으로 표시 (요약할 때 자세히 남기고 줄이지 않아요)';
+        star.tabIndex = 0;
+        extra.prepend(star);
         extra.prepend(pin);
         extra.prepend(view);
+    }
+    const starred = isStarred(msg);
+    el.classList.toggle('lm-starred', starred);
+    const starBtn = el.querySelector('.lm-mes-star');
+    if (starBtn) {
+        starBtn.classList.toggle('fa-solid', starred);
+        starBtn.classList.toggle('fa-regular', !starred);
+    }
+    let starBadge = el.querySelector('.lm-star-badge');
+    if (starred && !starBadge) {
+        starBadge = document.createElement('span');
+        starBadge.className = 'lm-star-badge fa-solid fa-star';
+        starBadge.title = '코끼리: 중요 장면 (누르면 표시 해제)';
+        starBadge.tabIndex = 0;
+        el.querySelector('.name_text')?.after(starBadge);
+    } else if (!starred && starBadge) {
+        starBadge.remove();
     }
     const view = el.querySelector('.lm-mes-view');
     if (view) view.style.display = msg.extra?.lm_owner && msg.extra.lm_owner !== SAGA_OWNER ? '' : 'none';
@@ -3328,12 +3389,13 @@ async function pinMessage(id) {
 }
 
 function onDocumentClick(event) {
-    const target = event.target.closest?.('.lm-mes-pin, .lm-mes-view, .lm-check-badge');
+    const target = event.target.closest?.('.lm-mes-pin, .lm-mes-view, .lm-check-badge, .lm-mes-star, .lm-star-badge');
     if (!target) return;
     const id = Number(target.closest('.mes')?.getAttribute('mesid'));
     if (Number.isNaN(id)) return;
     event.stopPropagation();
-    if (target.classList.contains('lm-mes-pin')) pinMessage(id);
+    if (target.classList.contains('lm-mes-star') || target.classList.contains('lm-star-badge')) toggleStar(id);
+    else if (target.classList.contains('lm-mes-pin')) pinMessage(id);
     else if (target.classList.contains('lm-check-badge')) showCheckIssues(id);
     else openManager({ focusOwner: ctx().chat[id]?.extra?.lm_owner });
 }
@@ -3475,6 +3537,8 @@ function carryOver(memory) {
     m.timeline.forEach(n => { mark(n); n.stale = false; n.msgCount = 0; });
     m.events.forEach(mark);
     m.archive.forEach(mark);
+    (m.hooks || []).forEach(h => { h.from = -1; if (h.status === 'resolved') h.resolvedAt = -1; });
+    m.timeline.forEach(n => { n.review = null; });
     m.saga.coversTo = -1;
     m.ledger.entries.forEach(e => { e.updatedAt = -1; });
     (m.cast || []).forEach(member => {
@@ -3604,6 +3668,11 @@ function buildMarkdown(memory) {
             const extra = [e.knownBy?.length && `아는 사람: ${e.knownBy.join(', ')}`, e.due && `기한: ${e.due}`, e.status === 'closed' && '해결됨'].filter(Boolean);
             out.push(`- **${e.key}**: ${e.value}${extra.length ? ` (${extra.join(', ')})` : ''}`);
         }
+        out.push('');
+    }
+    if (memory.hooks?.length) {
+        out.push('## 복선', '');
+        for (const h of memory.hooks) out.push(`- ${h.status === 'resolved' ? '[회수됨] ' : ''}${h.text}${h.how ? ` → ${h.how}` : ''}`);
         out.push('');
     }
     if (memory.events.length) {
@@ -4040,7 +4109,7 @@ async function stepCondense(memory) {
     const episodes = memory.timeline.filter(n => n.tier === 'episode');
     const protectedIds = new Set(episodes.slice(-s.protectRecent).map(n => n.id));
     const candidates = memory.timeline
-        .filter(n => !n.pinned && !protectedIds.has(n.id) && (n.condensed || 0) < 2 && n.importance <= 3 && estTokens(n.text) > 60)
+        .filter(n => !n.pinned && !n.starred && !protectedIds.has(n.id) && (n.condensed || 0) < 2 && n.importance <= 3 && estTokens(n.text) > 60)
         .sort((a, b) => (a.importance - b.importance) || (a.from - b.from))
         .slice(0, 8);
     if (!candidates.length) return false;
@@ -4097,7 +4166,7 @@ summary:
 <the chapter summary>
 </chapter>`;
     const user = run
-        .map(n => `<episode importance="${n.importance}" messages="#${n.from}-#${n.to}" title="${esc(n.title)}">\n${n.text}\n</episode>`)
+        .map(n => `<episode importance="${n.importance}"${n.starred ? ' marked_important="yes"' : ''} messages="#${n.from}-#${n.to}" title="${esc(n.title)}">\n${n.text}\n</episode>`)
         .join('\n\n');
     const out = await callModel(compactSystemPrompt(task), user, { expectTag: 'chapter' });
     const parsed = parseNodeBlock(extractTag(out, 'chapter'));
@@ -4118,6 +4187,7 @@ summary:
         title: parsed.title,
         text: parsed.text,
         importance: Math.max(...run.map(n => n.importance)),
+        starred: run.some(n => n.starred),
         keywords: [...new Set([...parsed.keywords, ...run.flatMap(n => n.keywords || [])])].slice(0, 24),
         pinned: false,
         condensed: 0,
@@ -4337,6 +4407,12 @@ const ICONS = {
     rotate: '<path d="M20 11.5A8 8 0 1 0 17.6 17"/><path d="M20.5 4.5v7h-7"/>',
     save: '<path d="M5 3.5h11.5L20 7v13.5H4V4.5a1 1 0 0 1 1-1z"/><path d="M8 3.5v5h7.5v-5"/><path d="M7.5 20.5v-6h9v6"/>',
     alert: '<path d="M12 3.5 2.5 20h19z"/><path d="M12 10v4.5M12 17.2v.3"/>',
+    star: '<path d="m12 3.5 2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z"/>',
+    graph: '<circle cx="6" cy="6.5" r="2.5"/><circle cx="18" cy="7.5" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8.5 6.8l7 .5M7.2 8.8l3.6 6.9M16.8 9.8l-3.6 6"/>',
+    calendar: '<rect x="3.5" y="5" width="17" height="15.5" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4M7.5 14h2M11 14h2M14.5 14h2M7.5 17h2M11 17h2"/>',
+    merge: '<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="12" r="2"/><path d="M6 7v10"/><path d="M6 7c0 4 3.5 5 10 5"/>',
+    compare: '<rect x="3.5" y="4" width="7" height="16" rx="1.5"/><rect x="13.5" y="4" width="7" height="16" rx="1.5"/><path d="M6 9h2M6 12h2M16 9h2M16 12h2M16 15h2"/>',
+    hook: '<path d="M15 3.5v9.5a5 5 0 0 1-10 0v-2.5"/><path d="m3 12.5 2-2.5 2 2.5"/><circle cx="15" cy="3.5" r="1"/>',
 };
 
 function icon(name) {
@@ -4574,6 +4650,8 @@ function settingsHtml() {
           ${numberRow('keepRecent', '최근 원본 유지', 0, 5000, '이만큼의 최근 메시지는 요약하지 않고 그대로 둬요')}
           ${checkRow('voiceEnabled', '캐해 보존', '캐릭터 카드로 핵심 성격과 말투를 정리해 고정하고, 요약할 때 실제 대사 샘플을 모아 AI에게 함께 보여줘요. 기억장 → 캐릭터 탭에서 고칠 수 있어요')}
           ${checkRow('previewBeforeSave', '저장 전에 미리보기', '압축할 때마다 결과를 보고 고치거나 다시 요약해요')}
+          ${selectRow('verifySummaries', '요약 자동 검수', selectOptions(VERIFY_MODES, s.verifySummaries), s.verifySummaries, '요약을 원본과 한 번 더 대조해서 지어낸 내용이나 빠진 중요 장면을 찾아요. 구간마다 API를 한 번 더 써요')}
+          ${checkRow('hooksEnabled', '복선 추적', '나중에 회수될 암시·수수께끼·약속을 따로 모아 두고, 안 풀린 것은 AI가 잊지 않게 알려줘요. 기억장 → 복선 탭')}
           ${advanced(`
             ${numberRow('batchTokens', '한 구간 최대 토큰', 1000, 2000000, '요약 모델이 감당하는 만큼 크게 잡으면 호출이 줄어요')}
             ${numberRow('batchMessages', '한 구간 최대 메시지', 1, 5000)}
@@ -4682,6 +4760,7 @@ function settingsHtml() {
             <div class="lm-style-list" id="lm_style_list" role="radiogroup" aria-label="지시문 방식"></div>
             <div class="lm-style-actions">
               <button type="button" class="menu_button lm-btn lm-btn-primary" id="lm_style_apply">${icon('check')}<span>이 방식 적용</span></button>
+              <button type="button" class="lm-chipbtn" id="lm_style_compare" title="같은 대화를 두 방식으로 요약해서 나란히 비교해요">${icon('compare')}<span>두 방식 비교해 보기</span></button>
               <button type="button" class="lm-chipbtn" id="lm_style_save">${icon('save')}<span>지금 프롬프트를 내 방식으로 저장</span></button>
               <button type="button" class="lm-chipbtn" id="lm_style_export">${icon('export')}<span>내보내기</span></button>
               <button type="button" class="lm-chipbtn" id="lm_style_import">${icon('import')}<span>가져오기</span></button>
@@ -4869,6 +4948,7 @@ function bindSettings(root) {
     root.querySelector('#lm_style_export').addEventListener('click', () => exportStyle(pickedStyle));
     const styleFile = root.querySelector('#lm_style_file');
     root.querySelector('#lm_style_import').addEventListener('click', () => styleFile.click());
+    root.querySelector('#lm_style_compare').addEventListener('click', () => compareStyles());
     styleFile.addEventListener('change', async () => {
         const file = styleFile.files?.[0];
         styleFile.value = '';
@@ -5378,6 +5458,8 @@ function nodeCard(node) {
       <span class="lm-chip lm-chip-${node.tier}">${node.tier === 'chapter' ? '챕터' : '에피소드'}</span>
       <span class="lm-range">${node.from === -1 ? '이전 채팅' : node.from < 0 ? '원본 삭제됨' : `#${node.from}~#${node.to}`}</span>
       ${node.condensed ? `<span class="lm-range">${node.condensed}회 압축됨</span>` : ''}
+      ${node.starred ? '<span class="lm-chip lm-chip-star" title="중요 장면이 들어 있어서 정리할 때 줄이지 않아요">★ 중요</span>' : ''}
+      ${node.review?.length ? `<button type="button" class="lm-review" data-review="${esc(node.id)}" title="원본과 다른 곳이 있어요. 눌러서 확인해요">${icon('alert')}검토 필요 ${node.review.length}</button>` : node.verified ? '<span class="lm-range lm-verified" title="원본과 대조했어요">검수 통과</span>' : ''}
       ${node.stale ? `<button type="button" class="lm-stale" data-resum="${esc(node.id)}" title="원본이 바뀌었어요. 눌러서 이 구간만 다시 요약해요">${icon('rotate')}다시 요약</button>` : ''}
       <span class="lm-spacer"></span>
       <span class="lm-ctl">
@@ -5601,6 +5683,7 @@ function managerHtml(memory) {
           <hr>
           ${tool('lm_handoff_save', 'handoff', '새 채팅으로 이어가기', '', '이 기억을 저장해 두고, 같은 캐릭터로 새 채팅을 열 때 이어받아요')}
           ${tool('lm_handoff_load', 'receive', '이전 채팅 기억 이어받기', '', '저장해 둔 이전 채팅의 기억을 이 채팅으로 가져와요')}
+          ${tool('lm_merge', 'merge', '다른 채팅 기억 합치기', '', '다른 채팅이나 파일의 기억을 지금 기억에 더해요')}
           <hr>
           ${tool('lm_reset', 'reset', '이 채팅 기억 초기화', 'lm-toolbtn-danger')}
         </div>
@@ -5614,6 +5697,7 @@ function managerHtml(memory) {
     ${tab('cast', 'userpen', '캐릭터', memory.cast.length)}
     ${tab('timeline', 'timeline', '타임라인', memory.timeline.length)}
     ${tab('ledger', 'ledger', '기록부', memory.ledger.entries.length)}
+    ${tab('hooks', 'hook', '복선', (memory.hooks || []).filter(h => h.status !== 'resolved').length)}
     ${tab('events', 'events', '사건', memory.events.length)}
     ${tab('wiki', 'wiki', '위키', wikiPages.length)}
     ${tab('ask', 'ask', '질문')}
@@ -5686,6 +5770,10 @@ function managerHtml(memory) {
   </section>
 
   <section class="lm-pane" data-lm-pane="timeline" role="tabpanel">
+    <div class="lm-wiki-tools">
+      ${tool('lm_chron', 'calendar', '연표로 보기', '', '작중 시간 순서로 묶어서 보여줘요')}
+      ${tool('lm_verify', 'shield', '최근 요약 검수', '', '최근 에피소드 3개를 원본과 대조해서 틀린 곳을 찾아요')}
+    </div>
     <div class="lm-saga">
       <div class="lm-field-text"><span class="lm-field-label">지금까지의 이야기</span><span class="lm-hint">오래된 챕터가 합쳐지면 여기에 쌓여요</span></div>
       <textarea class="text_pole" id="lm_saga" rows="${memory.saga.text ? 6 : 2}" placeholder="아직 비어 있어요.">${esc(memory.saga.text)}</textarea>
@@ -5695,6 +5783,9 @@ function managerHtml(memory) {
   </section>
 
   <section class="lm-pane" data-lm-pane="ledger" role="tabpanel">
+    <div class="lm-wiki-tools">
+      ${tool('lm_relmap', 'graph', '관계도 보기', '', '관계 항목을 인물 그림으로 그려요')}
+    </div>
     <div class="lm-scene">
       <div class="lm-field lm-field-stack"><div class="lm-field-text"><span class="lm-field-label">시간</span></div><input class="text_pole" id="lm_s_time" value="${esc(sc.time)}"></div>
       <div class="lm-field lm-field-stack"><div class="lm-field-text"><span class="lm-field-label">장소</span></div><input class="text_pole" id="lm_s_place" value="${esc(sc.place)}"></div>
@@ -5703,6 +5794,10 @@ function managerHtml(memory) {
     </div>
     ${bulkBar('ledger')}
     <div id="lm_entries" class="lm-list">${ledgerGroups(memory)}</div>
+  </section>
+
+  <section class="lm-pane" data-lm-pane="hooks" role="tabpanel">
+    ${hooksPaneHtml(memory)}
   </section>
 
   <section class="lm-pane" data-lm-pane="events" role="tabpanel">
@@ -5828,6 +5923,7 @@ function collectManager(root, memory) {
             };
         })
         .filter(m => m.name);
+    out.hooks = collectHooks(root, memory);
     const deletedArchive = new Set([...root.querySelectorAll('#lm_archive .lm-arch.lm-deleted')].map(el => el.dataset.archiveId));
     out.archive = memory.archive.filter(a => !deletedArchive.has(a.id));
     const deletedWiki = new Set([...root.querySelectorAll('#lm_wiki .lm-wiki-page.lm-deleted')].map(el => el.dataset.wikiId));
@@ -6037,6 +6133,36 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
             selectTab(tab.dataset.lmTab);
             return;
         }
+        const review = event.target.closest('[data-review]');
+        if (review) {
+            const node = memory.timeline.find(n => n.id === review.dataset.review);
+            if (!node?.review?.length) return;
+            const action = await showReview(node);
+            if (action === 'ok') {
+                node.review = null;
+                await c.saveMetadata();
+                review.outerHTML = '<span class="lm-range lm-verified">검수 통과</span>';
+            } else if (action === 'resum') {
+                const notes = reviewerNotes(node.review);
+                await saveThen(async () => {
+                    await resummarizeNode(node.id, { notes });
+                    openManager({ focusOwner: node.id });
+                });
+            }
+            return;
+        }
+        if (event.target.closest('#lm_hook_add')) {
+            const list = root.querySelector('#lm_hooks');
+            list.querySelector('.lm-hook-empty')?.remove();
+            list.insertAdjacentHTML('afterbegin', hookRow({ id: newId(), kind: 'hint', text: '', how: '', importance: 3, from: -2, status: 'open' }));
+            list.firstElementChild.querySelector('.lm-text').focus();
+            return;
+        }
+        const hookDone = event.target.closest('.lm-hook-done-cb');
+        if (hookDone) {
+            hookDone.closest('.lm-hook').classList.toggle('lm-hook-done', hookDone.checked);
+            return;
+        }
         const resum = event.target.closest('[data-resum]');
         if (resum) {
             const id = resum.dataset.resum;
@@ -6048,9 +6174,26 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
         }
         const menu = root.querySelector('.lm-menu');
         if (menu?.open && !event.target.closest('.lm-menu > summary')) menu.open = false;
-        const tool = event.target.closest('#lm_ko, #lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html');
+        const tool = event.target.closest('#lm_ko, #lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_relmap, #lm_verify');
         if (!tool) return;
         switch (tool.id) {
+            case 'lm_chron':
+                await openChronicle(collectManager(root, memory), { onJump: (id) => closeThen(() => jumpToMessage(id)) });
+                break;
+            case 'lm_relmap':
+                await openRelationMap(collectManager(root, memory));
+                break;
+            case 'lm_verify':
+                await saveThen(async () => {
+                    await runVerify();
+                    openManager({ tab: 'timeline' });
+                });
+                break;
+            case 'lm_merge':
+                await saveThen(async () => {
+                    if (await openMerge()) openManager({ tab: 'timeline' });
+                });
+                break;
             case 'lm_wiki_build':
                 await closeThen(async () => {
                     await buildWiki();
@@ -6095,6 +6238,12 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
         root.querySelectorAll('#lm_events .lm-event').forEach(row => {
             const text = (row.querySelector('.lm-text').value + ' ' + row.querySelector('.lm-entry-top').textContent).toLowerCase();
             row.hidden = !!q && !text.includes(q);
+        });
+    });
+    const hookOpenOnly = root.querySelector('#lm_hook_open_only');
+    hookOpenOnly?.addEventListener('change', () => {
+        root.querySelectorAll('#lm_hooks .lm-hook').forEach(row => {
+            row.hidden = hookOpenOnly.checked && row.querySelector('.lm-hook-done-cb').checked;
         });
     });
     const wikiFilter = root.querySelector('#lm_wiki_filter');
@@ -6185,7 +6334,7 @@ async function saveManagerEditsImpl({ root, memory, chatId }) {
         edited.events = edited.events.filter(e => !removedIds.has(e.episodeId));
         edited.archive = edited.archive.filter(a => !removedIds.has(a.ownerId));
     }
-    for (const key of ['frame', 'cast', 'saga', 'timeline', 'ledger', 'events', 'archive', 'wiki']) current[key] = edited[key];
+    for (const key of ['frame', 'cast', 'saga', 'timeline', 'ledger', 'events', 'archive', 'wiki', 'hooks']) current[key] = edited[key];
     if (removedIds.size && root.querySelector('#lm_restore_src')?.checked) {
         restoreSources(current, removedIds);
         await ctx().saveChat();
@@ -6196,6 +6345,1090 @@ async function saveManagerEditsImpl({ root, memory, chatId }) {
     toastr.success('기억을 저장했습니다.');
     syncAfter();
     return true;
+}
+
+// ---------------------------------------------------------------- foreshadowing tracker ("복선")
+// Setups the story may pay off later. The summarizer adds and resolves them; open ones
+// are kept in front of the AI so they are not forgotten.
+
+const HOOK_KINDS = { hint: '암시', mystery: '수수께끼', promise: '약속·위협', object: '심어 둔 물건', secret: '숨긴 비밀' };
+
+function hooksFormat() {
+    return `
+<hooks>
+[JSON array of foreshadowing operations; [] if nothing changed]
+</hooks>
+
+Foreshadowing operations (open setups are listed in <open_hooks>):
+{"op":"add","kind":"hint|mystery|promise|object|secret","text":"<the setup in one or two self-contained sentences, naming the characters>","keywords":["..."],"importance":<1-5>}
+{"op":"resolve","id":"<id from <open_hooks>>","how":"<how it was paid off or explained>"}
+${getPrompt('hooks')}
+`;
+}
+
+function openHooks(memory) {
+    return (memory?.hooks || []).filter(h => h.status !== 'resolved');
+}
+
+function openHooksText(memory, limit = 30) {
+    return openHooks(memory)
+        .slice(-limit)
+        .map(h => `[${h.id}] (${h.kind || 'hint'}, ${h.from >= 0 ? `set up at #${h.from}` : 'set up earlier'}) ${h.text}`)
+        .join('\n');
+}
+
+function applyHookOps(memory, ops, batch) {
+    if (!Array.isArray(ops)) return 0;
+    memory.hooks = memory.hooks || [];
+    let n = 0;
+    for (const op of ops) {
+        if (!op || typeof op !== 'object') continue;
+        const kind = String(op.op || '').toLowerCase();
+        if (kind === 'add') {
+            const text = String(op.text || '').trim();
+            if (!text || memory.hooks.some(h => normQuote(h.text) === normQuote(text))) continue;
+            memory.hooks.push({
+                id: newId(),
+                kind: HOOK_KINDS[op.kind] ? op.kind : 'hint',
+                text: text.slice(0, 400),
+                keywords: toList(op.keywords),
+                importance: clampInt(op.importance, 1, 5, 3),
+                from: batch.from,
+                status: 'open',
+                how: '',
+                resolvedAt: null,
+            });
+            n++;
+        } else if (kind === 'resolve') {
+            const h = memory.hooks.find(x => x.id === String(op.id || '').trim());
+            if (!h || h.status === 'resolved') continue;
+            h.status = 'resolved';
+            h.how = String(op.how || '').trim().slice(0, 300);
+            h.resolvedAt = batch.to;
+            n++;
+        }
+    }
+    return n;
+}
+
+function hooksMemoryText(memory) {
+    const open = openHooks(memory)
+        .slice()
+        .sort((a, b) => (b.importance - a.importance) || (b.from - a.from))
+        .slice(0, 8);
+    if (!open.length) return '';
+    return `[Setups not yet paid off: keep them consistent and remember them; pay one off only when it fits the scene naturally, never several at once]\n${open.map(h => `- ${h.text}`).join('\n')}`;
+}
+
+// ---------------------------------------------------------------- starred messages ("중요 장면")
+
+function isStarred(msg) {
+    return !!msg?.extra?.lm_star;
+}
+
+function batchHasStar(batch) {
+    const { chat } = ctx();
+    return (batch?.indices || []).some(i => isStarred(chat[i]));
+}
+
+function markStarredNode(node, batch) {
+    if (!batchHasStar(batch)) return;
+    node.starred = true;
+    node.importance = Math.max(node.importance || 3, 4);
+}
+
+async function toggleStar(id) {
+    if (!hasChat()) return;
+    const c = ctx();
+    const msg = c.chat[id];
+    if (!msg) return;
+    msg.extra = msg.extra || {};
+    const on = !msg.extra.lm_star;
+    if (on) msg.extra.lm_star = true;
+    else delete msg.extra.lm_star;
+    const memory = getMemory(false);
+    const owner = msg.extra.lm_owner;
+    if (on && memory && owner && owner !== SAGA_OWNER) {
+        // Already summarized: protect the memory that holds this message.
+        const node = memory.timeline.find(n => n.id === owner);
+        if (node) {
+            node.starred = true;
+            node.importance = Math.max(node.importance || 3, 4);
+            await c.saveMetadata();
+            refreshInjection();
+        }
+    }
+    await c.saveChat();
+    decorateMessage(id);
+    toastr.success(on ? '중요 장면으로 표시했어요. 요약할 때 자세히 남기고, 정리할 때 줄이지 않아요.' : '중요 표시를 지웠어요.', APP_NAME, { timeOut: 2500 });
+}
+
+// ---------------------------------------------------------------- summary verification ("요약 검수")
+
+const VERIFY_MODES = { off: '끄기', flag: '틀린 곳만 표시', fix: '틀리면 고쳐서 다시 요약' };
+
+// Rebuilds the transcript lines of a stored memory from the messages it owns.
+function nodeBatch(node) {
+    if (!node || node.from < 0) return null;
+    const { chat } = ctx();
+    const indices = [];
+    chat.forEach((m, i) => { if (m?.extra?.lm_owner === node.id) indices.push(i); });
+    const kept = indices.filter(i => chat[i]?.extra?.lm_hidden || isSummarizable(chat[i]) || (node.includeHidden && String(chat[i]?.mes ?? '').trim()));
+    if (!kept.length) return null;
+    return { from: indices[0], to: indices[indices.length - 1], lines: kept.map(i => messageLine(chat[i], i)), indices, tokens: 0 };
+}
+
+async function verifySummary(node, batch) {
+    const system = `${getPrompt('verify')}
+
+Reply with exactly this block and nothing else:
+<issues>
+[JSON array; [] if the summary is faithful. Each item: {"problem":"<what the summary gets wrong or leaves out, in Korean>","fix":"<what the transcript actually shows, in Korean>","msg":<message number or null>}]
+</issues>`;
+    const user = [
+        `<transcript messages="#${batch.from}-#${batch.to}">\n${batch.lines.join('\n\n')}\n</transcript>`,
+        `<summary>\ntitle: ${node.title}\nwhen: ${node.when || ''}\n${node.text}\n</summary>`,
+        'Check the summary against the transcript now.',
+    ].join('\n\n');
+    const out = await callModel(system, user, { expectTag: 'issues', retries: 1 });
+    const list = parseJsonLenient(extractTag(out, 'issues') || '[]');
+    if (!Array.isArray(list)) return [];
+    return list
+        .filter(x => x && typeof x === 'object' && String(x.problem || '').trim())
+        .slice(0, 8)
+        .map(x => ({
+            problem: String(x.problem).trim().slice(0, 300),
+            fix: String(x.fix || '').trim().slice(0, 300),
+            msg: Number.isInteger(Number(x.msg)) && x.msg !== null && x.msg !== '' ? Number(x.msg) : null,
+        }));
+}
+
+function reviewerNotes(issues) {
+    return issues.map(x => `- ${x.problem}${x.fix ? ` -> ${x.fix}` : ''}${x.msg !== null ? ` (#${x.msg})` : ''}`).join('\n');
+}
+
+// Runs after a batch is summarized. Never fails the compression: a broken check only logs.
+async function verifyAfterSummary(memory, batch, summary) {
+    const mode = getSettings().verifySummaries;
+    if (mode === 'off' || !VERIFY_MODES[mode] || summary.node.blocked) return summary;
+    try {
+        setProgress(`요약 검수 중 (#${batch.from}~#${batch.to})`);
+        let issues = await verifySummary(summary.node, batch);
+        if (issues.length && mode === 'fix') {
+            logActivity('compress', `#${batch.from}~#${batch.to} 요약에서 틀린 곳 ${issues.length}개를 찾아 고쳐 쓰는 중`, 'warn');
+            setProgress(`지적받은 곳을 고쳐서 다시 요약 중 (#${batch.from}~#${batch.to})`);
+            const fixed = await summarizeBatch(memory, { ...batch, notes: reviewerNotes(issues) });
+            if (!fixed.node.blocked) {
+                summary = fixed;
+                setProgress(`고친 요약 검수 중 (#${batch.from}~#${batch.to})`);
+                issues = await verifySummary(summary.node, batch);
+                summary.node.fixed = true;
+            }
+        }
+        summary.node.review = issues.length ? issues : null;
+        summary.node.verified = true;
+        if (issues.length) logActivity('compress', `#${batch.from}~#${batch.to} 요약에 검토할 곳 ${issues.length}개`, 'warn');
+    } catch (err) {
+        if (String(err?.message) === 'aborted') throw err;
+        console.warn(LOG_PREFIX, 'verify failed', err);
+        logActivity('compress', `요약 검수를 건너뛰었어요 · ${errorDetail(err)}`, 'warn');
+    }
+    return summary;
+}
+
+async function runVerify({ nodeIds = null, last = 3 } = {}) {
+    if (busy) return toastr.warning('이미 작업 중입니다.');
+    const memory = getMemory(false);
+    const pool = (memory?.timeline || []).filter(n => n.from >= 0 && !n.blocked);
+    const nodes = nodeIds ? pool.filter(n => nodeIds.includes(n.id)) : pool.filter(n => n.tier === 'episode').slice(-last);
+    const work = nodes.map(n => ({ node: n, batch: nodeBatch(n) })).filter(x => x.batch);
+    if (!work.length) return toastr.info('검수할 요약이 없어요. 원본 메시지가 남아 있는 에피소드만 검수할 수 있어요.');
+    const chatId = ctx().getCurrentChatId();
+    busy = true;
+    abortController = new AbortController();
+    setBusyUI(true);
+    let found = 0;
+    let done = 0;
+    try {
+        for (const { node, batch } of work) {
+            if (abortController.signal.aborted || !stillSameChat(chatId)) break;
+            setProgress(`요약 검수 중 ${done + 1}/${work.length} (#${batch.from}~#${batch.to})`);
+            const issues = await verifySummary(node, batch);
+            node.review = issues.length ? issues : null;
+            node.verified = true;
+            found += issues.length;
+            done++;
+        }
+        if (done && stillSameChat(chatId)) await ctx().saveMetadata();
+        if (done) {
+            const msg = found ? `${done}개 요약을 검수했어요. 검토할 곳 ${found}개를 표시해 뒀어요.` : `${done}개 요약을 검수했어요. 원본과 어긋난 곳이 없어요.`;
+            (found ? toastr.warning : toastr.success)(msg, APP_NAME);
+            logActivity('compress', msg, found ? 'warn' : 'ok');
+        }
+    } catch (err) {
+        if (String(err?.message) === 'aborted') toastr.info('중지했습니다.');
+        else reportError('요약 검수 실패', err);
+    } finally {
+        busy = false;
+        abortController = null;
+        setBusyUI(false);
+        setProgress('');
+        updateStatus();
+    }
+    return found;
+}
+
+// Returns 'resum', 'ok' or null.
+async function showReview(node) {
+    const c = ctx();
+    const root = document.createElement('div');
+    const canResum = node.from >= 0;
+    root.innerHTML = `
+<div class="lm-root lm-review-pop">
+  <h3>${icon('alert')}검토할 곳 ${node.review.length}개</h3>
+  <p class="lm-hint">“${esc(node.title)}” 요약을 원본(#${node.from}~#${node.to})과 대조했어요.</p>
+  <ol class="lm-review-list">${node.review.map(x => `<li><p>${esc(x.problem)}</p>${x.fix ? `<p class="lm-review-fix">원본: ${esc(x.fix)}</p>` : ''}${x.msg !== null ? `<span class="lm-range">#${x.msg}</span>` : ''}</li>`).join('')}</ol>
+  <div class="lm-review-actions">
+    ${canResum ? `<button type="button" class="menu_button lm-btn lm-btn-primary" data-act="resum">${icon('rotate')}<span>지적한 곳 반영해서 다시 요약</span></button>` : ''}
+    <button type="button" class="menu_button lm-btn" data-act="ok">${icon('check')}<span>괜찮아요, 표시 지우기</span></button>
+  </div>
+</div>`;
+    applyThemeMode(root.firstElementChild);
+    let action = null;
+    const popup = new c.Popup(root, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: false, allowVerticalScrolling: true, leftAlign: true });
+    root.addEventListener('click', (event) => {
+        const btn = event.target.closest('[data-act]');
+        if (!btn) return;
+        action = btn.dataset.act;
+        popup.completeAffirmative();
+    });
+    await popup.show();
+    return action;
+}
+
+// ---------------------------------------------------------------- cost estimate ("비용 예측")
+
+function estimateCompress(batches) {
+    const s = getSettings();
+    const memory = getMemory(false) || emptyMemory();
+    const system = estTokens(summarySystemPrompt());
+    const context = estTokens(summaryUserPrompt(memory, { from: 0, to: 0, lines: [], indices: [] }));
+    const lore = s.loreEnabled ? Math.round(s.loreTokenBudget * 0.5) : 0;
+    const ratio = { concise: 0.06, standard: 0.1, detailed: 0.15 }[s.detail] ?? 0.1;
+    const verify = s.verifySummaries === 'fix' || s.verifySummaries === 'flag' ? s.verifySummaries : 'off';
+    let input = 0;
+    let output = 0;
+    let calls = 0;
+    let growth = 0;
+    for (const b of batches) {
+        const tokens = b.tokens || estTokens(b.lines.join('\n'));
+        const out = Math.min(s.maxOutputTokens, Math.round(tokens * ratio + 250
+            + (s.eventsEnabled ? tokens * 0.04 : 0) + (s.voiceEnabled ? 120 : 0) + (s.hooksEnabled ? 60 : 0)));
+        input += system + context + lore + growth + tokens;
+        output += out;
+        calls++;
+        if (verify !== 'off') {
+            input += 500 + tokens + out;
+            output += 250;
+            calls++;
+        }
+        // Ledger, cast and recent episodes grow as the story is remembered.
+        growth = Math.min(growth + Math.round(out * 0.25), 6000);
+    }
+    if (s.autoCompact) {
+        const episodes = memory.timeline.filter(n => n.tier === 'episode').length + batches.length;
+        const chapters = Math.max(0, Math.ceil((episodes - s.maxEpisodes) / Math.max(2, s.chapterSize)));
+        calls += chapters;
+        input += chapters * (system + Math.round(1500 * s.chapterSize));
+        output += chapters * 900;
+    }
+    // In "fix" mode a summary with mistakes is written and checked once more.
+    const maybeMore = verify === 'fix' ? batches.length * 2 : 0;
+    return { batches: batches.length, calls, maybeMore, input, output };
+}
+
+function fmtTokens(n) {
+    if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1)}M`;
+    if (n >= 1e4) return `${Math.round(n / 1e3)}K`;
+    if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+    return String(Math.round(n));
+}
+
+function estimateText(est) {
+    return `API 약 ${est.calls}번${est.maybeMore ? ` (틀린 곳이 있으면 최대 ${est.maybeMore}번 더)` : ''} · 입력 약 ${fmtTokens(est.input)} 토큰 · 출력 약 ${fmtTokens(est.output)} 토큰`;
+}
+
+function estimateRemaining() {
+    if (!hasChat()) return null;
+    const { start, end, count } = unsummarizedRange();
+    if (count <= 0) return { ...estimateCompress([]), start, end, count: 0 };
+    return { ...estimateCompress(planBatches(start, end)), start, end, count };
+}
+
+// ---------------------------------------------------------------- relationship map ("관계도")
+
+const REL_SPLIT = /\s*(?:<->|<=>|↔|-->|->|=>|→|⇒|➔)\s*|\s+[-–—]\s+/;
+
+function relationPairs(memory) {
+    const out = [];
+    for (const e of memory?.ledger?.entries || []) {
+        if (e.cat !== 'relation') continue;
+        const parts = String(e.key || '').split(REL_SPLIT).map(x => x.trim()).filter(Boolean);
+        if (parts.length < 2) continue;
+        out.push({
+            a: parts[0],
+            b: parts[1],
+            value: String(e.value || ''),
+            both: /<->|<=>|↔|\s[-–—]\s/.test(e.key),
+            closed: e.status === 'closed',
+            importance: e.importance || 3,
+            id: e.id,
+        });
+    }
+    return out;
+}
+
+function relationGraph(memory) {
+    const nodes = new Map();
+    const add = (name) => {
+        const key = normName(name);
+        if (!nodes.has(key)) nodes.set(key, { key, name, deg: 0 });
+        nodes.get(key).deg++;
+        return key;
+    };
+    const edges = relationPairs(memory).map(p => ({ ...p, ka: add(p.a), kb: add(p.b) }));
+    return { nodes: [...nodes.values()], edges };
+}
+
+function relationLayout(graph, size) {
+    const pos = new Map();
+    const list = [...graph.nodes].sort((a, b) => b.deg - a.deg);
+    if (!list.length) return pos;
+    const c = size / 2;
+    const me = normName(ctx().name1 || '');
+    const hub = list.find(n => n.key === me && n.deg >= 2) || (list.length > 3 && list[0].deg >= 3 ? list[0] : null);
+    const ring = list.filter(n => n !== hub);
+    if (hub) pos.set(hub.key, { x: c, y: c });
+    // Neighbours of the previous node go next to it so lines stay short.
+    const ordered = [];
+    const left = [...ring];
+    while (left.length) {
+        const prev = ordered[ordered.length - 1];
+        let idx = 0;
+        if (prev) {
+            const near = left.findIndex(n => graph.edges.some(e => (e.ka === prev.key && e.kb === n.key) || (e.kb === prev.key && e.ka === n.key)));
+            if (near >= 0) idx = near;
+        }
+        ordered.push(left.splice(idx, 1)[0]);
+    }
+    const r = ordered.length <= 1 && !hub ? 0 : size * 0.37;
+    const start = ordered.length === 2 && !hub ? Math.PI : -Math.PI / 2;
+    ordered.forEach((n, i) => {
+        const a = start + (i * 2 * Math.PI) / ordered.length;
+        pos.set(n.key, { x: c + r * Math.cos(a), y: c + r * Math.sin(a) });
+    });
+    return pos;
+}
+
+function relationSvg(graph) {
+    const size = Math.max(420, Math.min(900, graph.nodes.length * 52));
+    const pos = relationLayout(graph, size);
+    const R = 21;
+    const marker = `lm-arrow-${newId()}`;
+    const me = normName(ctx().name1 || '');
+    const edges = graph.edges.map((e, i) => {
+        const p = pos.get(e.ka);
+        const q = pos.get(e.kb);
+        if (!p || !q || e.ka === e.kb) return '';
+        const dx = q.x - p.x;
+        const dy = q.y - p.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const ux = dx / len;
+        const uy = dy / len;
+        // One-way pairs bend so A->B and B->A do not overlap.
+        const bend = e.both ? 0 : 16;
+        const sx = p.x + ux * (R + 3);
+        const sy = p.y + uy * (R + 3);
+        const ex = q.x - ux * (R + 7);
+        const ey = q.y - uy * (R + 7);
+        const cx = (sx + ex) / 2 - uy * bend;
+        const cy = (sy + ey) / 2 + ux * bend;
+        const d = `M${sx.toFixed(1)} ${sy.toFixed(1)} Q${cx.toFixed(1)} ${cy.toFixed(1)} ${ex.toFixed(1)} ${ey.toFixed(1)}`;
+        const cls = `lm-rel-edge imp-${e.importance}${e.closed ? ' closed' : ''}`;
+        return `<g class="${cls}" data-edge="${i}" data-a="${esc(e.ka)}" data-b="${esc(e.kb)}"><path class="lm-rel-hit" d="${d}"/><path class="lm-rel-line" d="${d}" marker-end="url(#${marker})"${e.both ? ` marker-start="url(#${marker})"` : ''}/></g>`;
+    }).join('');
+    const nodes = graph.nodes.map(n => {
+        const p = pos.get(n.key);
+        if (!p) return '';
+        const label = n.name.length > 9 ? `${n.name.slice(0, 8)}…` : n.name;
+        const initial = [...n.name.trim()][0] || '?';
+        return `<g class="lm-rel-node${n.key === me ? ' me' : ''}" data-node="${esc(n.key)}" tabindex="0" role="button" aria-label="${esc(n.name)}">
+  <circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="${R}"/>
+  <text class="lm-rel-initial" x="${p.x.toFixed(1)}" y="${(p.y + 6).toFixed(1)}" text-anchor="middle">${esc(initial)}</text>
+  <text class="lm-rel-name" x="${p.x.toFixed(1)}" y="${(p.y < size / 2 - 1 ? p.y - R - 9 : p.y + R + 17).toFixed(1)}" text-anchor="middle">${esc(label)}</text>
+</g>`;
+    }).join('');
+    const ys = [...pos.values()].map(v => v.y);
+    const top = Math.min(...ys) - R - 34;
+    const height = Math.max(...ys) - top + R + 34;
+    return `<svg class="lm-rel-svg" viewBox="-40 ${top.toFixed(0)} ${size + 80} ${height.toFixed(0)}" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="인물 관계도">
+<defs><marker id="${marker}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker></defs>
+${edges}${nodes}</svg>`;
+}
+
+function relationCards(graph) {
+    return graph.edges.map((e, i) => `
+<article class="lm-rel-card${e.closed ? ' closed' : ''}" data-edge="${i}" data-a="${esc(e.ka)}" data-b="${esc(e.kb)}">
+  <div class="lm-rel-pair"><b>${esc(e.a)}</b><span class="lm-rel-arrow" aria-hidden="true">${e.both ? '⇄' : '→'}</span><b>${esc(e.b)}</b>${e.importance >= 4 ? '<span class="lm-chip lm-chip-imp">중요</span>' : ''}${e.closed ? '<span class="lm-range">끝난 관계</span>' : ''}</div>
+  <p data-tr>${esc(e.value)}</p>
+</article>`).join('');
+}
+
+// Translates every [data-tr] element in place; pressing again shows the original.
+async function toggleTranslation(root, btn) {
+    const els = [...root.querySelectorAll('[data-tr]')];
+    if (!els.length || btn.disabled) return;
+    const label = btn.querySelector('span');
+    if (btn.dataset.state === 'ko') {
+        els.forEach(el => { if (el.dataset.orig !== undefined) el.textContent = el.dataset.orig; });
+        btn.dataset.state = '';
+        label.textContent = '한국어로 보기';
+        return;
+    }
+    btn.disabled = true;
+    label.textContent = '번역하는 중…';
+    try {
+        const src = els.map(el => el.dataset.orig ?? el.textContent);
+        const out = await translateTexts(src, 'Korean');
+        els.forEach((el, i) => {
+            if (el.dataset.orig === undefined) el.dataset.orig = el.textContent;
+            el.textContent = out[i];
+        });
+        btn.dataset.state = 'ko';
+        label.textContent = '원문 보기';
+    } catch (err) {
+        reportError('번역 실패', err);
+        label.textContent = '한국어로 보기';
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function needsTranslation(memory) {
+    return !sameLanguage(memoryLanguage(memory), 'Korean');
+}
+
+async function openRelationMap(memory = getMemory(false)) {
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    const c = ctx();
+    const graph = relationGraph(memory);
+    const root = document.createElement('div');
+    root.innerHTML = `
+<div class="lm-root lm-relmap">
+  <div class="lm-pop-head">
+    <h3>${icon('graph')}관계도</h3>
+    ${graph.edges.length && needsTranslation(memory) ? `<button type="button" class="lm-toolbtn" id="lm_rel_ko">${icon('wiki')}<span>한국어로 보기</span></button>` : ''}
+  </div>
+  ${graph.edges.length ? `
+  <p class="lm-hint">기록부의 관계 항목으로 그렸어요. 인물을 누르면 그 사람의 관계만, 선을 누르면 그 관계의 설명을 보여줘요.</p>
+  <div class="lm-rel-stage">${relationSvg(graph)}</div>
+  <div class="lm-rel-filter" hidden><span></span><button type="button" class="lm-link-btn" id="lm_rel_all">전체 보기</button></div>
+  <div class="lm-rel-list">${relationCards(graph)}</div>` : '<div class="lm-empty">아직 그릴 관계가 없어요. 압축하면 기록부에 “A -> B” 형식의 관계 항목이 생기고, 여기에 그려져요. 기억장 → 기록부에서 직접 추가해도 돼요.</div>'}
+</div>`;
+    applyThemeMode(root.firstElementChild);
+    const focusNode = (key) => {
+        const name = graph.nodes.find(n => n.key === key)?.name || key;
+        root.querySelectorAll('.lm-rel-node').forEach(g => g.classList.toggle('picked', g.dataset.node === key));
+        root.querySelectorAll('.lm-rel-edge, .lm-rel-card').forEach(el => {
+            const hit = !key || el.dataset.a === key || el.dataset.b === key;
+            el.classList.toggle('dim', !hit);
+            if (el.classList.contains('lm-rel-card')) el.hidden = !hit;
+        });
+        const bar = root.querySelector('.lm-rel-filter');
+        if (bar) {
+            bar.hidden = !key;
+            bar.querySelector('span').textContent = key ? `${name}의 관계 ${root.querySelectorAll('.lm-rel-card:not([hidden])').length}개` : '';
+        }
+        if (!key) root.querySelectorAll('.lm-rel-node').forEach(g => g.classList.remove('picked'));
+    };
+    let focused = null;
+    root.addEventListener('click', (event) => {
+        if (event.target.closest('#lm_rel_ko')) { toggleTranslation(root, event.target.closest('#lm_rel_ko')); return; }
+        if (event.target.closest('#lm_rel_all')) { focused = null; focusNode(null); return; }
+        const node = event.target.closest('.lm-rel-node');
+        if (node) {
+            focused = focused === node.dataset.node ? null : node.dataset.node;
+            focusNode(focused);
+            return;
+        }
+        const edge = event.target.closest('.lm-rel-edge');
+        if (edge) {
+            focused = null;
+            focusNode(null);
+            root.querySelectorAll('.lm-rel-edge').forEach(g => g.classList.toggle('lit', g === edge));
+            const card = root.querySelector(`.lm-rel-card[data-edge="${edge.dataset.edge}"]`);
+            root.querySelectorAll('.lm-rel-card').forEach(el => el.classList.toggle('lit', el === card));
+            card?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+    });
+    root.addEventListener('keydown', (event) => {
+        if ((event.key === 'Enter' || event.key === ' ') && event.target.closest?.('.lm-rel-node')) {
+            event.preventDefault();
+            event.target.closest('.lm-rel-node').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        }
+    });
+    await new c.Popup(root, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, allowVerticalScrolling: true, leftAlign: true }).show();
+}
+
+// ---------------------------------------------------------------- in-story chronicle ("연표")
+
+function chronicleGroups(memory) {
+    const ids = new Set(memory.timeline.map(n => n.id));
+    const contains = (n, i) => i !== null && i !== undefined && i >= 0 && n.from >= 0 && i >= n.from && i <= n.to;
+    const groups = [];
+    for (const n of memory.timeline) {
+        const events = (memory.events || [])
+            .filter(e => (e.episodeId && ids.has(e.episodeId)) ? e.episodeId === n.id : contains(n, e.from))
+            .sort((a, b) => (b.importance - a.importance) || (a.from - b.from))
+            .slice(0, 6)
+            .sort((a, b) => a.from - b.from);
+        const hooks = (memory.hooks || []).filter(h => contains(n, h.from)).map(h => ({ ...h, mark: 'add' }));
+        const paid = (memory.hooks || []).filter(h => h.status === 'resolved' && contains(n, h.resolvedAt)).map(h => ({ ...h, mark: 'paid' }));
+        const item = { node: n, events, hooks: [...hooks, ...paid] };
+        const when = String(n.when || '').trim();
+        const prev = groups[groups.length - 1];
+        if (prev && (!when || when === prev.when)) prev.items.push(item);
+        else groups.push({ when, items: [item] });
+    }
+    return groups;
+}
+
+function chronicleHtml(memory) {
+    const groups = chronicleGroups(memory);
+    const sc = memory.ledger.scene || {};
+    const now = [sc.time, sc.place].filter(Boolean).join(', ');
+    const item = ({ node: n, events, hooks }) => `
+<article class="lm-chron-node imp-${n.importance}${n.starred ? ' starred' : ''}" data-text="${esc(`${n.title} ${n.text} ${events.map(e => e.text).join(' ')}`.toLowerCase())}">
+  <header>
+    <b data-tr>${esc(n.title)}</b>
+    ${n.starred ? '<span class="lm-chip lm-chip-star">★ 중요</span>' : ''}
+    <span class="lm-spacer"></span>
+    ${n.from >= 0 ? `<button type="button" class="lm-chron-jump" data-jump="${n.from}" title="이 장면으로 이동">#${n.from}~#${n.to}</button>` : '<span class="lm-range">이전 채팅</span>'}
+  </header>
+  <p class="lm-chron-text" data-tr>${esc(n.text)}</p>
+  ${events.length || hooks.length ? `<ul class="lm-chron-ev">
+    ${events.map(e => `<li><span data-tr>${esc(e.text)}</span>${e.when && e.when !== n.when ? `<em>${esc(e.when)}</em>` : ''}</li>`).join('')}
+    ${hooks.map(h => `<li class="lm-chron-hook ${h.mark}"><b>${h.mark === 'paid' ? '복선 회수' : '복선'}</b><span data-tr>${esc(h.mark === 'paid' && h.how ? `${h.text} → ${h.how}` : h.text)}</span></li>`).join('')}
+  </ul>` : ''}
+</article>`;
+    return `
+<div class="lm-root lm-chron">
+  <div class="lm-pop-head">
+    <h3>${icon('calendar')}연표</h3>
+    ${memory.timeline.length && needsTranslation(memory) ? `<button type="button" class="lm-toolbtn" id="lm_chron_ko">${icon('wiki')}<span>한국어로 보기</span></button>` : ''}
+  </div>
+  ${memory.timeline.length ? `
+  <p class="lm-hint">요약에 적힌 작중 시간으로 묶었어요. 시간이 안 적힌 장면은 바로 앞 날짜에 이어 붙였어요.</p>
+  <div class="lm-search">${icon('search')}<input class="text_pole lm-filter" id="lm_chron_filter" placeholder="연표에서 찾기" aria-label="연표에서 찾기"></div>
+  ${memory.saga.text.trim() ? `<details class="lm-chron-saga"><summary>그 전 이야기</summary><p data-tr>${esc(memory.saga.text.trim())}</p></details>` : ''}
+  <ol class="lm-chron-list">
+    ${groups.map(g => `<li class="lm-chron-day"><div class="lm-chron-when">${g.when ? `<span data-tr>${esc(g.when)}</span>` : '<span class="lm-muted">때를 알 수 없음</span>'}</div><div class="lm-chron-items">${g.items.map(item).join('')}</div></li>`).join('')}
+  </ol>
+  ${now ? `<div class="lm-chron-now"><b>지금</b><span data-tr>${esc(now)}</span></div>` : ''}` : '<div class="lm-empty">아직 기억한 장면이 없어요. 압축하면 작중 시간 순서로 여기 쌓여요.</div>'}
+</div>`;
+}
+
+async function openChronicle(memory = getMemory(false), { onJump = null } = {}) {
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    const c = ctx();
+    const root = document.createElement('div');
+    root.innerHTML = chronicleHtml(memory || emptyMemory());
+    applyThemeMode(root.firstElementChild);
+    const popup = new c.Popup(root, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, large: true, allowVerticalScrolling: true, leftAlign: true });
+    let jumpTo = null;
+    root.addEventListener('click', (event) => {
+        const ko = event.target.closest('#lm_chron_ko');
+        if (ko) { toggleTranslation(root, ko); return; }
+        const jump = event.target.closest('[data-jump]');
+        if (jump) {
+            jumpTo = Number(jump.dataset.jump);
+            popup.completeAffirmative();
+            return;
+        }
+        const text = event.target.closest('.lm-chron-text');
+        if (text) text.classList.toggle('open');
+    });
+    const filter = root.querySelector('#lm_chron_filter');
+    filter?.addEventListener('input', () => {
+        const q = filter.value.trim().toLowerCase();
+        root.querySelectorAll('.lm-chron-node').forEach(el => { el.hidden = !!q && !el.dataset.text.includes(q) && !el.textContent.toLowerCase().includes(q); });
+        root.querySelectorAll('.lm-chron-day').forEach(day => { day.hidden = ![...day.querySelectorAll('.lm-chron-node')].some(el => !el.hidden); });
+    });
+    await popup.show();
+    if (jumpTo !== null) await (onJump ? onJump(jumpTo) : jumpToMessage(jumpTo));
+}
+
+// ---------------------------------------------------------------- style comparison ("방식 비교")
+
+const CURRENT_STYLE = '__current';
+
+// Temporarily swaps the prompt templates and style settings, then restores them.
+async function withStyle(id, fn) {
+    if (id === CURRENT_STYLE) return fn();
+    const s = getSettings();
+    const style = allStyles()[id];
+    if (!style) return fn();
+    const keys = Object.keys(style.settings || {}).filter(k => k in defaultSettings);
+    const saved = { prompts: s.prompts };
+    for (const k of keys) saved[k] = s[k];
+    try {
+        s.prompts = { ...(style.prompts || {}) };
+        for (const k of keys) s[k] = style.settings[k];
+        return await fn();
+    } finally {
+        Object.assign(s, saved);
+    }
+}
+
+function compareSample() {
+    const s = getSettings();
+    const { start, end } = unsummarizedRange();
+    let batch = end >= start ? planBatches(start, end)[0] : null;
+    let memory = structuredClone(getMemory(true));
+    let source = 'next';
+    if (!batch) {
+        const last = memory.timeline.filter(n => n.tier === 'episode' && n.from >= 0).slice(-1)[0];
+        batch = last ? nodeBatch(last) : null;
+        if (batch) {
+            // Pretend this part was not remembered yet so both runs start from the same place.
+            memory.timeline = memory.timeline.filter(n => n.id !== last.id);
+            source = 'last';
+        }
+    }
+    if (!batch) return null;
+    // Keep the trial cheap: about a third of a normal batch at most.
+    const limit = Math.min(s.batchTokens, 9000);
+    let tokens = 0;
+    let keep = 0;
+    for (const line of batch.lines) {
+        const t = estTokens(line);
+        if (keep && (tokens + t > limit || keep >= 30)) break;
+        tokens += t;
+        keep++;
+    }
+    const indices = batch.indices.slice(0, keep);
+    return { memory, source, batch: { ...batch, lines: batch.lines.slice(0, keep), indices, to: indices[indices.length - 1], tokens } };
+}
+
+function compareResultHtml(label, r) {
+    if (r.error) return `<div class="lm-cmp-col"><h4>${esc(label)}</h4><div class="lm-empty">실패: ${esc(r.error)}</div></div>`;
+    const n = r.node;
+    const stat = [
+        `${n.text.length.toLocaleString()}자`,
+        `기록 ${Array.isArray(r.ops) ? r.ops.length : 0}건`,
+        getSettings().eventsEnabled ? `사건 ${r.events?.length || 0}개` : '',
+        Array.isArray(r.voices) && r.voices.length ? `말투 ${r.voices.length}명` : '',
+        Array.isArray(r.hooks) && r.hooks.length ? `복선 ${r.hooks.length}개` : '',
+        `${(r.ms / 1000).toFixed(1)}초`,
+    ].filter(Boolean).join(' · ');
+    return `<div class="lm-cmp-col">
+  <h4>${esc(label)}</h4>
+  <div class="lm-cmp-stat">${esc(stat)}</div>
+  <div class="lm-cmp-title"><b>${esc(n.title)}</b>${n.when ? `<span class="lm-range">${esc(n.when)}</span>` : ''}<span class="lm-range">중요도 ${n.importance}</span></div>
+  <p class="lm-cmp-text" data-tr>${esc(n.text)}</p>
+  ${Array.isArray(r.ops) && r.ops.length ? `<details class="lm-cmp-more"><summary>기록부에 적을 내용 ${r.ops.length}건</summary><ul>${r.ops.filter(o => o && o.key).slice(0, 20).map(o => `<li><b>${esc(o.key)}</b> <span data-tr>${esc(String(o.value || o.op || ''))}</span></li>`).join('')}</ul></details>` : ''}
+  <button type="button" class="menu_button lm-btn lm-btn-primary lm-cmp-pick" data-pick>${icon('check')}<span>이 방식 쓰기</span></button>
+</div>`;
+}
+
+async function compareStyles() {
+    if (busy) return toastr.warning('이미 작업 중입니다.');
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    const c = ctx();
+    const s = getSettings();
+    const sample = compareSample();
+    if (!sample) return toastr.info('비교해 볼 메시지가 없어요. 대화가 조금 쌓이면 다시 해 보세요.');
+    const styles = allStyles();
+    const currentLabel = `지금 쓰는 지시문${editedSinceStyle() ? ' (고친 것 포함)' : ''}: ${styles[s.promptStyle]?.label || '기본'}`;
+    const options = { [CURRENT_STYLE]: currentLabel, ...Object.fromEntries(Object.entries(styles).map(([id, st]) => [id, st.label])) };
+    const other = Object.keys(styles).find(id => id !== s.promptStyle) || 'default';
+    const est = estimateCompress([sample.batch]);
+    const pick = document.createElement('div');
+    pick.innerHTML = `
+<div class="lm-root lm-cmp-setup">
+  <h3>${icon('compare')}두 방식 비교해 보기</h3>
+  <p class="lm-hint">같은 대화(#${sample.batch.from}~#${sample.batch.to}, ${sample.batch.lines.length}개)를 두 방식으로 한 번씩 요약해서 나란히 보여줘요. ${sample.source === 'last' ? '남은 메시지가 없어서 마지막으로 기억한 구간을 썼어요. ' : ''}비교 결과는 기억에 저장하지 않아요.</p>
+  <div class="lm-field lm-field-stack"><div class="lm-field-text"><span class="lm-field-label">A</span></div><select class="text_pole" id="lm_cmp_a">${selectOptions(options, CURRENT_STYLE)}</select></div>
+  <div class="lm-field lm-field-stack"><div class="lm-field-text"><span class="lm-field-label">B</span></div><select class="text_pole" id="lm_cmp_b">${selectOptions(options, other)}</select></div>
+  <p class="lm-hint">예상: API 2번 · 입력 약 ${fmtTokens(est.input * 2)} 토큰 · 출력 약 ${fmtTokens(est.output * 2)} 토큰</p>
+</div>`;
+    applyThemeMode(pick.firstElementChild);
+    const ok = await new c.Popup(pick, c.POPUP_TYPE.CONFIRM, '', { okButton: '비교 시작', cancelButton: '취소' }).show();
+    if (ok !== c.POPUP_RESULT.AFFIRMATIVE) return;
+    const a = pick.querySelector('#lm_cmp_a').value;
+    const b = pick.querySelector('#lm_cmp_b').value;
+    if (a === b) return toastr.info('서로 다른 두 방식을 골라 주세요.');
+
+    const chatId = c.getCurrentChatId();
+    const results = {};
+    busy = true;
+    abortController = new AbortController();
+    setBusyUI(true);
+    try {
+        for (const [slot, id] of [['a', a], ['b', b]]) {
+            if (abortController.signal.aborted || !stillSameChat(chatId)) break;
+            setProgress(`방식 비교: ${slot.toUpperCase()} 요약 중`);
+            const t0 = Date.now();
+            try {
+                const r = await withStyle(id, () => summarizeBatchOnce(structuredClone(sample.memory), sample.batch));
+                results[slot] = { ...r, ms: Date.now() - t0 };
+            } catch (err) {
+                if (String(err?.message) === 'aborted') throw err;
+                results[slot] = { error: errorDetail(err) };
+            }
+        }
+    } catch (err) {
+        if (String(err?.message) === 'aborted') toastr.info('중지했습니다.');
+        else reportError('방식 비교 실패', err);
+        return;
+    } finally {
+        busy = false;
+        abortController = null;
+        setBusyUI(false);
+        setProgress('');
+    }
+    if (!results.a || !results.b) return;
+    logActivity('compress', `방식 비교: ${options[a]} / ${options[b]}`);
+
+    const root = document.createElement('div');
+    root.innerHTML = `
+<div class="lm-root lm-cmp">
+  <div class="lm-pop-head">
+    <h3>${icon('compare')}방식 비교 #${sample.batch.from}~#${sample.batch.to}</h3>
+    ${needsTranslation(sample.memory) ? `<button type="button" class="lm-toolbtn" id="lm_cmp_ko">${icon('wiki')}<span>한국어로 보기</span></button>` : ''}
+  </div>
+  <div class="lm-cmp-grid">
+    <div data-slot="${esc(a)}">${compareResultHtml(`A · ${options[a]}`, results.a)}</div>
+    <div data-slot="${esc(b)}">${compareResultHtml(`B · ${options[b]}`, results.b)}</div>
+  </div>
+</div>`;
+    applyThemeMode(root.firstElementChild);
+    let chosen = null;
+    const popup = new c.Popup(root, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, large: true, allowVerticalScrolling: true, leftAlign: true });
+    root.addEventListener('click', (event) => {
+        const ko = event.target.closest('#lm_cmp_ko');
+        if (ko) { toggleTranslation(root, ko); return; }
+        const btn = event.target.closest('[data-pick]');
+        if (!btn) return;
+        chosen = btn.closest('[data-slot]').dataset.slot;
+        popup.completeAffirmative();
+    });
+    await popup.show();
+    if (!chosen) return;
+    if (chosen === CURRENT_STYLE) return toastr.info('지금 쓰는 지시문을 그대로 써요.');
+    const edited = editedSinceStyle();
+    if (edited && !await c.Popup.show.confirm('지시문 방식', `"${styles[chosen].label}" 방식으로 바꿀까요? 직접 고쳐 둔 프롬프트 ${edited}개는 이 방식의 문구로 바뀌어요.`)) return;
+    applyPromptStyle(chosen);
+    const panel = document.getElementById('lm_settings');
+    if (panel) {
+        renderPromptEditors(panel);
+        renderStyleList(panel, chosen);
+    }
+    toastr.success(`"${styles[chosen].label}" 방식을 적용했어요.`, APP_NAME);
+}
+
+// ---------------------------------------------------------------- merging memories ("기억 합치기")
+
+const MERGE_PARTS = { story: '줄거리·타임라인·사건', ledger: '기록부', cast: '캐릭터 캐해', hooks: '복선', wiki: '위키' };
+
+function normalizeMemory(data) {
+    const base = emptyMemory();
+    const m = { ...base, ...structuredClone(data || {}) };
+    m.saga = { ...base.saga, ...(m.saga || {}) };
+    m.ledger = { ...base.ledger, ...(m.ledger || {}) };
+    m.ledger.scene = { ...base.ledger.scene, ...(m.ledger.scene || {}) };
+    for (const key of ['timeline', 'events', 'archive', 'cast', 'hooks']) if (!Array.isArray(m[key])) m[key] = [];
+    if (!Array.isArray(m.ledger.entries)) m.ledger.entries = [];
+    m.cast = m.cast.filter(x => x && x.name).map(x => ({ ...emptyCastMember(x.name), ...x, quotes: Array.isArray(x.quotes) ? x.quotes : [], growth: Array.isArray(x.growth) ? x.growth : [] }));
+    m.wiki = { updatedAt: 0, pages: [], ...(m.wiki || {}) };
+    if (!Array.isArray(m.wiki.pages)) m.wiki.pages = [];
+    return m;
+}
+
+function memoryStats(m) {
+    return `요약 ${m?.timeline?.length || 0} · 기록 ${m?.ledger?.entries?.length || 0} · 사건 ${m?.events?.length || 0}${m?.cast?.length ? ` · 캐릭터 ${m.cast.length}` : ''}`;
+}
+
+function mergeMemory(target, source, { parts = Object.keys(MERGE_PARTS), label = '' } = {}) {
+    const src = carryOver(normalizeMemory(source));
+    const want = new Set(parts);
+    const stats = { nodes: 0, events: 0, entries: 0, cast: 0, hooks: 0, wiki: 0 };
+    if (want.has('story')) {
+        const carried = [];
+        if (src.saga.text.trim()) {
+            carried.push({ id: newId(), tier: 'chapter', from: -1, to: -1, title: `Earlier chat${label ? ` (${label})` : ''}: the story so far`, when: '', text: src.saga.text.trim(), importance: 4, keywords: [], pinned: false, condensed: 0, msgCount: 0 });
+        }
+        const have = new Set(target.timeline.map(n => n.id));
+        for (const n of src.timeline) if (!have.has(n.id)) carried.push({ ...n, review: null });
+        // The other chat happened earlier: its memories go after earlier carried ones and before this chat's own.
+        const firstOwn = target.timeline.findIndex(n => n.from !== -1);
+        target.timeline.splice(firstOwn === -1 ? target.timeline.length : firstOwn, 0, ...carried);
+        stats.nodes = carried.length;
+        const evIds = new Set(target.events.map(e => e.id));
+        for (const e of src.events) if (!evIds.has(e.id)) { target.events.push(e); stats.events++; }
+        const arIds = new Set(target.archive.map(a => a.id));
+        for (const a of src.archive) if (!arIds.has(a.id)) target.archive.push(a);
+    }
+    if (want.has('ledger')) {
+        const find = (cat, key) => target.ledger.entries.find(e => e.cat === cat && String(e.key).toLowerCase() === String(key).toLowerCase());
+        const ids = new Set(target.ledger.entries.map(e => e.id));
+        for (const e of src.ledger.entries) {
+            if (!e?.key || find(e.cat, e.key)) continue;
+            target.ledger.entries.push({ ...e, id: ids.has(e.id) ? newId() : e.id });
+            stats.entries++;
+        }
+        const sc = target.ledger.scene;
+        if (![sc.time, sc.place, sc.present, sc.mood].some(Boolean)) target.ledger.scene = { ...src.ledger.scene };
+    }
+    if (want.has('cast')) {
+        for (const m of src.cast) {
+            const mine = castFind(target, m.name);
+            if (!mine) {
+                target.cast.push({ ...m, id: newId() });
+                stats.cast++;
+                continue;
+            }
+            if (!mine.core && m.core) mine.core = m.core;
+            if (!mine.speech && m.speech) mine.speech = m.speech;
+            const seen = new Set(mine.quotes.map(q => normQuote(q.text)));
+            for (const q of m.quotes) if (!seen.has(normQuote(q.text))) { mine.quotes.push(q); seen.add(normQuote(q.text)); }
+            const grown = new Set(mine.growth.map(g => g.text));
+            for (const g of m.growth) if (!grown.has(g.text)) mine.growth.unshift(g);
+            stats.cast++;
+        }
+    }
+    if (want.has('hooks')) {
+        target.hooks = target.hooks || [];
+        const seen = new Set(target.hooks.map(h => normQuote(h.text)));
+        for (const h of src.hooks) {
+            if (!h?.text || seen.has(normQuote(h.text))) continue;
+            target.hooks.push({ ...h, id: newId(), from: -1, resolvedAt: h.status === 'resolved' ? -1 : null });
+            seen.add(normQuote(h.text));
+            stats.hooks++;
+        }
+    }
+    if (want.has('wiki')) {
+        target.wiki = target.wiki || { updatedAt: 0, pages: [] };
+        const titles = new Set(target.wiki.pages.map(p => normName(p.title)));
+        for (const p of src.wiki.pages) {
+            if (!p?.title || titles.has(normName(p.title))) continue;
+            target.wiki.pages.push({ ...p, id: newId() });
+            stats.wiki++;
+        }
+    }
+    for (const [k, v] of Object.entries(src.frame || {})) {
+        if (v && !target.frame[k] && k !== 'mode') target.frame[k] = v;
+    }
+    target.merged = [...(target.merged || []), { label, at: Date.now(), parts: [...want] }].slice(-30);
+    return stats;
+}
+
+async function fetchJson(url, body) {
+    const res = await fetch(url, { method: 'POST', headers: ctx().getRequestHeaders(), body: JSON.stringify(body) });
+    if (!res.ok) throw new Error(`서버 응답 ${res.status}`);
+    return res.json();
+}
+
+async function mergeSources() {
+    const c = ctx();
+    const current = c.getCurrentChatId();
+    const out = [];
+    if (c.groupId) {
+        const group = (c.groups || []).find(g => String(g.id) === String(c.groupId));
+        for (const id of [...(group?.chats || [])].reverse()) {
+            if (id !== current) out.push({ kind: 'group', id, label: id, memory: undefined });
+        }
+        return out;
+    }
+    const ch = c.characters?.[c.characterId];
+    if (!ch?.avatar) return out;
+    const data = await fetchJson('/api/characters/chats', { avatar_url: ch.avatar, metadata: true });
+    const list = Array.isArray(data) ? data : Object.values(data || {});
+    const when = (x) => new Date(x).getTime() || Number(x) || 0;
+    for (const x of list) {
+        if (!x || typeof x !== 'object' || !x.file_name) continue;
+        const id = String(x.file_name).replace(/\.jsonl$/, '');
+        if (id === current) continue;
+        const mem = x.chat_metadata?.[META_KEY];
+        out.push({ kind: 'chat', id, label: id, items: x.chat_items, last: when(x.last_mes), memory: mem && hasContent(normalizeMemory(mem)) ? mem : null });
+    }
+    out.sort((a, b) => (Number(!!b.memory) - Number(!!a.memory)) || (b.last - a.last));
+    return out;
+}
+
+async function loadSourceMemory(src) {
+    if (src.memory !== undefined) return src.memory;
+    const data = await fetchJson('/api/chats/group/get', { id: src.id });
+    const head = Array.isArray(data) ? data.find(x => x && x.chat_metadata) : null;
+    const mem = head?.chat_metadata?.[META_KEY];
+    return mem && hasContent(normalizeMemory(mem)) ? mem : null;
+}
+
+async function runMerge(source, label, parts) {
+    const c = ctx();
+    const memory = getMemory(true);
+    pushHistory(memory, `기억 합치기: ${label}`);
+    const st = mergeMemory(memory, source, { parts, label });
+    await c.saveMetadata();
+    refreshInjection();
+    updateStatus();
+    syncAfter();
+    const bits = [st.nodes && `요약 ${st.nodes}개`, st.events && `사건 ${st.events}개`, st.entries && `기록 ${st.entries}개`, st.cast && `캐릭터 ${st.cast}명`, st.hooks && `복선 ${st.hooks}개`, st.wiki && `위키 ${st.wiki}쪽`].filter(Boolean);
+    const msg = bits.length ? `${label}의 기억을 합쳤어요: ${bits.join(', ')}` : `${label}에서 새로 더할 기억이 없었어요.`;
+    toastr.success(`${msg}. 되돌리기로 취소할 수 있어요.`, APP_NAME, { timeOut: 7000 });
+    logActivity('compress', msg);
+    return true;
+}
+
+async function openMerge() {
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    if (busy) return toastr.warning('작업이 끝난 뒤에 해 주세요.');
+    const c = ctx();
+    const chatId = c.getCurrentChatId();
+    const root = document.createElement('div');
+    root.innerHTML = `
+<div class="lm-root lm-merge">
+  <h3>${icon('merge')}다른 기억 합치기</h3>
+  <p class="lm-hint">다른 채팅에서 쌓은 기억을 지금 기억에 더해요. 지금 기억은 그대로 두고, 겹치는 기록은 지금 것을 남겨요. 합친 기억은 “이전 채팅”으로 표시돼요.</p>
+  <h4 class="lm-subhead">어디서 가져올까요</h4>
+  <div class="lm-merge-list" id="lm_merge_list" role="radiogroup" aria-label="가져올 기억"><div class="lm-empty">채팅 목록을 불러오는 중…</div></div>
+  <div class="lm-merge-file"><button type="button" class="lm-chipbtn" id="lm_merge_file_btn">${icon('import')}<span>기억 파일(.json)에서 가져오기</span></button><span class="lm-hint" id="lm_merge_file_name"></span></div>
+  <input type="file" id="lm_merge_file" accept=".json,application/json" hidden>
+  <h4 class="lm-subhead">무엇을 합칠까요</h4>
+  <div class="lm-merge-parts">${Object.entries(MERGE_PARTS).map(([k, v]) => `<label class="lm-merge-part"><input type="checkbox" value="${k}" checked><span>${esc(v)}</span></label>`).join('')}</div>
+</div>`;
+    applyThemeMode(root.firstElementChild);
+    const sources = [];
+    let picked = null;
+    const listEl = root.querySelector('#lm_merge_list');
+    const card = (src, i) => `<label class="lm-merge-src${src.memory === null ? ' empty' : ''}"><input type="radio" name="lm_merge_src" value="${i}" ${src.memory === null ? 'disabled' : ''}>
+      <span class="lm-merge-name">${esc(src.label)}</span>
+      <span class="lm-hint">${src.kind === 'handoff' ? `이어가기로 저장한 기억 · ${new Date(src.last).toLocaleDateString()}` : src.kind === 'file' ? '파일' : ''}${src.kind === 'chat' ? `메시지 ${src.items ?? '?'}개${src.last ? ` · ${new Date(src.last).toLocaleDateString()}` : ''}` : ''}${src.kind === 'group' ? '그룹 채팅 (고르면 불러와요)' : ''}${src.memory ? ` · ${memoryStats(src.memory)}` : src.memory === null ? ' · 기억 없음' : ''}</span>
+    </label>`;
+    const render = () => {
+        listEl.innerHTML = sources.length ? sources.map(card).join('') : '<div class="lm-empty">기억이 있는 다른 채팅이 없어요. 파일에서 가져올 수 있어요.</div>';
+        if (picked !== null) listEl.querySelector(`input[value="${picked}"]`)?.click();
+    };
+    (async () => {
+        try {
+            const lf = store();
+            const key = handoffKey();
+            const hand = key && lf ? await lf.getItem(key) : null;
+            if (hand?.memory && hand.chatId !== chatId) sources.push({ kind: 'handoff', label: `${hand.name || '이 캐릭터'}의 이어가기 기억`, last: hand.at, memory: hand.memory });
+            sources.push(...await mergeSources());
+        } catch (err) {
+            console.warn(LOG_PREFIX, 'merge sources failed', err);
+            toastr.warning(`채팅 목록을 불러오지 못했어요: ${err.message}`);
+        }
+        render();
+    })();
+    listEl.addEventListener('change', async (event) => {
+        const input = event.target.closest('input[name="lm_merge_src"]');
+        if (!input) return;
+        picked = Number(input.value);
+        const src = sources[picked];
+        if (src && src.memory === undefined) {
+            input.closest('.lm-merge-src').querySelector('.lm-hint').textContent = '불러오는 중…';
+            try { src.memory = await loadSourceMemory(src); } catch (err) { src.memory = null; toastr.warning(`불러오지 못했어요: ${err.message}`); }
+            if (!src.memory) picked = null;
+            render();
+        }
+    });
+    const fileInput = root.querySelector('#lm_merge_file');
+    root.querySelector('#lm_merge_file_btn').addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', async () => {
+        const file = fileInput.files?.[0];
+        fileInput.value = '';
+        if (!file) return;
+        try {
+            const data = JSON.parse(await file.text());
+            const mem = data?.memory && Array.isArray(data.memory.timeline) ? data.memory : data;
+            if (!mem || !Array.isArray(mem.timeline) || !mem.ledger) throw new Error('코끼리를 생각하지마 기억 파일이 아니에요.');
+            sources.unshift({ kind: 'file', label: file.name, memory: mem });
+            picked = 0;
+            render();
+        } catch (err) {
+            toastr.error(`파일을 읽지 못했어요: ${err.message}`);
+        }
+    });
+    const result = await new c.Popup(root, c.POPUP_TYPE.CONFIRM, '', { okButton: '합치기', cancelButton: '취소', wide: true, allowVerticalScrolling: true, leftAlign: true }).show();
+    if (result !== c.POPUP_RESULT.AFFIRMATIVE) return false;
+    const src = picked === null ? null : sources[picked];
+    if (!src?.memory) { toastr.info('가져올 기억을 골라 주세요.'); return false; }
+    const parts = [...root.querySelectorAll('.lm-merge-part input:checked')].map(x => x.value);
+    if (!parts.length) { toastr.info('합칠 항목을 하나 이상 골라 주세요.'); return false; }
+    if (!stillSameChat(chatId)) return false;
+    const already = (getMemory(true).merged || []).some(x => x.label === src.label);
+    if (already && !await c.Popup.show.confirm('기억 합치기', `"${src.label}"의 기억은 이미 한 번 합쳤어요. 또 합칠까요? (겹치는 기록은 건너뛰어요)`)) return false;
+    return runMerge(src.memory, src.label, parts);
+}
+
+// ---------------------------------------------------------------- foreshadowing tab rows
+
+function hookRow(h) {
+    const done = h.status === 'resolved';
+    return `
+<div class="lm-hook lm-item${done ? ' lm-hook-done' : ''}" data-hook-id="${esc(h.id)}">
+  <div class="lm-node-meta">
+    ${selBox()}
+    <select class="text_pole lm-hook-kind lm-quiet" aria-label="복선 종류">${selectOptions(HOOK_KINDS, h.kind || 'hint')}</select>
+    <span class="lm-range">${h.from === -1 ? '이전 채팅' : h.from >= 0 ? `#${h.from}` : '직접 추가'}</span>
+    ${done && h.resolvedAt !== null && h.resolvedAt !== undefined ? `<span class="lm-range">회수 ${h.resolvedAt >= 0 ? `#${h.resolvedAt}` : ''}</span>` : ''}
+    <span class="lm-spacer"></span>
+    <span class="lm-ctl">
+      ${impControl(h.importance || 3)}
+      <label class="lm-hook-state" title="이야기에서 풀렸으면 체크. 풀린 복선은 AI에게 다시 상기시키지 않아요"><input type="checkbox" class="lm-hook-done-cb" ${done ? 'checked' : ''}><span>회수됨</span></label>
+      ${deleteButton()}
+    </span>
+  </div>
+  <textarea class="text_pole lm-text lm-quiet" rows="2" aria-label="복선 내용" placeholder="예: 레온이 낡은 은반지를 버리지 못한다">${esc(h.text || '')}</textarea>
+  <label class="lm-quiet-row lm-hook-how-row"><span class="lm-quiet-k">어떻게 풀렸나</span><input class="text_pole lm-hook-how lm-quiet" value="${esc(h.how || '')}" placeholder="회수됐을 때만" aria-label="어떻게 풀렸나"></label>
+</div>`;
+}
+
+function hooksPaneHtml(memory) {
+    const hooks = memory.hooks || [];
+    const ordered = [...hooks.filter(h => h.status !== 'resolved').reverse(), ...hooks.filter(h => h.status === 'resolved').reverse()];
+    return `
+    <div class="lm-wiki-tools">
+      <button type="button" class="lm-toolbtn lm-toolbtn-accent" id="lm_hook_add">${icon('plus')}<span>복선 추가</span></button>
+      <label class="lm-restore"><input type="checkbox" id="lm_hook_open_only"><span>안 풀린 것만</span></label>
+    </div>
+    <p class="lm-hint lm-pane-intro">요약할 때 나중에 회수될 만한 암시·수수께끼·약속을 모아 둬요. 안 풀린 복선은 중요한 것부터 AI에게 “잊지 말 것”으로 전달하고, 이야기에서 풀리면 회수됨으로 바뀌어요.${getSettings().hooksEnabled ? '' : ' <b>지금은 설정 → 요약 탭의 "복선 추적"이 꺼져 있어요.</b>'}</p>
+    ${hooks.length ? bulkBar('hooks') : ''}
+    <div id="lm_hooks" class="lm-list">${ordered.map(hookRow).join('') || '<div class="lm-empty lm-hook-empty">아직 모인 복선이 없어요. 압축하면 자동으로 찾아 두고, 직접 추가해도 돼요.</div>'}</div>`;
+}
+
+function collectHooks(root, memory) {
+    const rows = new Map();
+    root.querySelectorAll('#lm_hooks .lm-hook').forEach(row => rows.set(row.dataset.hookId, row));
+    const known = new Set((memory.hooks || []).map(h => h.id));
+    const read = (h, row) => {
+        if (row.classList.contains('lm-deleted')) return null;
+        const done = row.querySelector('.lm-hook-done-cb').checked;
+        return {
+            ...h,
+            kind: row.querySelector('.lm-hook-kind').value,
+            text: row.querySelector('.lm-text').value.trim(),
+            how: row.querySelector('.lm-hook-how').value.trim(),
+            importance: readImp(row),
+            status: done ? 'resolved' : 'open',
+            resolvedAt: done ? (h.resolvedAt ?? memory.cursor) : null,
+        };
+    };
+    const kept = (memory.hooks || []).map(h => (rows.has(h.id) ? read(h, rows.get(h.id)) : h));
+    const added = [...rows.entries()].filter(([id]) => !known.has(id)).map(([id, row]) => read({ id, from: -2, keywords: [] }, row));
+    return [...kept, ...added].filter(h => h && h.text);
 }
 
 // ---------------------------------------------------------------- slash commands
@@ -6220,6 +7453,28 @@ function registerCommands() {
         ],
         helpString: '<div>코끼리를 생각하지마: 미요약 메시지를 요약해 기억에 저장합니다. <code>/lm-compress all=true</code> 로 남은 전부를 처리합니다.</div>',
     }));
+    const simple = (name, help, fn) => SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name,
+        callback: async (_args, value) => (await fn(String(value ?? '').trim())) ?? '',
+        helpString: `<div>코끼리를 생각하지마: ${help}</div>`,
+    }));
+    simple('lm-chronicle', '작중 시간 순서로 묶은 연표를 엽니다.', () => { openChronicle(); return ''; });
+    simple('lm-relations', '기록부의 관계 항목으로 인물 관계도를 그립니다.', () => { openRelationMap(); return ''; });
+    simple('lm-merge', '다른 채팅이나 파일의 기억을 지금 기억에 합칩니다.', async () => { await openMerge(); return ''; });
+    simple('lm-compare', '같은 대화를 두 지시문 방식으로 요약해 비교합니다.', async () => { await compareStyles(); return ''; });
+    simple('lm-verify', '최근 요약을 원본과 대조해서 틀린 곳을 찾습니다. <code>/lm-verify 5</code> 처럼 개수를 줄 수 있어요.', async (v) => { await runVerify({ last: clampInt(v, 1, 50, 3) }); return ''; });
+    simple('lm-estimate', '남은 메시지를 전부 압축할 때 드는 API 호출 수와 토큰을 어림합니다.', () => {
+        const est = estimateRemaining();
+        if (!est) return '';
+        const text = est.count ? `#${est.start}~#${est.end} (${est.count}개, ${est.batches}구간) · ${estimateText(est)}` : '압축할 메시지가 없어요.';
+        toastr.info(text, `${APP_NAME} · 비용 예측`, { timeOut: 10000 });
+        return text;
+    });
+    simple('lm-star', '메시지를 중요 장면으로 표시하거나 해제합니다. 번호가 없으면 마지막 메시지예요.', async (v) => {
+        const id = v === '' ? ctx().chat.length - 1 : clampInt(v, 0, ctx().chat.length - 1, -1);
+        if (id >= 0) await toggleStar(id);
+        return '';
+    });
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lm-compact',
         callback: async () => {
