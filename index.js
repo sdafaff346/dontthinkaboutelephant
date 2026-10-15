@@ -1728,7 +1728,7 @@ async function callModel(systemText, userText, { retries = null, expectTag = nul
 // "401"-type failures that only happen through a connection profile: the profile can point at a
 // key that was deleted or replaced (secret-id), and it only carries a reverse proxy when a proxy
 // preset was saved into it. Custom endpoints also lose their "include headers".
-const AUTH_RE = /\b401\b|unauthori[sz]ed|no auth|not authenticated|authentication|invalid[^.]{0,24}(api[\s_-]?)?key|incorrect api key|api key not valid|missing[^.]{0,12}key|no api key|invalid (proxy )?password|wrong password|invalid token|x-api-key/i;
+const AUTH_RE = /\b401\b|key is required|json is required|service account|unauthori[sz]ed|no auth|not authenticated|authentication|invalid[^.]{0,24}(api[\s_-]?)?key|incorrect api key|api key not valid|missing[^.]{0,12}key|no api key|invalid (proxy )?password|wrong password|invalid token|x-api-key/i;
 
 function isAuthError(err) {
     return AUTH_RE.test(errorDetail(err));
@@ -1738,15 +1738,33 @@ function findProfile(profileId) {
     return (ctx().extensionSettings.connectionManager?.profiles ?? []).find(p => p.id === profileId) || null;
 }
 
+function profileSource(profile) {
+    try { return ctx().ConnectionManagerRequestService?.validateProfile?.(profile)?.source || ''; } catch { return ''; }
+}
+
+// Fields a profile request never carries but some APIs need on every call. Vertex AI reads its
+// auth mode (express key or service account) and project id from the main API settings; without
+// them ST falls back to Express mode and fails with "API key is required for Vertex AI Express mode".
+function profileBasePayload(profileId) {
+    const profile = findProfile(profileId);
+    const oai = ctx().chatCompletionSettings || {};
+    const payload = {};
+    if (profileSource(profile) === 'vertexai') {
+        if (oai.vertexai_auth_mode) payload.vertexai_auth_mode = oai.vertexai_auth_mode;
+        if (oai.vertexai_express_project_id) payload.vertexai_express_project_id = oai.vertexai_express_project_id;
+        if (!profile?.['api-url'] && oai.vertexai_region) payload.vertexai_region = oai.vertexai_region;
+    }
+    return payload;
+}
+
 // Builds request fields that make a profile request match the connection that works in chat.
 function profileRepairPayload(profileId) {
     const c = ctx();
-    const payload = { secret_id: undefined };
+    const payload = { ...profileBasePayload(profileId), secret_id: undefined };
     const notes = ['지금 선택된 API 키'];
     const profile = findProfile(profileId);
     const oai = c.chatCompletionSettings || {};
-    let source = '';
-    try { source = c.ConnectionManagerRequestService?.validateProfile?.(profile)?.source || ''; } catch { source = ''; }
+    const source = profileSource(profile);
     if (source && source === oai.chat_completion_source) {
         const noPreset = !profile?.proxy || profile.proxy === 'None';
         if (noPreset && oai.reverse_proxy) {
@@ -1804,7 +1822,7 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
                     messages,
                     s.maxOutputTokens,
                     { stream: false, signal: abortController?.signal ?? null, extractData: true, includePreset: s.includePreset },
-                    repair?.payload ?? {},
+                    repair?.payload ?? profileBasePayload(profileId),
                 );
                 raw = typeof result === 'string' ? result : (result?.content ?? '');
             } else {
@@ -2315,6 +2333,7 @@ function errorDetail(err) {
 
 function errorHint(detail) {
     const d = detail.toLowerCase();
+    if (/vertex ai express|service account json is required/.test(d)) return 'Vertex AI 인증 정보를 찾지 못했어요. API 연결 → Vertex AI에서 인증 방식(Express면 API 키, Full이면 서비스 계정 JSON)이 저장돼 있는지 확인해주세요. 이 버전부터는 요약 모델 프로필로 보낼 때도 지금 고른 인증 방식을 함께 보내요.';
     if (d.includes('could not find profile')) return '선택한 연결 프로필을 찾지 못했어요. 설정 → 요약 탭에서 요약 모델을 다시 골라주세요.';
     if (d.includes('connection manager is not available')) return 'ST 확장 목록에서 Connection Manager를 켜주세요.';
     if (d.includes('not supported') || d.includes('has an api')) return '이 프로필의 API 종류는 쓸 수 없어요. Chat Completion이나 Text Completion 프로필을 골라주세요.';
