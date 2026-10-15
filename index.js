@@ -7116,7 +7116,7 @@ async function compareStyles() {
     const sample = compareSample();
     if (!sample) return toastr.info('비교해 볼 메시지가 없어요. 대화가 조금 쌓이면 다시 해 보세요.');
     const styles = allStyles();
-    const currentLabel = `지금 쓰는 지시문${editedSinceStyle() ? ' (고친 것 포함)' : ''}: ${styles[s.promptStyle]?.label || '기본'}`;
+    const currentLabel = `지금 쓰는 것: ${styles[s.promptStyle]?.label || '기본'}${editedSinceStyle() ? ' + 고친 칸' : ''}`;
     const options = { [CURRENT_STYLE]: currentLabel, ...Object.fromEntries(Object.entries(styles).map(([id, st]) => [id, st.label])) };
     const other = Object.keys(styles).find(id => id !== s.promptStyle) || 'default';
     const est = estimateCompress([sample.batch]);

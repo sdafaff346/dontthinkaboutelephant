@@ -546,6 +546,8 @@
 
 /* manager: underline tabs */
 .lm-tabs-line {
+    flex-wrap: wrap;
+    overflow: visible;
     gap: 2px;
     margin: 4px 0 14px;
     border-bottom: 1px solid var(--lm-line);
@@ -778,7 +780,7 @@
 
 .lm-quiet-row { display: flex; align-items: center; gap: 8px; margin: 0; }
 .lm-quiet-k { flex: 0 0 auto; min-width: 52px; font-size: 11.5px; font-weight: 600; color: var(--lm-muted); }
-.lm-quiet-row .text_pole.lm-quiet { flex: 1 1 auto; width: auto; color: var(--lm-muted); }
+.lm-quiet-row .text_pole.lm-quiet { flex: 1 1 auto; width: auto; min-width: 0; color: var(--lm-muted); }
 .lm-entry-top .lm-key.lm-quiet { flex: 1 1 140px; width: auto; min-width: 0; }
 .lm-root .lm-quiet-select { width: auto; max-width: 150px; margin: 0; border-color: transparent; background-color: var(--lm-sunken); font-size: 12px; min-height: 30px; }
 .lm-root .lm-known.lm-quiet,
@@ -1675,7 +1677,7 @@
 .lm-hook.lm-hook-done .lm-text { color: var(--lm-muted); }
 .lm-hook .lm-hook-how-row { display: none; }
 .lm-hook.lm-hook-done .lm-hook-how-row { display: flex; }
-.lm-hook-kind { width: auto; min-width: 0; max-width: 130px; padding: 2px 6px; font-size: 12px; }
+.lm-root .lm-hook-kind { width: auto; min-width: 8.6em; max-width: 100%; padding: 2px 22px 2px 8px; font-size: 12px; }
 .lm-hook-state { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--lm-muted); cursor: pointer; white-space: nowrap; }
 .lm-hook.lm-deleted { opacity: .45; }
 .lm-hook.lm-picked { background: var(--lm-accent-soft); }
@@ -1778,4 +1780,71 @@
     .lm-chron-when::after { right: auto; left: -17px; top: 10px; }
     .lm-chron-items { padding-left: 0; }
     .lm-rel-list { grid-template-columns: 1fr; }
+}
+
+/* ---------- v1.9.8: nothing gets cut off ---------- */
+.lm-root input,
+.lm-root select,
+.lm-root textarea { min-width: 0; max-width: 100%; }
+.lm-root .lm-node-body,
+.lm-root .lm-hook,
+.lm-root .lm-entry,
+.lm-root .lm-cast { min-width: 0; }
+
+@media (max-width: 600px) {
+    /* the wrapped "더보기" stays at the right edge so its menu opens inside the window */
+    .lm-manager-tools { justify-content: flex-end; }
+    .lm-menu-list { max-width: calc(100vw - 40px); }
+
+    /* manager tabs: a 5-column grid instead of a strip that hides tabs off-screen */
+    .lm-manager .lm-tabs-line {
+        display: grid;
+        grid-template-columns: repeat(5, minmax(0, 1fr));
+        gap: 2px;
+    }
+    .lm-manager .lm-tabs-line .lm-tab {
+        position: relative;
+        flex-direction: column;
+        justify-content: center;
+        gap: 2px;
+        min-width: 0;
+        padding: 8px 2px 7px;
+        font-size: 11.5px;
+    }
+    .lm-manager .lm-tabs-line .lm-tab > span:not(.lm-count) { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .lm-manager .lm-tabs-line .lm-count {
+        position: absolute;
+        top: 3px;
+        right: 3px;
+        min-width: 15px;
+        padding: 0 4px;
+        font-size: 9.5px;
+        line-height: 15px;
+    }
+}
+
+@media (max-width: 600px) {
+    .lm-manager .lm-tabs-line .lm-tab > span:not(.lm-count) { white-space: normal; word-break: keep-all; line-height: 1.2; text-align: center; overflow: visible; }
+}
+
+@media (max-width: 420px) {
+    /* importance + pin + delete fit on one line inside narrow cards */
+    .lm-ctl { gap: 0; flex-wrap: wrap; justify-content: flex-end; max-width: 100%; }
+    .lm-ctl .lm-imp { margin-right: 2px; }
+    .lm-imp span { width: 24px; }
+    .lm-ctl .lm-icon-toggle,
+    .lm-ctl .lm-icon-btn { width: 33px; }
+    .lm-manager { padding: 10px; }
+}
+
+@media (max-width: 360px) {
+    .lm-imp span { width: 21px; font-size: 12px; }
+    .lm-ctl .lm-icon-toggle,
+    .lm-ctl .lm-icon-btn { width: 30px; }
+}
+
+@media (max-width: 340px) {
+    .lm-manager .lm-tabs-line .lm-tab { font-size: 11px; padding-left: 0; padding-right: 0; }
+    .lm-manager .lm-tabs-line .lm-tab > span:not(.lm-count) { letter-spacing: -0.04em; }
+    .lm-health-label { white-space: normal; }
 }
