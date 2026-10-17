@@ -2,7 +2,8 @@
  * Refined ivory and ink with a single bronze accent; charcoal and gold in dark themes.
  * Pretendard throughout. JS sets data-lm-mode="day" | "night" from the ST theme. */
 
-@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css');
+/* Pretendard is loaded from index.js without blocking: a CSS @import that fails (CDN blocked or
+ * offline) makes SillyTavern refuse to activate the whole extension. */
 
 .lm-root {
     --lm-bg: #F7F5F0;
