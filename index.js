@@ -2486,6 +2486,48 @@ function cardCharacters() {
     }).filter(x => x.name && x.text);
 }
 
+// Some models (Gemini especially) answer a "JSON inside <cast>" request with nested XML
+// such as <character><name>..</name><core>..</core></character>. Accept that shape too.
+function xmlField(block, tag) {
+    const m = block.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, 'i'));
+    return m ? m[1].replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').trim() : '';
+}
+
+function parseXmlRecords(text, recordTags = ['character', 'member', 'item', 'entry', 'voice']) {
+    const out = [];
+    for (const tag of recordTags) {
+        const re = new RegExp(`<${tag}(\\s[^>]*)?>([\\s\\S]*?)</${tag}>`, 'gi');
+        let m;
+        while ((m = re.exec(text)) !== null) {
+            const attrs = m[1] || '';
+            const body = m[2];
+            const attrName = (attrs.match(/name\s*=\s*"([^"]*)"/i) || [])[1] || '';
+            const quotesBlock = xmlField(body, 'quotes');
+            const quoteItems = quotesBlock
+                ? [...quotesBlock.matchAll(/<(?:quote|line|item|q)(?:\s[^>]*)?>([\s\S]*?)<\/(?:quote|line|item|q)>/gi)].map(x => x[1].trim())
+                : [...body.matchAll(/<quote(?:\s[^>]*)?>([\s\S]*?)<\/quote>/gi)].map(x => x[1].trim());
+            const quotes = quoteItems.length ? quoteItems : quotesBlock.split('\n').map(x => x.replace(/^[-*\d.)\s]+/, '').replace(/^["“]|["”]$/g, '').trim()).filter(Boolean);
+            const rec = {
+                name: xmlField(body, 'name') || attrName,
+                core: xmlField(body, 'core') || xmlField(body, 'personality'),
+                speech: xmlField(body, 'speech') || xmlField(body, 'voice'),
+                quotes,
+            };
+            if (rec.name || rec.core || rec.speech || rec.quotes.length) out.push(rec);
+        }
+        if (out.length) break;
+    }
+    return out;
+}
+
+// JSON first, then the XML shape above.
+function parseRecords(text) {
+    const json = parseJsonLenient(text || '');
+    const list = (json || []).filter(x => x && typeof x === 'object');
+    if (list.length) return list.flatMap(x => (Array.isArray(x) ? x : [x]));
+    return parseXmlRecords(String(text || ''));
+}
+
 async function extractCast(memory) {
     const cards = cardCharacters();
     const frameNotes = frameText(memory.frame);
@@ -2505,9 +2547,14 @@ Reply with only:
         ...cards.map(c => `<character_card name="${esc(c.name)}">\n${c.text}\n</character_card>`),
         'Write the <cast> block now. One object per character above, plus any other important recurring character named in the notes.',
     ].filter(Boolean).join('\n\n');
-    const out = await callModel(system, user, { expectTag: 'cast' });
-    const list = (parseJsonLenient(extractTag(out, 'cast') || '') || []).filter(x => x && typeof x === 'object' && String(x.name || '').trim());
-    if (!list.length) throw new Error('캐해 정리 응답을 해석하지 못했습니다.');
+    let list = [];
+    for (let attempt = 0; attempt < 2 && !list.length; attempt++) {
+        const reminder = attempt ? '\n\nIMPORTANT: answer with the <cast> block containing a JSON array exactly as shown, nothing else.' : '';
+        const out = await callModel(system, user + reminder, { expectTag: 'cast' });
+        const body = extractTag(out, 'cast') ?? out;
+        list = parseRecords(body).filter(x => String(x.name || '').trim());
+    }
+    if (!list.length) throw new Error('캐해 정리 응답을 해석하지 못했습니다. 다른 요약 모델로 해 보거나, 프롬프트 탭의 "캐해 정리 지시문"을 원래대로 돌려 보세요.');
     const source = cards.map(c => c.text).join('\n');
     return list.map(x => ({
         name: String(x.name).trim().slice(0, 60),
@@ -2619,7 +2666,7 @@ ${sp.items.map(it => `[#${it.i}] ${it.text}`).join('\n\n')}
             let parsed = null;
             try {
                 const out = await callModel(system, user, { expectTag: 'voice' });
-                parsed = (parseJsonLenient(extractTag(out, 'voice') || '') || [])[0];
+                parsed = parseRecords(extractTag(out, 'voice') ?? out)[0];
             } catch (err) {
                 if (String(err?.message) === 'aborted') throw err;
                 logActivity('compress', `${sp.name}의 말투를 모으지 못했어요: ${errorDetail(err)}`, 'warn');
