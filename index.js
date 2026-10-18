@@ -2006,7 +2006,7 @@ Reuse existing keys exactly when updating. Only emit operations for things that 
     check: {
         label: '모순 검사 기준',
         hint: '답변이 기억과 어긋나는지 볼 때의 기준. 경고 문구는 한국어로 나와요',
-        text: 'Report only real contradictions of established facts: dead or absent characters acting, wrong names, forgotten injuries, items in the wrong hands, characters knowing secrets they are not listed as knowing, broken promises with no explanation, wrong relationships or timeline. Do not report style, new information or plausible developments. Write each "problem" in Korean.',
+        text: 'Report only real contradictions of established facts: dead or absent characters acting, wrong names, forgotten injuries, items in the wrong hands, characters knowing secrets they are not listed as knowing, broken promises with no explanation, wrong relationships or timeline. Also report small continuity slips against the recent messages: what someone is holding, eating or drinking, wearing, which hand or side, where people are standing or sitting, the time of day, unless the new reply shows the change happening. Do not report style, new information or plausible developments. Write each "problem" in Korean.',
     },
     voiceCheck: {
         label: '캐해 검사 기준',
@@ -3360,6 +3360,9 @@ async function resummarizeNode(nodeId, { notes = '' } = {}) {
 // ---------------------------------------------------------------- after each reply: contradiction check + live state
 
 let turnBusy = false;
+let turnStartedAt = 0;
+let pendingTurn = null;
+const TURN_TIMEOUT_MS = 120000;
 const CHECK_SWIPE = 1002;
 const CHECK_CLEAR = 1003;
 
@@ -3389,7 +3392,15 @@ async function afterTurn(messageId) {
     const s = getSettings();
     const doCheck = s.checkContradictions;
     const doState = s.liveStateUpdate;
-    if (!s.enabled || (!doCheck && !doState) || turnBusy || !hasChat()) return;
+    // A request that never came back used to leave the check "running" forever, so no later
+    // reply was ever checked. Give up on it after the timeout.
+    if (turnBusy && Date.now() - turnStartedAt > TURN_TIMEOUT_MS + 10000) turnBusy = false;
+    if (turnBusy) {
+        // Check the newest reply once the current check finishes instead of skipping it.
+        pendingTurn = messageId;
+        return;
+    }
+    if (!s.enabled || (!doCheck && !doState) || !hasChat()) return;
     const memory = getMemory(false);
     if (!memory) return;
     const doVoice = doCheck && s.voiceEnabled && s.checkCharacter && memory.cast.some(m => m.core || m.speech);
@@ -3398,24 +3409,47 @@ async function afterTurn(messageId) {
     if (!msg || msg.is_user || msg.is_system) return;
     const chatId = ctx().getCurrentChatId();
     turnBusy = true;
+    turnStartedAt = Date.now();
     renderLive();
     const turnNotes = [];
     let turnLevel = 'ok';
     try {
+        // Recent turns, newest last, up to ~3500 tokens: small details such as what someone
+        // is holding or drinking usually live here, not in the summaries.
         const recent = [];
-        for (let i = Math.max(0, messageId - 6); i < messageId; i++) {
-            if (chat[i] && !chat[i].is_system) recent.push(messageLine(chat[i], i));
+        let recentTokens = 0;
+        for (let i = messageId - 1; i >= 0 && recent.length < 12; i--) {
+            if (!chat[i] || chat[i].is_system) continue;
+            const line = messageLine(chat[i], i);
+            const t = estTokens(line);
+            if (recent.length && recentTokens + t > 3500) break;
+            recent.unshift(line);
+            recentTokens += t;
         }
-        const lore = await loreFor(`${recent.slice(-2).join('\n')}\n${messageLine(msg, messageId)}`, 1200);
+        const replyLine = messageLine(msg, messageId);
+        const lore = await loreFor(`${recent.slice(-2).join('\n')}\n${replyLine}`, 1200);
+        // Earlier moments related to the new reply, from the same search used for recall.
+        let past = '';
+        if (memory.cursor >= 0) {
+            try {
+                const { results } = await withTimeout(hybridRecall(memory, [replyLine.slice(0, 1200), recent.slice(-1)[0] || ''], { topK: 6, budget: 1500 }), s.queryTimeoutMs);
+                past = results.map(({ item }) => `- [${rangeLabel(item.from ?? -2, item.to ?? item.from ?? -2)}] ${item.display.replace(/\n+/g, ' / ')}`).join('\n');
+            } catch (err) {
+                console.warn(LOG_PREFIX, 'check recall skipped', err);
+            }
+        }
+        const sc = memory.ledger.scene || {};
+        const scene = [sc.time && `time: ${sc.time}`, sc.place && `place: ${sc.place}`, sc.present && `present: ${sc.present}`].filter(Boolean).join(' | ');
         const user = [
             frameText(memory.frame) && `<story_frame>\n${frameText(memory.frame)}\n</story_frame>`,
             lore && `<lorebook_reference>\n${lore}\n</lorebook_reference>`,
-            `<established_memory>\n${ledgerText(memory.ledger) || '(empty)'}\n\n${timelineText(memory, { lastN: 1 })}\n</established_memory>`,
+            `<established_memory>\n${scene ? `Current scene: ${scene}\n\n` : ''}${ledgerText(memory.ledger) || '(empty)'}\n\n${timelineText(memory, { lastN: 2 })}\n</established_memory>`,
+            past && `<related_earlier_moments>\n${past}\n</related_earlier_moments>`,
             doVoice && `<cast>\n${castText(memory, { quotes: true })}\n</cast>`,
-            recent.length && `<recent_messages>\n${recent.slice(-4).join('\n\n')}\n</recent_messages>`,
-            `<new_reply>\n${messageLine(msg, messageId)}\n</new_reply>`,
+            recent.length && `<recent_messages>\nThe turns right before the new reply. Small physical details here (what someone holds, wears, drinks, where they stand) count as established facts.\n${recent.join('\n\n')}\n</recent_messages>`,
+            `<new_reply>\n${replyLine}\n</new_reply>`,
         ].filter(Boolean).join('\n\n');
-        const out = await callModel(afterTurnSystemPrompt(doCheck, doState, doVoice), user, { retries: 0 });
+        const out = await withTimeout(callModel(afterTurnSystemPrompt(doCheck, doState, doVoice), user, { retries: 0 }), TURN_TIMEOUT_MS);
         if (!stillSameChat(chatId) || ctx().chat[messageId] !== msg) return;
         if (doCheck) {
             const issues = (parseJsonLenient(extractTag(out, 'issues') || '') || [])
@@ -3450,10 +3484,15 @@ async function afterTurn(messageId) {
         logActivity('check', turnNotes.join(' · '), turnLevel);
     } catch (err) {
         console.warn(LOG_PREFIX, 'after-turn review failed', err);
-        logActivity('check', `점검 실패: ${errorDetail(err)}`, 'err');
+        logActivity('check', String(err?.message) === 'timeout'
+            ? `점검 시간 초과 (${TURN_TIMEOUT_MS / 1000}초) · 다음 답변부터 다시 점검해요`
+            : `점검 실패: ${errorDetail(err)}`, 'err');
     } finally {
         turnBusy = false;
         renderLive();
+        const next = pendingTurn;
+        pendingTurn = null;
+        if (next !== null && next !== messageId && stillSameChat(chatId)) setTimeout(() => afterTurn(next), 0);
     }
 }
 
