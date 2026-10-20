@@ -4591,6 +4591,93 @@ Reply with one block per entry, using the same id, and nothing else:
     return changed > 0 || picks.length > 0;
 }
 
+// "The story so far" was only asked to stay under the word limit. Models often re-copy it and
+// add the new chapters, so it can grow to tens of thousands of tokens. Shrink it back in parts.
+function sagaTarget() {
+    const s = getSettings();
+    return Math.max(800, Math.min(Math.floor(s.memoryBudget * 0.3), Math.round(s.sagaMaxWords * 2.2)));
+}
+
+function splitParagraphs(text, maxTokens) {
+    const paras = String(text).split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+    const out = [];
+    let cur = [];
+    let size = 0;
+    for (const p of paras) {
+        const t = estTokens(p);
+        if (cur.length && size + t > maxTokens) { out.push(cur.join('\n\n')); cur = []; size = 0; }
+        if (t > maxTokens) {
+            // One giant paragraph: cut at sentence ends.
+            const sentences = p.split(/(?<=[.!?。！？다요])\s+/);
+            let part = '';
+            for (const sen of sentences) {
+                if (part && estTokens(part + sen) > maxTokens) { out.push(part.trim()); part = ''; }
+                part += `${sen} `;
+            }
+            if (part.trim()) out.push(part.trim());
+            continue;
+        }
+        cur.push(p);
+        size += t;
+    }
+    if (cur.length) out.push(cur.join('\n\n'));
+    return out;
+}
+
+async function condenseSaga(memory) {
+    let changed = false;
+    for (let pass = 0; pass < 3; pass++) {
+        if (!(await condenseSagaOnce(memory, pass))) break;
+        changed = true;
+    }
+    return changed;
+}
+
+async function condenseSagaOnce(memory, pass) {
+    const text = memory.saga.text.trim();
+    const target = sagaTarget();
+    const now = estTokens(text);
+    if (!text || now <= target * 1.15 || memory.sagaCondenseFailed === text.length) return false;
+    const parts = splitParagraphs(text, 5000);
+    const ratio = Math.max(0.08, Math.min(0.8, target / now));
+    const out = [];
+    for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        const goal = Math.max(150, Math.round(estTokens(part) * ratio));
+        const words = Math.max(60, Math.round(goal / 1.6));
+        setProgress(`지금까지의 이야기 줄이는 중 ${i + 1}/${parts.length}`);
+        const task = `Task: condense this part of "the story so far" to about ${words} words (Korean/Japanese/Chinese text: at most ${goal} characters). This is a hard limit; shorter is fine. It is part ${i + 1} of ${parts.length}, in chronological order. Keep who the characters are to each other, major turning points, lasting promises and secrets (and who knows them), deaths and injuries with lasting effect, and anything still unresolved. Drop scene detail, dialogue and repetition. Do not flatten or reinterpret personalities. Keep the same language as the text.
+
+Reply with exactly this block and nothing else:
+<part>
+<the condensed text>
+</part>`;
+        let condensed = '';
+        try {
+            condensed = (extractTag(await callModel(compactSystemPrompt(task), part, { expectTag: 'part' }), 'part') || '').trim();
+        } catch (err) {
+            if (isAuthError?.(err)) throw err;
+            console.warn('[elephant] saga part failed', err);
+        }
+        if (condensed && estTokens(condensed) > goal * 1.4) {
+            // The model ignored the limit; ask once more for half the length and keep the shorter one.
+            const strict = task.replace(`about ${words} words`, `about ${Math.max(40, Math.round(words / 2))} words`).replace(`at most ${goal} characters`, `at most ${Math.max(100, Math.round(goal / 2))} characters`);
+            const again = (extractTag(await callModel(compactSystemPrompt(strict), part, { expectTag: 'part' }).catch(() => ''), 'part') || '').trim();
+            if (again && again.length < condensed.length) condensed = again;
+        }
+        out.push(condensed && condensed.length < part.length ? condensed : part);
+    }
+    const next = out.join('\n\n');
+    if (estTokens(next) >= now * 0.95) {
+        if (!pass) memory.sagaCondenseFailed = text.length;
+        return false;
+    }
+    // Keep the long version searchable for recall (only the original, not every pass).
+    if (!pass) parts.forEach((part, i) => archiveNode(memory, { id: newId(), title: `Story so far, earlier version (${i + 1}/${parts.length})`, text: part, keywords: [], importance: 3, from: -1, to: memory.saga.coversTo ?? -1 }, 'timeline', SAGA_OWNER));
+    memory.saga.text = next;
+    return true;
+}
+
 function pruneLedger(memory) {
     const s = getSettings();
     const before = memory.ledger.entries.length;
@@ -4611,6 +4698,8 @@ async function compactInternal(chatId, { force }) {
     let didAnything = false;
     const failed = new Set();
     let lastError = null;
+    // A manual 정리 may use a different model, so let it try the saga again.
+    if (force) { const m0 = getMemory(true); if (m0) delete m0.sagaCondenseFailed; }
     for (let iteration = 0; iteration < (force ? 60 : 25); iteration++) {
         if (abortController?.signal.aborted || !stillSameChat(chatId)) break;
         const memory = getMemory(true);
@@ -4644,6 +4733,7 @@ async function compactInternal(chatId, { force }) {
             await tryStep('chapter:force', () => stepChapter(memory, true));
             await tryStep('saga:force', () => stepSaga(memory, true));
         }
+        if (overBudget || forceThisRound || estTokens(memory.saga.text) > sagaTarget() * 2) await tryStep('saga:shrink', () => condenseSaga(memory));
         if (overBudget) {
             await tryStep('ledger', () => trimLedger(memory));
             await tryStep('condense:important', () => stepCondense(memory, { allowImportant: true }));
@@ -4659,7 +4749,7 @@ async function compactInternal(chatId, { force }) {
         }
         if (!stillSameChat(chatId)) break;
         didAnything = true;
-        if (!force) logActivity('compact', `기억 예산에 맞춰 정리 (${({ prune: '사소한 기록 보관', chapter: '챕터로 합침', saga: '이야기로 합침', condense: '요약 줄임', ledger: '오래된 기록을 보관함으로', cast: '자리에 없는 인물 설명 줄임' })[step]})`);
+        if (!force) logActivity('compact', `기억 예산에 맞춰 정리 (${({ prune: '사소한 기록 보관', chapter: '챕터로 합침', saga: '지금까지의 이야기 정리', condense: '요약 줄임', ledger: '오래된 기록을 보관함으로', cast: '자리에 없는 인물 설명 줄임' })[step]})`);
         await persistChat();
         refreshInjection();
         updateStatus();
@@ -4685,7 +4775,7 @@ async function runCompact() {
         if (after && total > getSettings().memoryBudget) {
             const b = memoryBreakdown(after);
             const keep = after.ledger.entries.filter(e => e.pinned || e.cat === 'note').length;
-            toastr.warning(`아직 예산보다 커요 (약 ${total.toLocaleString()}토큰: 이야기 ${b.saga.toLocaleString()} · 타임라인 ${b.timeline.toLocaleString()} · 기록부 ${b.ledger.toLocaleString()} · 캐릭터 ${b.cast.toLocaleString()}). 남은 건 직접 고정한 것(기록 ${keep}개), ★ 장면, 최근 장면이에요. 모델이 정리를 거부했다면 활동 기록에 이유가 남아 있어요.`, APP_NAME, { timeOut: 15000 });
+            toastr.warning(`아직 예산보다 커요 (약 ${total.toLocaleString()}토큰: 이야기 ${b.saga.toLocaleString()} · 타임라인 ${b.timeline.toLocaleString()} · 기록부 ${b.ledger.toLocaleString()} · 캐릭터 ${b.cast.toLocaleString()}). 남은 건 직접 고정한 것(기록 ${keep}개), ★ 장면, 최근 장면이에요. 모델이 정리를 거부했다면 활동 기록에 이유가 남아 있어요. 다른 요약 모델로 한 번 더 정리해 보세요.`, APP_NAME, { timeOut: 15000 });
         }
         if (did) logActivity('compact', '덜 중요한 기억을 줄였어요');
     } catch (err) {
