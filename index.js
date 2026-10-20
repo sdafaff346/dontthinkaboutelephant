@@ -4389,12 +4389,14 @@ function compactSystemPrompt(task) {
 ${task}${extraRules()}`;
 }
 
-async function stepCondense(memory, { allowImportant = false } = {}) {
+async function stepCondense(memory, { allowImportant = false, allowAll = false } = {}) {
     const s = getSettings();
     const episodes = memory.timeline.filter(n => n.tier === 'episode');
     const protectedIds = new Set(episodes.slice(-s.protectRecent).map(n => n.id));
     // Models rate most scenes 4, so when nothing else is left, importance 4 notes get one light pass too.
-    const fits = (n) => (n.importance <= 3 && (n.condensed || 0) < 2) || (allowImportant && n.importance === 4 && !(n.condensed || 0));
+    const fits = (n) => (n.importance <= 3 && (n.condensed || 0) < 2)
+        || (allowImportant && n.importance === 4 && !(n.condensed || 0))
+        || (allowAll && !(n.condensed || 0));
     const candidates = memory.timeline
         .filter(n => !n.pinned && !n.starred && !protectedIds.has(n.id) && fits(n) && estTokens(n.text) > 60)
         .sort((a, b) => (a.importance - b.importance) || (a.from - b.from))
@@ -4532,7 +4534,7 @@ function memoryBreakdown(memory) {
 // The ledger had no size limit, so long chats could carry tens of thousands of tokens of
 // facts. When the memory is over budget, move the least important, longest-untouched entries
 // to the archive (still found by recall) until the ledger fits its share of the budget.
-function trimLedger(memory, share = 0.4, { deep = false } = {}) {
+function trimLedger(memory, share = 0.4, { deep = false, deepest = false } = {}) {
     const s = getSettings();
     const limit = Math.floor(s.memoryBudget * share);
     if (estTokens(ledgerText(memory.ledger)) <= limit) return false;
@@ -4542,10 +4544,13 @@ function trimLedger(memory, share = 0.4, { deep = false } = {}) {
     // Models mark many facts as importance 5. In the deep pass those can move too once they
     // have not been touched for a long while; recall still brings them back when relevant.
     const oldFrom = memory.cursor - s.staleAfter;
-    const movable = (e) => e.importance < 5 || (deep && (e.updatedAt ?? -1) < oldFrom);
+    // The deepest pass is the last resort: anything not pinned and not touched recently may move,
+    // including facts about the characters in the scene.
+    const movable = (e) => e.importance < 5 || deepest || (deep && (e.updatedAt ?? -1) < oldFrom);
+    const shielded = (e) => !deepest && ['character', 'relation'].includes(e.cat) && mentionsPresent(e);
     const candidates = memory.ledger.entries
         .filter(e => !e.pinned && e.cat !== 'note' && movable(e) && e.status !== 'closed'
-            && (e.updatedAt ?? -1) < recentFrom && !(['character', 'relation'].includes(e.cat) && mentionsPresent(e)))
+            && (e.updatedAt ?? -1) < recentFrom && !shielded(e))
         .sort((a, b) => (a.importance - b.importance) || ((a.updatedAt ?? -1) - (b.updatedAt ?? -1)));
     let moved = 0;
     for (const e of candidates) {
@@ -4556,6 +4561,34 @@ function trimLedger(memory, share = 0.4, { deep = false } = {}) {
     }
     // Closed threads are not injected but still cost a little in prompts; archive old ones too.
     return moved > 0;
+}
+
+// Shortens long ledger values with the model (one pass per entry), keeping every fact.
+async function condenseLedger(memory) {
+    const s = getSettings();
+    const limit = Math.floor(s.memoryBudget * 0.4);
+    if (estTokens(ledgerText(memory.ledger)) <= limit) return false;
+    const picks = memory.ledger.entries
+        .filter(e => !e.pinned && e.cat !== 'note' && !e.shortened && e.status !== 'closed' && estTokens(e.value) > 45)
+        .sort((a, b) => estTokens(b.value) - estTokens(a.value))
+        .slice(0, 20);
+    if (!picks.length) return false;
+    const task = `Task: rewrite each fact sheet entry below to about half its length. Keep every name, number, state, secret and who knows it, and the current status; drop history, repetition and description. Keep the same language as each entry.
+
+Reply with one block per entry, using the same id, and nothing else:
+<entry id="ID">shortened value</entry>`;
+    const user = picks.map(e => `<entry id="${e.id}" key="${esc(e.key)}">\n${e.value}\n</entry>`).join('\n\n');
+    const out = await callModel(compactSystemPrompt(task), user, { expectTag: 'entry' });
+    let changed = 0;
+    for (const { id, text } of extractAllTags(out, 'entry')) {
+        const e = memory.ledger.entries.find(x => x.id === id);
+        if (!e || !text || text.length >= e.value.length) continue;
+        e.value = text;
+        changed++;
+    }
+    // Never try the same entries again in a loop, even if the model refused.
+    for (const e of picks) e.shortened = true;
+    return changed > 0 || picks.length > 0;
 }
 
 function pruneLedger(memory) {
@@ -4614,8 +4647,11 @@ async function compactInternal(chatId, { force }) {
         if (overBudget) {
             await tryStep('ledger', () => trimLedger(memory));
             await tryStep('condense:important', () => stepCondense(memory, { allowImportant: true }));
+            await tryStep('ledger:shorten', () => condenseLedger(memory));
             await tryStep('ledger:deep', () => trimLedger(memory, 0.4, { deep: true }));
             await tryStep('cast', () => trimCast(memory));
+            await tryStep('condense:all', () => stepCondense(memory, { allowAll: true }));
+            await tryStep('ledger:deepest', () => trimLedger(memory, 0.4, { deepest: true }));
         }
         if (!step) {
             memory.history.pop();
@@ -4623,7 +4659,7 @@ async function compactInternal(chatId, { force }) {
         }
         if (!stillSameChat(chatId)) break;
         didAnything = true;
-        if (!force) logActivity('compact', `기억 예산에 맞춰 정리 (${({ prune: '사소한 기록 보관', chapter: '챕터로 합침', saga: '이야기로 합침', condense: '덜 중요한 것 줄임', ledger: '오래된 기록을 보관함으로', cast: '자리에 없는 인물 설명 줄임' })[step]})`);
+        if (!force) logActivity('compact', `기억 예산에 맞춰 정리 (${({ prune: '사소한 기록 보관', chapter: '챕터로 합침', saga: '이야기로 합침', condense: '요약 줄임', ledger: '오래된 기록을 보관함으로', cast: '자리에 없는 인물 설명 줄임' })[step]})`);
         await persistChat();
         refreshInjection();
         updateStatus();
@@ -4649,7 +4685,7 @@ async function runCompact() {
         if (after && total > getSettings().memoryBudget) {
             const b = memoryBreakdown(after);
             const keep = after.ledger.entries.filter(e => e.pinned || e.cat === 'note').length;
-            toastr.warning(`아직 예산보다 커요 (약 ${total.toLocaleString()}토큰: 이야기 ${b.saga.toLocaleString()} · 타임라인 ${b.timeline.toLocaleString()} · 기록부 ${b.ledger.toLocaleString()} · 캐릭터 ${b.cast.toLocaleString()}). 남은 건 고정한 것(${keep}개 기록), 중요도 5, ★ 장면, 최근 장면처럼 줄이지 않게 되어 있는 기억이에요. 더 줄이려면 기억장에서 고정을 풀거나 중요도를 낮추세요.`, APP_NAME, { timeOut: 15000 });
+            toastr.warning(`아직 예산보다 커요 (약 ${total.toLocaleString()}토큰: 이야기 ${b.saga.toLocaleString()} · 타임라인 ${b.timeline.toLocaleString()} · 기록부 ${b.ledger.toLocaleString()} · 캐릭터 ${b.cast.toLocaleString()}). 남은 건 직접 고정한 것(기록 ${keep}개), ★ 장면, 최근 장면이에요. 모델이 정리를 거부했다면 활동 기록에 이유가 남아 있어요.`, APP_NAME, { timeOut: 15000 });
         }
         if (did) logActivity('compact', '덜 중요한 기억을 줄였어요');
     } catch (err) {
