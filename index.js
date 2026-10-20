@@ -952,6 +952,16 @@ function presentNames(memory) {
     return String(memory.ledger.scene?.present || '').split(/[,，、/&]| and | 와 | 과 /).map(normName).filter(Boolean);
 }
 
+// When the memory is over budget, characters who are not in the current scene are
+// described briefly (core trimmed, fewer growth notes). Nothing is deleted.
+function trimCast(memory) {
+    if (memory.castCompact) return false;
+    const s = getSettings();
+    if (!s.voiceEnabled || estTokens(castText(memory)) <= s.memoryBudget * 0.2) return false;
+    memory.castCompact = true;
+    return true;
+}
+
 function castText(memory, { quotes = true } = {}) {
     const s = getSettings();
     const members = (memory.cast || []).filter(m => m.name && (m.core || m.speech || m.quotes.length || m.growth.length));
@@ -961,9 +971,11 @@ function castText(memory, { quotes = true } = {}) {
     const ordered = [...members.filter(isPresent), ...members.filter(m => !isPresent(m))];
     return ordered.map(m => {
         const lines = [`${m.name}`];
-        if (m.core) lines.push(`- Core personality (constant; the story does not change it): ${m.core.replace(/\n+/g, ' / ')}`);
-        if (m.speech) lines.push(`- Speech: ${m.speech.replace(/\n+/g, ' / ')}`);
-        if (m.growth.length) lines.push(`- Development in this story (gradual, keeps the core): ${m.growth.slice(-4).map(g => g.text).join('; ')}`);
+        const brief = memory.castCompact && !isPresent(m) && members.length > 2;
+        const cut = (t, n) => (brief && t.length > n ? `${t.slice(0, n).trim()}…` : t);
+        if (m.core) lines.push(`- Core personality (constant; the story does not change it): ${cut(m.core.replace(/\n+/g, ' / '), 220)}`);
+        if (m.speech) lines.push(`- Speech: ${cut(m.speech.replace(/\n+/g, ' / '), 140)}`);
+        if (m.growth.length) lines.push(`- Development in this story (gradual, keeps the core): ${m.growth.slice(brief ? -1 : -4).map(g => g.text).join('; ')}`);
         if (quotes && s.voiceQuotes > 0 && m.quotes.length) {
             const n = isPresent(m) || members.length <= 2 ? s.voiceQuotes : 1;
             const picked = [...m.quotes.filter(q => q.pinned), ...m.quotes.filter(q => !q.pinned).reverse()].slice(0, n);
@@ -4520,15 +4532,19 @@ function memoryBreakdown(memory) {
 // The ledger had no size limit, so long chats could carry tens of thousands of tokens of
 // facts. When the memory is over budget, move the least important, longest-untouched entries
 // to the archive (still found by recall) until the ledger fits its share of the budget.
-function trimLedger(memory, share = 0.4) {
+function trimLedger(memory, share = 0.4, { deep = false } = {}) {
     const s = getSettings();
     const limit = Math.floor(s.memoryBudget * share);
     if (estTokens(ledgerText(memory.ledger)) <= limit) return false;
     const present = new Set(presentNames(memory));
     const recentFrom = memory.cursor - s.keepRecent * 3;
     const mentionsPresent = (e) => [...present].some(n => n && normName(e.key).includes(n));
+    // Models mark many facts as importance 5. In the deep pass those can move too once they
+    // have not been touched for a long while; recall still brings them back when relevant.
+    const oldFrom = memory.cursor - s.staleAfter;
+    const movable = (e) => e.importance < 5 || (deep && (e.updatedAt ?? -1) < oldFrom);
     const candidates = memory.ledger.entries
-        .filter(e => !e.pinned && e.cat !== 'note' && e.importance < 5 && e.status !== 'closed'
+        .filter(e => !e.pinned && e.cat !== 'note' && movable(e) && e.status !== 'closed'
             && (e.updatedAt ?? -1) < recentFrom && !(['character', 'relation'].includes(e.cat) && mentionsPresent(e)))
         .sort((a, b) => (a.importance - b.importance) || ((a.updatedAt ?? -1) - (b.updatedAt ?? -1)));
     let moved = 0;
@@ -4560,6 +4576,8 @@ function pruneLedger(memory) {
 async function compactInternal(chatId, { force }) {
     const s = getSettings();
     let didAnything = false;
+    const failed = new Set();
+    let lastError = null;
     for (let iteration = 0; iteration < (force ? 60 : 25); iteration++) {
         if (abortController?.signal.aborted || !stillSameChat(chatId)) break;
         const memory = getMemory(true);
@@ -4572,25 +4590,45 @@ async function compactInternal(chatId, { force }) {
 
         setProgress('덜 중요한 기억 정리 중...');
         pushHistory(memory, '기억 정리');
+        // A step the model keeps refusing or garbling is skipped for the rest of this run
+        // instead of ending the whole clean-up.
+        const tryStep = async (name, fn) => {
+            if (step || failed.has(name)) return;
+            try {
+                if (await fn()) step = name.split(':')[0];
+            } catch (err) {
+                if (String(err?.message) === 'aborted') throw err;
+                failed.add(name);
+                lastError = err;
+                console.warn(LOG_PREFIX, `compaction step ${name} failed`, err);
+            }
+        };
         if (pruneLedger(memory) && !structural) step = 'prune';
-        if (!step && await stepChapter(memory, false)) step = 'chapter';
-        if (!step && await stepSaga(memory, false)) step = 'saga';
-        if (!step && (overBudget || forceThisRound) && await stepCondense(memory)) step = 'condense';
-        if (!step && (overBudget || forceThisRound) && await stepChapter(memory, true)) step = 'chapter';
-        if (!step && (overBudget || forceThisRound) && await stepSaga(memory, true)) step = 'saga';
-        if (!step && overBudget && trimLedger(memory)) step = 'ledger';
-        if (!step && overBudget && await stepCondense(memory, { allowImportant: true })) step = 'condense';
+        await tryStep('chapter', () => stepChapter(memory, false));
+        await tryStep('saga', () => stepSaga(memory, false));
+        if (overBudget || forceThisRound) {
+            await tryStep('condense', () => stepCondense(memory));
+            await tryStep('chapter:force', () => stepChapter(memory, true));
+            await tryStep('saga:force', () => stepSaga(memory, true));
+        }
+        if (overBudget) {
+            await tryStep('ledger', () => trimLedger(memory));
+            await tryStep('condense:important', () => stepCondense(memory, { allowImportant: true }));
+            await tryStep('ledger:deep', () => trimLedger(memory, 0.4, { deep: true }));
+            await tryStep('cast', () => trimCast(memory));
+        }
         if (!step) {
             memory.history.pop();
             break;
         }
         if (!stillSameChat(chatId)) break;
         didAnything = true;
-        if (!force) logActivity('compact', `기억 예산에 맞춰 정리 (${({ prune: '사소한 기록 보관', chapter: '챕터로 합침', saga: '이야기로 합침', condense: '덜 중요한 것 줄임', ledger: '오래된 기록을 보관함으로' })[step]})`);
+        if (!force) logActivity('compact', `기억 예산에 맞춰 정리 (${({ prune: '사소한 기록 보관', chapter: '챕터로 합침', saga: '이야기로 합침', condense: '덜 중요한 것 줄임', ledger: '오래된 기록을 보관함으로', cast: '자리에 없는 인물 설명 줄임' })[step]})`);
         await persistChat();
         refreshInjection();
         updateStatus();
     }
+    if (failed.size && lastError) logActivity('compact', `정리 일부를 건너뛰었어요 (${[...failed].join(', ')}) · ${errorDetail(lastError)}`, 'warn');
     return didAnything;
 }
 
@@ -4606,6 +4644,13 @@ async function runCompact() {
         const did = await compactInternal(chatId, { force: true });
         if (did) syncAfter();
         toastr[did ? 'success' : 'info'](did ? '덜 중요한 기억을 압축했습니다.' : '더 압축할 기억이 없습니다.');
+        const after = getMemory(false);
+        const total = after ? estTokens(buildMemoryText(after)) : 0;
+        if (after && total > getSettings().memoryBudget) {
+            const b = memoryBreakdown(after);
+            const keep = after.ledger.entries.filter(e => e.pinned || e.cat === 'note').length;
+            toastr.warning(`아직 예산보다 커요 (약 ${total.toLocaleString()}토큰: 이야기 ${b.saga.toLocaleString()} · 타임라인 ${b.timeline.toLocaleString()} · 기록부 ${b.ledger.toLocaleString()} · 캐릭터 ${b.cast.toLocaleString()}). 남은 건 고정한 것(${keep}개 기록), 중요도 5, ★ 장면, 최근 장면처럼 줄이지 않게 되어 있는 기억이에요. 더 줄이려면 기억장에서 고정을 풀거나 중요도를 낮추세요.`, APP_NAME, { timeOut: 15000 });
+        }
         if (did) logActivity('compact', '덜 중요한 기억을 줄였어요');
     } catch (err) {
         if (String(err?.message) === 'aborted') toastr.info('중지했습니다.');
