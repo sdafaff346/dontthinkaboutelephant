@@ -954,11 +954,14 @@ function presentNames(memory) {
 
 // When the memory is over budget, characters who are not in the current scene are
 // described briefly (core trimmed, fewer growth notes). Nothing is deleted.
-function trimCast(memory) {
-    if (memory.castCompact) return false;
+function trimCast(memory, limit = null) {
     const s = getSettings();
-    if (!s.voiceEnabled || estTokens(castText(memory)) <= s.memoryBudget * 0.2) return false;
-    memory.castCompact = true;
+    const level = Number(memory.castCompact) || 0;
+    if (!s.voiceEnabled || level >= 2) return false;
+    if (estTokens(castText(memory)) <= (limit ?? s.memoryBudget * 0.2)) return false;
+    // Level 1: absent characters get a short entry. Level 2: present characters keep fewer
+    // voice samples and only their latest development.
+    memory.castCompact = level + 1;
     return true;
 }
 
@@ -971,13 +974,15 @@ function castText(memory, { quotes = true } = {}) {
     const ordered = [...members.filter(isPresent), ...members.filter(m => !isPresent(m))];
     return ordered.map(m => {
         const lines = [`${m.name}`];
-        const brief = memory.castCompact && !isPresent(m) && members.length > 2;
+        const level = Number(memory.castCompact) || 0;
+        const brief = level >= 1 && !isPresent(m) && members.length > 2;
+        const tight = level >= 2;
         const cut = (t, n) => (brief && t.length > n ? `${t.slice(0, n).trim()}…` : t);
         if (m.core) lines.push(`- Core personality (constant; the story does not change it): ${cut(m.core.replace(/\n+/g, ' / '), 220)}`);
         if (m.speech) lines.push(`- Speech: ${cut(m.speech.replace(/\n+/g, ' / '), 140)}`);
-        if (m.growth.length) lines.push(`- Development in this story (gradual, keeps the core): ${m.growth.slice(brief ? -1 : -4).map(g => g.text).join('; ')}`);
+        if (m.growth.length) lines.push(`- Development in this story (gradual, keeps the core): ${m.growth.slice(brief ? -1 : tight ? -2 : -4).map(g => g.text).join('; ')}`);
         if (quotes && s.voiceQuotes > 0 && m.quotes.length) {
-            const n = isPresent(m) || members.length <= 2 ? s.voiceQuotes : 1;
+            const n = isPresent(m) || members.length <= 2 ? (tight ? Math.min(2, s.voiceQuotes) : s.voiceQuotes) : 1;
             const picked = [...m.quotes.filter(q => q.pinned), ...m.quotes.filter(q => !q.pinned).reverse()].slice(0, n);
             lines.push(`- Voice samples (their real earlier lines; match this voice, never repeat them): ${picked.map(q => `"${q.text}"`).join(' / ')}`);
         }
@@ -4389,14 +4394,15 @@ function compactSystemPrompt(task) {
 ${task}${extraRules()}`;
 }
 
-async function stepCondense(memory, { allowImportant = false, allowAll = false } = {}) {
+async function stepCondense(memory, { allowImportant = false, allowAll = false, allowRecent = false } = {}) {
     const s = getSettings();
     const episodes = memory.timeline.filter(n => n.tier === 'episode');
-    const protectedIds = new Set(episodes.slice(-s.protectRecent).map(n => n.id));
+    const protectedIds = new Set(episodes.slice(-(allowRecent ? 1 : s.protectRecent)).map(n => n.id));
     // Models rate most scenes 4, so when nothing else is left, importance 4 notes get one light pass too.
     const fits = (n) => (n.importance <= 3 && (n.condensed || 0) < 2)
         || (allowImportant && n.importance === 4 && !(n.condensed || 0))
-        || (allowAll && !(n.condensed || 0));
+        || (allowAll && !(n.condensed || 0))
+        || (allowRecent && (n.condensed || 0) < 2);
     const candidates = memory.timeline
         .filter(n => !n.pinned && !n.starred && !protectedIds.has(n.id) && fits(n) && estTokens(n.text) > 60)
         .sort((a, b) => (a.importance - b.importance) || (a.from - b.from))
@@ -4534,12 +4540,13 @@ function memoryBreakdown(memory) {
 // The ledger had no size limit, so long chats could carry tens of thousands of tokens of
 // facts. When the memory is over budget, move the least important, longest-untouched entries
 // to the archive (still found by recall) until the ledger fits its share of the budget.
-function trimLedger(memory, share = 0.4, { deep = false, deepest = false } = {}) {
+function trimLedger(memory, share = 0.4, { deep = false, deepest = false, last = false, limit: forced = null } = {}) {
     const s = getSettings();
-    const limit = Math.floor(s.memoryBudget * share);
+    const limit = forced ?? Math.floor(s.memoryBudget * share);
     if (estTokens(ledgerText(memory.ledger)) <= limit) return false;
     const present = new Set(presentNames(memory));
-    const recentFrom = memory.cursor - s.keepRecent * 3;
+    // The very last pass only keeps what changed in the newest batch of messages.
+    const recentFrom = memory.cursor - (last ? Math.max(5, Math.floor(s.keepRecent / 2)) : s.keepRecent * 3);
     const mentionsPresent = (e) => [...present].some(n => n && normName(e.key).includes(n));
     // Models mark many facts as importance 5. In the deep pass those can move too once they
     // have not been touched for a long while; recall still brings them back when relevant.
@@ -4547,7 +4554,7 @@ function trimLedger(memory, share = 0.4, { deep = false, deepest = false } = {})
     // The deepest pass is the last resort: anything not pinned and not touched recently may move,
     // including facts about the characters in the scene.
     const movable = (e) => e.importance < 5 || deepest || (deep && (e.updatedAt ?? -1) < oldFrom);
-    const shielded = (e) => !deepest && ['character', 'relation'].includes(e.cat) && mentionsPresent(e);
+    const shielded = (e) => (!deepest || last) && ['character', 'relation'].includes(e.cat) && mentionsPresent(e) && !(last && e.importance < 5);
     const candidates = memory.ledger.entries
         .filter(e => !e.pinned && e.cat !== 'note' && movable(e) && e.status !== 'closed'
             && (e.updatedAt ?? -1) < recentFrom && !shielded(e))
@@ -4564,12 +4571,12 @@ function trimLedger(memory, share = 0.4, { deep = false, deepest = false } = {})
 }
 
 // Shortens long ledger values with the model (one pass per entry), keeping every fact.
-async function condenseLedger(memory) {
+async function condenseLedger(memory, forced = null, { again = false } = {}) {
     const s = getSettings();
-    const limit = Math.floor(s.memoryBudget * 0.4);
+    const limit = forced ?? Math.floor(s.memoryBudget * 0.4);
     if (estTokens(ledgerText(memory.ledger)) <= limit) return false;
     const picks = memory.ledger.entries
-        .filter(e => !e.pinned && e.cat !== 'note' && !e.shortened && e.status !== 'closed' && estTokens(e.value) > 45)
+        .filter(e => !e.pinned && e.cat !== 'note' && (Number(e.shortened) || 0) < (again ? 2 : 1) && e.status !== 'closed' && estTokens(e.value) > (again ? 30 : 45))
         .sort((a, b) => estTokens(b.value) - estTokens(a.value))
         .slice(0, 20);
     if (!picks.length) return false;
@@ -4587,12 +4594,29 @@ Reply with one block per entry, using the same id, and nothing else:
         changed++;
     }
     // Never try the same entries again in a loop, even if the model refused.
-    for (const e of picks) e.shortened = true;
+    for (const e of picks) e.shortened = (Number(e.shortened) || 0) + 1;
     return changed > 0 || picks.length > 0;
 }
 
 // "The story so far" was only asked to stay under the word limit. Models often re-copy it and
 // add the new chapters, so it can grow to tens of thousands of tokens. Shrink it back in parts.
+// Each part used to have its own fixed share (story 30%, fact sheet 40%, characters 20%), and
+// those shares plus the timeline added up to more than the budget. So every part could be
+// "within its share" while the whole was still far over. Now the overflow is split across the
+// parts in proportion to how much each one can still give up.
+function sectionLimits(memory) {
+    const s = getSettings();
+    const b = memoryBreakdown(memory);
+    const excess = Math.max(0, estTokens(buildMemoryText(memory)) - s.memoryBudget);
+    const floors = { saga: 600, timeline: 0, ledger: Math.floor(s.memoryBudget * 0.15), cast: Math.floor(s.memoryBudget * 0.08) };
+    const room = {};
+    let sum = 0;
+    for (const k of Object.keys(floors)) { room[k] = Math.max(0, b[k] - floors[k]); sum += room[k]; }
+    const out = {};
+    for (const k of Object.keys(floors)) out[k] = sum ? Math.max(floors[k], Math.floor(b[k] - (excess * 1.1 + 50) * room[k] / sum)) : b[k];
+    return out;
+}
+
 function sagaTarget() {
     const s = getSettings();
     return Math.max(800, Math.min(Math.floor(s.memoryBudget * 0.3), Math.round(s.sagaMaxWords * 2.2)));
@@ -4624,18 +4648,17 @@ function splitParagraphs(text, maxTokens) {
     return out;
 }
 
-async function condenseSaga(memory) {
+async function condenseSaga(memory, target = sagaTarget()) {
     let changed = false;
     for (let pass = 0; pass < 3; pass++) {
-        if (!(await condenseSagaOnce(memory, pass))) break;
+        if (!(await condenseSagaOnce(memory, pass, target))) break;
         changed = true;
     }
     return changed;
 }
 
-async function condenseSagaOnce(memory, pass) {
+async function condenseSagaOnce(memory, pass, target) {
     const text = memory.saga.text.trim();
-    const target = sagaTarget();
     const now = estTokens(text);
     if (!text || now <= target * 1.15 || memory.sagaCondenseFailed === text.length) return false;
     const parts = splitParagraphs(text, 5000);
@@ -4733,15 +4756,24 @@ async function compactInternal(chatId, { force }) {
             await tryStep('chapter:force', () => stepChapter(memory, true));
             await tryStep('saga:force', () => stepSaga(memory, true));
         }
-        if (overBudget || forceThisRound || estTokens(memory.saga.text) > sagaTarget() * 2) await tryStep('saga:shrink', () => condenseSaga(memory));
+        const lim = overBudget ? sectionLimits(memory) : null;
+        const sagaGoal = lim ? Math.min(sagaTarget(), lim.saga) : sagaTarget();
+        if (overBudget || forceThisRound || estTokens(memory.saga.text) > sagaTarget() * 2) await tryStep('saga:shrink', () => condenseSaga(memory, sagaGoal));
         if (overBudget) {
-            await tryStep('ledger', () => trimLedger(memory));
+            const ledgerLimit = Math.min(Math.floor(s.memoryBudget * 0.4), lim.ledger);
+            const castLimit = Math.min(Math.floor(s.memoryBudget * 0.2), lim.cast);
+            await tryStep('ledger', () => trimLedger(memory, 0.4, { limit: ledgerLimit }));
             await tryStep('condense:important', () => stepCondense(memory, { allowImportant: true }));
-            await tryStep('ledger:shorten', () => condenseLedger(memory));
-            await tryStep('ledger:deep', () => trimLedger(memory, 0.4, { deep: true }));
-            await tryStep('cast', () => trimCast(memory));
+            await tryStep('ledger:shorten', () => condenseLedger(memory, ledgerLimit));
+            await tryStep('ledger:deep', () => trimLedger(memory, 0.4, { deep: true, limit: ledgerLimit }));
+            await tryStep('cast', () => trimCast(memory, castLimit));
             await tryStep('condense:all', () => stepCondense(memory, { allowAll: true }));
-            await tryStep('ledger:deepest', () => trimLedger(memory, 0.4, { deepest: true }));
+            await tryStep('ledger:deepest', () => trimLedger(memory, 0.4, { deepest: true, limit: ledgerLimit }));
+            // Last resort: recent scenes (all but the newest) get a light pass, long facts a second
+            // shortening, and facts not touched in the newest messages move to the archive.
+            await tryStep('condense:recent', () => stepCondense(memory, { allowAll: true, allowRecent: true }));
+            await tryStep('ledger:again', () => condenseLedger(memory, ledgerLimit, { again: true }));
+            await tryStep('ledger:last', () => trimLedger(memory, 0.4, { deepest: true, last: true, limit: ledgerLimit }));
         }
         if (!step) {
             memory.history.pop();
@@ -4775,7 +4807,7 @@ async function runCompact() {
         if (after && total > getSettings().memoryBudget) {
             const b = memoryBreakdown(after);
             const keep = after.ledger.entries.filter(e => e.pinned || e.cat === 'note').length;
-            toastr.warning(`아직 예산보다 커요 (약 ${total.toLocaleString()}토큰: 이야기 ${b.saga.toLocaleString()} · 타임라인 ${b.timeline.toLocaleString()} · 기록부 ${b.ledger.toLocaleString()} · 캐릭터 ${b.cast.toLocaleString()}). 남은 건 직접 고정한 것(기록 ${keep}개), ★ 장면, 최근 장면이에요. 모델이 정리를 거부했다면 활동 기록에 이유가 남아 있어요. 다른 요약 모델로 한 번 더 정리해 보세요.`, APP_NAME, { timeOut: 15000 });
+            toastr.warning(`아직 예산보다 커요 (약 ${total.toLocaleString()}토큰: 이야기 ${b.saga.toLocaleString()} · 타임라인 ${b.timeline.toLocaleString()} · 기록부 ${b.ledger.toLocaleString()} · 캐릭터 ${b.cast.toLocaleString()}). 남은 건 직접 고정한 것(기록 ${keep}개), ★ 장면, 가장 최근 장면, 이미 한계까지 줄인 내용이에요. 모델이 정리를 거부했다면 활동 기록에 이유가 남아 있어요. 기억 크기 한도를 조금 올리거나 다른 요약 모델로 한 번 더 정리해 보세요.`, APP_NAME, { timeOut: 15000 });
         }
         if (did) logActivity('compact', '덜 중요한 기억을 줄였어요');
     } catch (err) {
