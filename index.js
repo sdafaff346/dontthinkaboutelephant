@@ -4497,8 +4497,16 @@ async function stepSaga(memory, force) {
     const chapters = memory.timeline.filter(n => n.tier === 'chapter');
     if (!force && chapters.length <= s.maxChapters) return false;
     const run = [];
+    // When forced (over budget), an old episode left at the front, or one stuck between chapters,
+    // must not block folding: take the oldest chapters and unprotected episodes, and step over
+    // pinned ones (they stay in the timeline).
+    const episodes = memory.timeline.filter(n => n.tier === 'episode');
+    const protectedIds = new Set(episodes.slice(-s.protectRecent).map(n => n.id));
     for (const node of memory.timeline) {
-        if (node.tier === 'chapter' && !node.pinned && run.length < 3) run.push(node);
+        if (run.length >= 3) break;
+        if (node.pinned) { if (force) continue; break; }
+        if (node.tier === 'chapter' || (force && !protectedIds.has(node.id) && !node.starred)) run.push(node);
+        else if (force && node.starred && !protectedIds.has(node.id)) run.push(node);
         else break;
     }
     if (!run.length) return false;
@@ -4521,7 +4529,7 @@ Reply with exactly this block and nothing else:
     for (const e of memory.events) if (runIds.includes(e.episodeId)) e.episodeId = SAGA_OWNER;
     for (const a of memory.archive) if (runIds.includes(a.ownerId)) a.ownerId = SAGA_OWNER;
     memory.saga = { text: saga, coversTo: run[run.length - 1].to };
-    memory.timeline.splice(0, run.length);
+    memory.timeline = memory.timeline.filter(n => !runIds.includes(n.id));
     return true;
 }
 
@@ -4660,7 +4668,8 @@ async function condenseSaga(memory, target = sagaTarget()) {
 async function condenseSagaOnce(memory, pass, target) {
     const text = memory.saga.text.trim();
     const now = estTokens(text);
-    if (!text || now <= target * 1.15 || memory.sagaCondenseFailed === text.length) return false;
+    const tries = memory.sagaCondenseFailed?.len === text.length ? memory.sagaCondenseFailed.n : 0;
+    if (!text || now <= target * 1.15 || tries >= 2) return false;
     const parts = splitParagraphs(text, 5000);
     const ratio = Math.max(0.08, Math.min(0.8, target / now));
     const out = [];
@@ -4692,7 +4701,7 @@ Reply with exactly this block and nothing else:
     }
     const next = out.join('\n\n');
     if (estTokens(next) >= now * 0.95) {
-        if (!pass) memory.sagaCondenseFailed = text.length;
+        memory.sagaCondenseFailed = { len: text.length, n: tries + 1 };
         return false;
     }
     // Keep the long version searchable for recall (only the original, not every pass).
@@ -4716,10 +4725,13 @@ function pruneLedger(memory) {
     return memory.ledger.entries.length < before;
 }
 
+let lastCompactRefused = [];
+
 async function compactInternal(chatId, { force }) {
     const s = getSettings();
     let didAnything = false;
     const failed = new Set();
+    const failCount = new Map();
     let lastError = null;
     // A manual 정리 may use a different model, so let it try the saga again.
     if (force) { const m0 = getMemory(true); if (m0) delete m0.sagaCondenseFailed; }
@@ -4743,7 +4755,9 @@ async function compactInternal(chatId, { force }) {
                 if (await fn()) step = name.split(':')[0];
             } catch (err) {
                 if (String(err?.message) === 'aborted') throw err;
-                failed.add(name);
+                // Models sometimes refuse once and then comply, so give each step a second chance.
+                failCount.set(name, (failCount.get(name) || 0) + 1);
+                if (failCount.get(name) >= 2 || isAuthError(err)) failed.add(name);
                 lastError = err;
                 console.warn(LOG_PREFIX, `compaction step ${name} failed`, err);
             }
@@ -4786,6 +4800,7 @@ async function compactInternal(chatId, { force }) {
         refreshInjection();
         updateStatus();
     }
+    lastCompactRefused = [...failed];
     if (failed.size && lastError) logActivity('compact', `정리 일부를 건너뛰었어요 (${[...failed].join(', ')}) · ${errorDetail(lastError)}`, 'warn');
     return didAnything;
 }
@@ -4807,7 +4822,8 @@ async function runCompact() {
         if (after && total > getSettings().memoryBudget) {
             const b = memoryBreakdown(after);
             const keep = after.ledger.entries.filter(e => e.pinned || e.cat === 'note').length;
-            toastr.warning(`아직 예산보다 커요 (약 ${total.toLocaleString()}토큰: 이야기 ${b.saga.toLocaleString()} · 타임라인 ${b.timeline.toLocaleString()} · 기록부 ${b.ledger.toLocaleString()} · 캐릭터 ${b.cast.toLocaleString()}). 남은 건 직접 고정한 것(기록 ${keep}개), ★ 장면, 가장 최근 장면, 이미 한계까지 줄인 내용이에요. 모델이 정리를 거부했다면 활동 기록에 이유가 남아 있어요. 기억 크기 한도를 조금 올리거나 다른 요약 모델로 한 번 더 정리해 보세요.`, APP_NAME, { timeOut: 15000 });
+            const refusedNote = lastCompactRefused.length ? ` 이번 정리에서 모델이 ${lastCompactRefused.length}개 단계를 거부하거나 형식을 틀렸어요. 한 번 더 누르면 다시 시도해요.` : '';
+            toastr.warning(`아직 예산보다 커요 (약 ${total.toLocaleString()}토큰: 이야기 ${b.saga.toLocaleString()} · 타임라인 ${b.timeline.toLocaleString()} · 기록부 ${b.ledger.toLocaleString()} · 캐릭터 ${b.cast.toLocaleString()}). 남은 건 직접 고정한 것(기록 ${keep}개), ★ 장면, 가장 최근 장면, 이미 한계까지 줄인 내용이에요. 모델이 정리를 거부했다면 활동 기록에 이유가 남아 있어요. 기억 크기 한도를 조금 올리거나 다른 요약 모델로 한 번 더 정리해 보세요.${refusedNote}`, APP_NAME, { timeOut: 15000 });
         }
         if (did) logActivity('compact', '덜 중요한 기억을 줄였어요');
     } catch (err) {
