@@ -38,6 +38,14 @@
 - 임베딩 소스를 바꾸면 색인을 새로 만들어야 하니 **벡터 색인 맞추기**를 한 번 눌러주세요. (채팅을 열 때와 압축 후에는 자동으로 맞춰요)
 - **검색 테스트** 버튼이나 `/lm-search 검색어 | /echo` 로 무엇이 회상되는지 미리 볼 수 있습니다.
 
+## v1.9.22 Vertex AI "Publisher model ... was not found"
+
+최신 Gemini 모델 중에는 Vertex AI의 global 지역에서만 제공되는 것이 있어요. 연결 프로필에 지역이 비어 있으면 ST가 us-central1으로 보내서, 채팅은 되는데 요약만 "Publisher model ... was not found or your project does not have access to it" (404)로 실패했어요.
+
+- 이 오류가 나면 API 연결 화면의 지역, global, us-central1 순서로 다른 지역에 한 번씩 다시 보내요.
+- 되는 지역을 찾으면 그 프로필은 다음부터 바로 그 지역으로 보내고, 알림으로 알려 줘요.
+- 어느 지역에서도 안 되면 지역을 바꾸거나 그 지역에 있는 모델로 프로필을 다시 저장하라고 안내해요.
+
 ## v1.9.21 Vertex AI "Service Account JSON is missing" 오류
 
 연결 프로필에는 저장할 때 쓰던 인증 정보(Express API 키 또는 서비스 계정 JSON)의 ID가 같이 저장돼요. 그런데 요약 요청을 보낼 때 인증 방식은 지금 API 연결 화면의 설정을 따라가서, 둘이 다르면 실패했어요. 예를 들어 Express 키로 저장한 프로필을 쓰는데 지금 연결이 서비스 계정 방식이면, ST가 그 키 ID로 서비스 계정을 찾다가 "Vertex AI Service Account JSON is missing."을 띄웠어요.

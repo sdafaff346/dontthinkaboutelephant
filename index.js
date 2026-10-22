@@ -1881,9 +1881,23 @@ async function profileBasePayload(profileId) {
         if (mode) payload.vertexai_auth_mode = mode;
         if (dropSecretId) payload.secret_id = undefined;
         if (oai.vertexai_express_project_id) payload.vertexai_express_project_id = oai.vertexai_express_project_id;
-        if (!profile?.['api-url'] && oai.vertexai_region) payload.vertexai_region = oai.vertexai_region;
+        const learned = getSettings().vertexRegionFix?.[profileId];
+        if (learned) payload.vertexai_region = learned;
+        else if (!profile?.['api-url'] && oai.vertexai_region) payload.vertexai_region = oai.vertexai_region;
     }
     return payload;
+}
+
+// Newer Gemini models on Vertex are often served only from the "global" location. A profile saved
+// with us-central1 (or no region, which ST treats as us-central1) then gets
+// "Publisher model ... was not found". Try the chat's region, then global, and remember what worked.
+const VERTEX_MODEL_404 = /publisher model[\s\S]{0,200}(not found|does not have access)|publishers\/google\/models\/[^\s`]+[\s\S]{0,40}not found/i;
+function vertexRegionCandidates(profileId, err) {
+    const profile = findProfile(profileId);
+    if (profileSource(profile) !== 'vertexai' || !VERTEX_MODEL_404.test(errorDetail(err))) return [];
+    const used = (errorDetail(err).match(/locations\/([a-z0-9-]+)\//i) || [])[1] || profile?.['api-url'] || 'us-central1';
+    const oai = ctx().chatCompletionSettings || {};
+    return [...new Set([oai.vertexai_region, 'global', 'us-central1'].filter(r => r && r !== used))];
 }
 
 // Builds request fields that make a profile request match the connection that works in chat.
@@ -1940,6 +1954,8 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
     let lastError = null;
     let repair = null;
     let authStep = 0;
+    let regionTries = null;
+    let regionOverride = null;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
         if (abortController?.signal.aborted) throw new Error('aborted');
         try {
@@ -1951,7 +1967,7 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
                     messages,
                     s.maxOutputTokens,
                     { stream: false, signal: abortController?.signal ?? null, extractData: true, includePreset: s.includePreset },
-                    repair?.payload ?? await profileBasePayload(profileId),
+                    { ...(repair?.payload ?? await profileBasePayload(profileId)), ...(regionOverride ? { vertexai_region: regionOverride } : {}) },
                 );
                 raw = typeof result === 'string' ? result : (result?.content ?? '');
             } else {
@@ -1967,12 +1983,26 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
             const cleaned = cleanOutput(raw);
             if (!cleaned) throw new Error('빈 응답');
             if (looksRefused(cleaned, expectTag)) throw new BlockedError(`모델이 요약을 거절했어요: "${cleaned.slice(0, 80)}"`, 'refused');
+            if (regionOverride && profileId) {
+                s.vertexRegionFix = { ...(s.vertexRegionFix || {}), [profileId]: regionOverride };
+                ctx().saveSettingsDebounced();
+                toastr.info(`이 모델은 Vertex AI ${regionOverride} 지역에서만 찾을 수 있어서, 앞으로 이 프로필은 ${regionOverride}로 보낼게요.`, APP_NAME, { timeOut: 8000 });
+            }
             return cleaned;
         } catch (err) {
             lastError = err;
             if (abortController?.signal.aborted) throw new Error('aborted');
             // A blocked request fails the same way every time; do not burn retries on it.
             if (isBlockError(err)) break;
+            if (profileId) {
+                if (regionTries === null) regionTries = vertexRegionCandidates(profileId, err);
+                if (regionTries.length && VERTEX_MODEL_404.test(errorDetail(err))) {
+                    regionOverride = regionTries.shift();
+                    console.warn(LOG_PREFIX, `Vertex model not found in this region, trying ${regionOverride}`, err);
+                    attempt--;
+                    continue;
+                }
+            }
             // ST answers a Vertex service-account mix-up with a bare 400 ("Response not OK").
             const vertexBare = profileId && /response not ok|status 400/i.test(errorDetail(err)) && profileSource(findProfile(profileId)) === 'vertexai';
             if (profileId && (isAuthError(err) || vertexBare) && authStep < 2) {
@@ -2480,6 +2510,7 @@ function errorHint(detail) {
             : '모델의 검열 필터가 이 구간을 막았어요. 설정 → 요약 탭의 "검열되면 대신 쓸 모델"에 다른 모델 프로필(예: DeepSeek, GLM)을 골라두면 막힐 때만 자동으로 넘겨요.';
     }
     if (/context|too long|maximum.*token|token.*(limit|exceed)|length/.test(d)) return '보낸 내용이 모델 한도보다 길어요. 범위 탭의 "한 구간 최대 토큰"을 줄여보세요.';
+    if (/publisher model[\s\S]{0,200}(not found|does not have access)/.test(d)) return 'Vertex AI에서 이 모델을 찾지 못했어요. 이 지역(us-central1, global 등)에 없는 모델이거나 프로젝트에 권한이 없어요. API 연결 → Vertex AI의 지역을 global로 바꾸거나, 그 지역에 있는 모델로 연결 프로필을 다시 저장해주세요.';
     if (/\b404\b|not found|no such model|unknown model/.test(d)) return '모델이나 주소를 찾지 못했어요. 프로필에 저장된 모델 이름을 확인해주세요.';
     if (d.includes('빈 응답')) return '모델이 빈 답을 보냈어요. 생각(추론) 모델이라면 요약 탭의 "응답 최대 토큰"을 8000 이상으로 늘려보세요.';
     if (/response not ok|\b50[0-4]\b|overloaded|unavailable|internal/.test(d)) return 'API 쪽에서 오류를 돌려줬어요. 자세한 이유는 SillyTavern 서버 창(검은 콘솔 창)에 찍혀 있어요. 잠시 뒤 다시 하거나 다른 모델을 써보세요.';
