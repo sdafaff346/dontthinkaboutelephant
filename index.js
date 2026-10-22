@@ -1832,12 +1832,54 @@ function profileSource(profile) {
 // Fields a profile request never carries but some APIs need on every call. Vertex AI reads its
 // auth mode (express key or service account) and project id from the main API settings; without
 // them ST falls back to Express mode and fails with "API key is required for Vertex AI Express mode".
-function profileBasePayload(profileId) {
+// Which saved secrets exist (ids and labels only; ST masks the values). Cached for a minute.
+let secretIdCache = null;
+let secretIdCacheAt = 0;
+async function savedSecretIds() {
+    if (secretIdCache && Date.now() - secretIdCacheAt < 60000) return secretIdCache;
+    try {
+        const res = await fetch('/api/secrets/read', { method: 'POST', headers: ctx().getRequestHeaders(), body: '{}' });
+        if (res.ok) {
+            secretIdCache = await res.json();
+            secretIdCacheAt = Date.now();
+        }
+    } catch { /* fall back to the main settings */ }
+    return secretIdCache || {};
+}
+
+// A profile stores the id of the secret that was active when it was saved: an Express API key or
+// a service account JSON. Sending the main settings' auth mode with that id fails when they
+// differ (a profile saved in Express mode, chat now in service-account mode, gives "Vertex AI
+// Service Account JSON is missing"). So the mode follows the profile's own secret.
+async function vertexAuthFor(profile, oai) {
+    const sid = profile?.['secret-id'] || '';
+    const st = await savedSecretIds();
+    const list = (key) => (Array.isArray(st?.[key]) ? st[key] : []);
+    const sa = list('vertexai_service_account_json');
+    const keys = list('vertexai');
+    const known = Object.keys(st || {}).length > 0;
+    let mode = '';
+    let dropSecretId = false;
+    if (sid && sa.some(x => x.id === sid)) mode = 'full';
+    else if (sid && keys.some(x => x.id === sid)) mode = 'express';
+    else {
+        // No secret on the profile, or it was deleted/replaced: use the active one of the main mode.
+        dropSecretId = !!sid && known;
+        mode = oai.vertexai_auth_mode || '';
+        if (known && mode === 'full' && !sa.length && keys.length) mode = 'express';
+        if (known && (mode === 'express' || !mode) && !keys.length && sa.length) mode = 'full';
+    }
+    return { mode, dropSecretId };
+}
+
+async function profileBasePayload(profileId) {
     const profile = findProfile(profileId);
     const oai = ctx().chatCompletionSettings || {};
     const payload = {};
     if (profileSource(profile) === 'vertexai') {
-        if (oai.vertexai_auth_mode) payload.vertexai_auth_mode = oai.vertexai_auth_mode;
+        const { mode, dropSecretId } = await vertexAuthFor(profile, oai);
+        if (mode) payload.vertexai_auth_mode = mode;
+        if (dropSecretId) payload.secret_id = undefined;
         if (oai.vertexai_express_project_id) payload.vertexai_express_project_id = oai.vertexai_express_project_id;
         if (!profile?.['api-url'] && oai.vertexai_region) payload.vertexai_region = oai.vertexai_region;
     }
@@ -1845,9 +1887,9 @@ function profileBasePayload(profileId) {
 }
 
 // Builds request fields that make a profile request match the connection that works in chat.
-function profileRepairPayload(profileId) {
+async function profileRepairPayload(profileId) {
     const c = ctx();
-    const payload = { ...profileBasePayload(profileId), secret_id: undefined };
+    const payload = { ...(await profileBasePayload(profileId)), secret_id: undefined };
     const notes = ['지금 선택된 API 키'];
     const profile = findProfile(profileId);
     const oai = c.chatCompletionSettings || {};
@@ -1909,7 +1951,7 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
                     messages,
                     s.maxOutputTokens,
                     { stream: false, signal: abortController?.signal ?? null, extractData: true, includePreset: s.includePreset },
-                    repair?.payload ?? profileBasePayload(profileId),
+                    repair?.payload ?? await profileBasePayload(profileId),
                 );
                 raw = typeof result === 'string' ? result : (result?.content ?? '');
             } else {
@@ -1931,11 +1973,13 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
             if (abortController?.signal.aborted) throw new Error('aborted');
             // A blocked request fails the same way every time; do not burn retries on it.
             if (isBlockError(err)) break;
-            if (profileId && isAuthError(err) && authStep < 2) {
+            // ST answers a Vertex service-account mix-up with a bare 400 ("Response not OK").
+            const vertexBare = profileId && /response not ok|status 400/i.test(errorDetail(err)) && profileSource(findProfile(profileId)) === 'vertexai';
+            if (profileId && (isAuthError(err) || vertexBare) && authStep < 2) {
                 authStep++;
                 if (authStep === 1) {
                     // First: same profile, but with the key (and proxy) that works in chat right now.
-                    repair = profileRepairPayload(profileId);
+                    repair = await profileRepairPayload(profileId);
                     console.warn(LOG_PREFIX, 'auth error through profile, retrying with', repair.notes.join(', '), err);
                     noticeAuthFallback(profileId, `${repair.notes.join('·')}(으)로 다시 보냈어요`);
                 } else {
@@ -2420,7 +2464,7 @@ function errorDetail(err) {
 
 function errorHint(detail) {
     const d = detail.toLowerCase();
-    if (/vertex ai express|service account json is required/.test(d)) return 'Vertex AI 인증 정보를 찾지 못했어요. API 연결 → Vertex AI에서 인증 방식(Express면 API 키, Full이면 서비스 계정 JSON)이 저장돼 있는지 확인해주세요. 이 버전부터는 요약 모델 프로필로 보낼 때도 지금 고른 인증 방식을 함께 보내요.';
+    if (/vertex ai express|service account json is (required|missing)/.test(d)) return 'Vertex AI 인증 정보를 찾지 못했어요. API 연결 → Vertex AI에서 인증 방식(Express면 API 키, Full이면 서비스 계정 JSON)이 저장돼 있는지 확인해주세요. 이 버전부터는 요약 모델 프로필로 보낼 때도 지금 고른 인증 방식을 함께 보내요.';
     if (d.includes('could not find profile')) return '선택한 연결 프로필을 찾지 못했어요. 설정 → 요약 탭에서 요약 모델을 다시 골라주세요.';
     if (d.includes('connection manager is not available')) return 'ST 확장 목록에서 Connection Manager를 켜주세요.';
     if (d.includes('not supported') || d.includes('has an api')) return '이 프로필의 API 종류는 쓸 수 없어요. Chat Completion이나 Text Completion 프로필을 골라주세요.';
