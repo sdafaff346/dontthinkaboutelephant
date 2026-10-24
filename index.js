@@ -3184,7 +3184,8 @@ function planBatches(start, end, { includeHidden = false } = {}) {
     let current = null;
     for (let i = start; i <= end; i++) {
         const msg = chat[i];
-        if (!msg || !(isSummarizable(msg) || (includeHidden && String(msg.mes ?? '').trim()))) continue;
+        // Messages this extension hid (kept hidden after a reset or a deleted memory) can be summarized again.
+        if (!msg || !(isSummarizable(msg) || (msg.extra?.lm_hidden && String(msg.mes ?? '').trim()) || (includeHidden && String(msg.mes ?? '').trim()))) continue;
         const line = messageLine(msg, i);
         const tokens = estTokens(line);
         if (current && (current.lines.length >= s.batchMessages || current.tokens + tokens > s.batchTokens)) {
@@ -5064,20 +5065,37 @@ async function runReset() {
     if (busy) return toastr.warning('작업 중입니다.');
     const memory = getMemory(false);
     if (!memory) return toastr.info('기억이 없습니다.');
-    const ok = await ctx().Popup.show.confirm('기억 초기화', '이 채팅의 모든 요약을 지우고 숨긴 원본 메시지를 다시 보이게 합니다. 작품/캐릭터 설정은 유지돼요.');
-    if (!ok) return;
-    const unhide = rangesToList(memory.hiddenRanges);
-    setHidden(unhide, false);
-    clearTags();
+    const c = ctx();
+    const hiddenCount = rangesToList(memory.hiddenRanges).length;
+    const SHOW = c.POPUP_RESULT.AFFIRMATIVE;
+    const KEEP = 2;
+    const body = document.createElement('div');
+    body.innerHTML = `<h3>기억 초기화</h3><p>이 채팅의 모든 요약을 지워요. 작품/캐릭터 설정은 유지돼요.</p>${hiddenCount ? `<p>요약하면서 숨긴 원본 메시지 ${hiddenCount.toLocaleString()}개를 어떻게 할까요?</p><p class="lm-hint"><b>숨긴 채로 두기</b>를 고르면 다시 압축할 때 그 메시지들을 그대로 요약하고, 그동안 AI에게는 보이지 않아요(다시 압축하기 전까지 AI는 지난 내용을 몰라요). <b>다시 보이기</b>를 고르면 긴 채팅은 다음 답변부터 원본이 한꺼번에 AI에게 가요.</p>` : ''}`;
+    const result = await new c.Popup(body, c.POPUP_TYPE.CONFIRM, '', {
+        okButton: hiddenCount ? '초기화 · 원본 다시 보이기' : '초기화',
+        cancelButton: '취소',
+        customButtons: hiddenCount ? [{ text: '초기화 · 숨긴 채로 두기', result: KEEP, classes: ['menu_button'] }] : null,
+        leftAlign: true,
+    }).show();
+    if (result !== SHOW && result !== KEEP) return;
+    const keepHidden = result === KEEP;
+    if (keepHidden) {
+        // Only forget which memory owned each message; they stay hidden and marked as ours.
+        for (const msg of c.chat) if (msg?.extra) delete msg.extra.lm_owner;
+    } else {
+        setHidden(rangesToList(memory.hiddenRanges), false);
+        clearTags();
+    }
     const frame = memory.frame;
     const fresh = emptyMemory();
     fresh.frame = frame;
-    ctx().chatMetadata[META_KEY] = fresh;
+    if (keepHidden) fresh.hiddenRanges = memory.hiddenRanges;
+    c.chatMetadata[META_KEY] = fresh;
     await purgeVectors();
     await persistChat();
     refreshInjection();
     updateStatus();
-    toastr.success('초기화했습니다.');
+    toastr.success(keepHidden ? '초기화했어요. 숨긴 원본은 그대로 두었어요. 압축(전체 압축)을 누르면 처음부터 다시 요약해요.' : '초기화했습니다.');
 }
 
 function syncAfter() {
@@ -6612,7 +6630,7 @@ function managerHtml(memory) {
       <div class="lm-field-text"><span class="lm-field-label">지금까지의 이야기</span><span class="lm-hint">오래된 챕터가 합쳐지면 여기에 쌓여요</span></div>
       <textarea class="text_pole" id="lm_saga" rows="${memory.saga.text ? 6 : 2}" placeholder="아직 비어 있어요.">${esc(memory.saga.text)}</textarea>
     </div>
-    ${memory.timeline.length ? bulkBar('timeline', `<label class="lm-restore" title="지운 기억에 들어 있던 메시지를 숨김 해제해서 다시 AI에게 보여줘요. 가장 최근 기억을 지우면 그 구간을 다시 압축할 수 있어요"><input type="checkbox" id="lm_restore_src"><span>원본 다시 보이기</span></label>`) : ''}
+    ${memory.timeline.length ? bulkBar('timeline', `<label class="lm-restore" title="기억을 지울 때 그 기억에 들어 있던 원본 메시지를 어떻게 할지 골라요. 가장 최근 기억을 지우면 어느 쪽이든 그 구간을 다시 압축할 수 있어요"><span>지운 기억의 원본</span><select id="lm_restore_mode" class="text_pole lm-quiet"><option value="hidden">숨긴 채로 두기</option><option value="show">다시 보이기</option></select></label>`) : ''}
     <div id="lm_timeline" class="lm-timeline lm-list">${memory.timeline.map(nodeCard).join('') || '<div class="lm-empty">아직 기억한 이야기가 없어요. 패널에서 압축을 누르면 여기에 차곡차곡 쌓여요.</div>'}</div>
   </section>
 
@@ -6767,13 +6785,13 @@ function collectManager(root, memory) {
 
 // Shows the messages of deleted memories to the AI again and pulls the cursor back
 // when the newest memories were removed, so that part can be compressed again.
-function restoreSources(memory, ids) {
+function restoreSources(memory, ids, { show = true } = {}) {
     const { chat } = ctx();
     const unhide = [];
     chat.forEach((msg, i) => {
         if (!msg?.extra?.lm_owner || !ids.has(msg.extra.lm_owner)) return;
         delete msg.extra.lm_owner;
-        if (msg.extra.lm_hidden) {
+        if (show && msg.extra.lm_hidden) {
             delete msg.extra.lm_hidden;
             unhide.push(i);
         }
@@ -7169,8 +7187,8 @@ async function saveManagerEditsImpl({ root, memory, chatId }) {
         edited.archive = edited.archive.filter(a => !removedIds.has(a.ownerId));
     }
     for (const key of ['frame', 'cast', 'saga', 'timeline', 'ledger', 'events', 'archive', 'wiki', 'hooks']) current[key] = edited[key];
-    if (removedIds.size && root.querySelector('#lm_restore_src')?.checked) {
-        restoreSources(current, removedIds);
+    if (removedIds.size) {
+        restoreSources(current, removedIds, { show: root.querySelector('#lm_restore_mode')?.value === 'show' });
     }
     await persistChat();
     refreshInjection();
