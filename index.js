@@ -335,6 +335,10 @@ function getMemory(create = true) {
     memory.ledger.scene = { ...base.ledger.scene, ...memory.ledger.scene };
     if (!Array.isArray(memory.ledger.entries)) memory.ledger.entries = [];
     if (!Array.isArray(memory.cast)) memory.cast = [];
+    if (memory.cast.length > 1 && memory.castDedupeAt !== memory.cast.length) {
+        try { dedupeCast(memory); } catch (err) { console.warn(LOG_PREFIX, 'cast dedupe failed', err); }
+        memory.castDedupeAt = memory.cast.length;
+    }
     if (!Array.isArray(memory.hooks)) memory.hooks = [];
     return memory;
 }
@@ -870,10 +874,73 @@ function normName(name) {
     return String(name || '').toLowerCase().replace(/\s+/g, '');
 }
 
+// Summaries written in English often romanize Korean names ("깡" -> "Kkang"), which used to
+// create a second cast entry for the same character. Names in different scripts are treated as
+// the same character when their romanized forms match loosely.
+const RR_INITIAL = ['g', 'kk', 'n', 'd', 'tt', 'r', 'm', 'b', 'pp', 's', 'ss', '', 'j', 'jj', 'ch', 'k', 't', 'p', 'h'];
+const RR_VOWEL = ['a', 'ae', 'ya', 'yae', 'eo', 'e', 'yeo', 'ye', 'o', 'wa', 'wae', 'oe', 'yo', 'u', 'wo', 'we', 'wi', 'yu', 'eu', 'ui', 'i'];
+const RR_FINAL = ['', 'k', 'k', 'k', 'n', 'n', 'n', 't', 'l', 'k', 'm', 'l', 'l', 'l', 'p', 'l', 'm', 'p', 'p', 't', 't', 'ng', 't', 't', 'k', 't', 'p', 't'];
+
+function romanizeHangul(text) {
+    let out = '';
+    for (const ch of String(text)) {
+        const c = ch.codePointAt(0) - 0xac00;
+        if (c < 0 || c > 11171) { out += ch; continue; }
+        out += RR_INITIAL[Math.floor(c / 588)] + RR_VOWEL[Math.floor((c % 588) / 28)] + RR_FINAL[c % 28];
+    }
+    return out;
+}
+
+const hasHangul = (t) => /[\uac00-\ud7a3]/.test(t);
+const isLatinName = (t) => /[a-z]/i.test(t) && !/[^\x00-\x7f\u00c0-\u024f]/.test(t);
+
+// Spelling-tolerant key. Romanizations of the same Korean name differ mostly in vowels
+// (정우: Jeongu / Jungwoo, 서연: Seoyeon / Suhyun) and in g/k, d/t, b/p, j/ch, r/l and doubled
+// letters, so the key is the consonant skeleton plus the number of vowel groups.
+function looseNameKey(name) {
+    const t = romanizeHangul(String(name || '').toLowerCase())
+        .replace(/[^a-z]/g, '')
+        .replace(/ng/g, 'N').replace(/ch/g, 'j').replace(/sh/g, 's')
+        .replace(/[wy]/g, '').replace(/[gk]/g, 'k').replace(/[dt]/g, 't').replace(/[bp]/g, 'p').replace(/r/g, 'l')
+        .replace(/(.)\1+/g, '$1');
+    const vowels = (t.match(/[aeiou]+/g) || []).length;
+    const skeleton = t.replace(/[aeiou]+/g, '');
+    return skeleton ? `${skeleton}:${vowels}` : '';
+}
+
+// "Kkang (깡)" and "깡/Kkang" carry both spellings.
+function nameParts(name) {
+    const raw = String(name || '').trim();
+    return [raw, ...raw.split(/[()（）/|,]/)].map(x => x.trim()).filter(Boolean);
+}
+
+function sameCharacterName(a, b) {
+    for (const x of nameParts(a)) {
+        for (const y of nameParts(b)) {
+            if (normName(x) && normName(x) === normName(y)) return true;
+            const cross = (hasHangul(x) && isLatinName(y)) || (hasHangul(y) && isLatinName(x));
+            if (!cross) continue;
+            const kx = looseNameKey(x);
+            if (kx && kx === looseNameKey(y)) return true;
+        }
+    }
+    return false;
+}
+
+function memberNames(m) {
+    return [m.name, ...(Array.isArray(m.aliases) ? m.aliases : [])];
+}
+
 function castFind(memory, name) {
     const n = normName(name);
     if (!n) return null;
-    return memory.cast.find(m => normName(m.name) === n) || null;
+    const exact = memory.cast.find(m => memberNames(m).some(x => normName(x) === n));
+    if (exact) return exact;
+    const loose = memory.cast.find(m => memberNames(m).some(x => sameCharacterName(x, name)));
+    if (loose) {
+        loose.aliases = [...new Set([...(loose.aliases || []), String(name).trim()])].slice(0, 8);
+    }
+    return loose || null;
 }
 
 function castGet(memory, name) {
@@ -883,6 +950,55 @@ function castGet(memory, name) {
         memory.cast.push(member);
     }
     return member;
+}
+
+// Which spelling to show: the one the chat itself uses most (speaker names and recent text).
+function preferredName(names) {
+    const { chat, name2 } = ctx();
+    const recent = (chat || []).slice(-150);
+    const score = (n) => {
+        const k = normName(n);
+        let sc = normName(name2) === k ? 1000 : 0;
+        for (const m of recent) {
+            if (normName(m?.name) === k) sc += 5;
+            else if (String(m?.mes || '').includes(n)) sc += 1;
+        }
+        return sc + (hasHangul(n) ? 0.5 : 0);
+    };
+    return [...names].sort((a, b) => score(b) - score(a))[0];
+}
+
+function mergeCastMembers(a, b) {
+    const keep = getSettings().voiceKeep;
+    const names = [...new Set([...memberNames(a), ...memberNames(b)].map(x => String(x).trim()).filter(Boolean))];
+    a.name = preferredName(names);
+    a.aliases = names.filter(x => x !== a.name).slice(0, 8);
+    if ((b.core || '').length > (a.core || '').length && !a.lockCore) a.core = b.core;
+    if (!a.lockSpeech && (b.lockSpeech || (b.speech || '').length > (a.speech || '').length)) a.speech = b.speech;
+    a.lockSpeech = !!(a.lockSpeech || b.lockSpeech);
+    const seen = new Set(a.quotes.map(q => normQuote(q.text)));
+    for (const q of b.quotes || []) if (!seen.has(normQuote(q.text))) { a.quotes.push(q); seen.add(normQuote(q.text)); }
+    const pinned = a.quotes.filter(q => q.pinned);
+    const rest = a.quotes.filter(q => !q.pinned).sort((x, y) => (x.at ?? -1) - (y.at ?? -1));
+    a.quotes = [...pinned, ...rest.slice(-Math.max(0, keep - pinned.length))];
+    a.growth = [...(a.growth || []), ...(b.growth || [])].sort((x, y) => (x.at ?? -1) - (y.at ?? -1)).slice(-8);
+}
+
+// Folds existing duplicates (same character under a Korean and a romanized name) into one.
+function dedupeCast(memory) {
+    let merged = 0;
+    for (let i = 0; i < memory.cast.length; i++) {
+        for (let j = memory.cast.length - 1; j > i; j--) {
+            const a = memory.cast[i];
+            const b = memory.cast[j];
+            if (memberNames(a).some(x => memberNames(b).some(y => sameCharacterName(x, y)))) {
+                mergeCastMembers(a, b);
+                memory.cast.splice(j, 1);
+                merged++;
+            }
+        }
+    }
+    return merged;
 }
 
 function normQuote(text) {
@@ -970,7 +1086,7 @@ function castText(memory, { quotes = true } = {}) {
     const members = (memory.cast || []).filter(m => m.name && (m.core || m.speech || m.quotes.length || m.growth.length));
     if (!members.length) return '';
     const present = new Set(presentNames(memory));
-    const isPresent = (m) => present.has(normName(m.name)) || [...present].some(p => p.includes(normName(m.name)));
+    const isPresent = (m) => memberNames(m).some(n => present.has(normName(n)) || [...present].some(p => p.includes(normName(n)) || sameCharacterName(p, n)));
     const ordered = [...members.filter(isPresent), ...members.filter(m => !isPresent(m))];
     return ordered.map(m => {
         const lines = [`${m.name}`];
@@ -2624,7 +2740,8 @@ async function extractCast(memory) {
 Reply with only:
 <cast>
 [{"name":"...","core":"...","speech":"...","quotes":["..."]}]
-</cast>`;
+</cast>
+Write each "name" exactly as the card writes it (same script and spelling; never romanize or translate it).`;
     const lore = await loreFor(cards.map(c => c.text).join('\n'), 1500);
     const user = [
         frameNotes && `<story_frame>\n${frameNotes}\n</story_frame>`,
@@ -2931,7 +3048,7 @@ function voicesFormat() {
 [JSON array, one object per AI-played character who speaks in this transcript; [] if none]
 </voices>
 
-Each object: {"name":"<character name as written in the transcript>","quotes":["<1-2 lines copied EXACTLY, character for character, from this character's own dialogue in the transcript, in the original language. Pick lines that best show their personal voice and manner, not plot exposition. Each under 120 characters>"],"speech":"<only if the transcript shows something new: the complete updated description of how this character talks, merging what <cast> already says: speech level and politeness, first-person pronoun, sentence endings, verbal tics, what they call the other characters>","growth":"<only if this transcript shows a lasting change in how this character behaves toward someone or talks, as a concrete change with its cause; otherwise omit>"}
+Each object: {"name":"<character name exactly as written in the transcript, or as already listed in <cast>; keep its original script and spelling even if you write everything else in another language (never romanize or translate a name)>","quotes":["<1-2 lines copied EXACTLY, character for character, from this character's own dialogue in the transcript, in the original language. Pick lines that best show their personal voice and manner, not plot exposition. Each under 120 characters>"],"speech":"<only if the transcript shows something new: the complete updated description of how this character talks, merging what <cast> already says: speech level and politeness, first-person pronoun, sentence endings, verbal tics, what they call the other characters>","growth":"<only if this transcript shows a lasting change in how this character behaves toward someone or talks, as a concrete change with its cause; otherwise omit>"}
 Do not include "${name1}" (the user's character). Never paraphrase or translate quotes; if no line fits, use an empty array.
 `;
 }
@@ -4579,9 +4696,9 @@ async function stepSaga(memory, force) {
     const protectedIds = new Set(episodes.slice(-s.protectRecent).map(n => n.id));
     for (const node of memory.timeline) {
         if (run.length >= 3) break;
-        if (node.pinned) { if (force) continue; break; }
-        if (node.tier === 'chapter' || (force && !protectedIds.has(node.id) && !node.starred)) run.push(node);
-        else if (force && node.starred && !protectedIds.has(node.id)) run.push(node);
+        // ★ episodes stay in the timeline like pinned ones (a chapter holding one is still folded).
+        if (node.pinned || (node.tier === 'episode' && node.starred)) { if (force) continue; break; }
+        if (node.tier === 'chapter' || (force && !protectedIds.has(node.id))) run.push(node);
         else break;
     }
     if (!run.length) return false;
@@ -6121,6 +6238,7 @@ function castCard(m) {
       ${deleteButton()}
     </span>
   </div>
+  ${m.aliases?.length ? `<p class="lm-hint lm-cast-alias">다른 이름: ${esc(m.aliases.join(', '))} (같은 인물로 합쳐 둔 이름이에요)</p>` : ''}
   <label class="lm-cast-field"><span class="lm-quiet-k">핵심 캐해</span><span class="lm-hint">요약이 절대 바꾸지 않는 기준이에요. AI가 늘 이 성격을 지켜요</span>
     <textarea class="text_pole lm-cast-core lm-quiet" rows="${m.core ? 4 : 2}" placeholder="성격, 가치관, 결점, 사람을 대하는 방식, 절대 하지 않을 일">${esc(m.core)}</textarea></label>
   <label class="lm-cast-field"><span class="lm-quiet-k">말투 · 호칭</span>
@@ -7156,18 +7274,22 @@ async function toggleStar(id) {
     else delete msg.extra.lm_star;
     const memory = getMemory(false);
     const owner = msg.extra.lm_owner;
-    if (on && memory && owner && owner !== SAGA_OWNER) {
-        // Already summarized: protect the memory that holds this message.
-        const node = memory.timeline.find(n => n.id === owner);
+    let note = '중요 장면으로 표시했어요. 요약할 때 자세히 남기고, 정리할 때 줄이지 않아요.';
+    if (on && memory && owner) {
+        const node = owner !== SAGA_OWNER ? memory.timeline.find(n => n.id === owner) : null;
         if (node) {
+            // Already summarized: protect the memory that holds this message from now on.
             node.starred = true;
             node.importance = Math.max(node.importance || 3, 4);
             refreshInjection();
+            note = '중요 장면으로 표시했어요. 이 장면이 든 요약은 이제부터 줄이지 않고, 회상할 때 원문을 먼저 꺼내 와요.';
+        } else {
+            note = '중요 장면으로 표시했어요. 이미 지금까지의 이야기로 합쳐진 장면이라 요약은 그대로지만, 회상할 때 이 원문을 먼저 꺼내 와요.';
         }
     }
     await persistChat();
     decorateMessage(id);
-    toastr.success(on ? '중요 장면으로 표시했어요. 요약할 때 자세히 남기고, 정리할 때 줄이지 않아요.' : '중요 표시를 지웠어요.', APP_NAME, { timeOut: 2500 });
+    toastr.success(on ? note : '중요 표시를 지웠어요.', APP_NAME, { timeOut: 4000 });
 }
 
 // ---------------------------------------------------------------- summary verification ("요약 검수")
