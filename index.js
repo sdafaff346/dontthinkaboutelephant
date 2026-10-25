@@ -158,6 +158,8 @@ const defaultSettings = Object.freeze({
     voiceQuotes: 3,
     voiceKeep: 12,
     checkCharacter: true,
+    checkContextTokens: 12000,
+    checkDoubleCheck: true,
     verifySummaries: 'off',
     hooksEnabled: true,
     autoIndex: true,
@@ -215,7 +217,81 @@ function emptyFrame() {
     return {
         mode: 'original', work: '', characters: '', au: '', notes: '',
         era: '', eraDetail: '', culture: '', cultureCustom: '', storyLanguage: '', nameStyle: '',
+        medium: 'auto',
     };
+}
+
+// How the story is told: face to face, through a messenger app, or by phone. Messenger and
+// phone stories need different summaries and checks (people are in different places, time
+// stamps and who-sent-what matter, nobody can see what the other is holding).
+const MEDIUMS = {
+    auto: '자동 감지',
+    inperson: '대면 롤플',
+    messenger: '메신저 · 문자 (톡)',
+    phone: '전화 · 통화',
+    mixed: '섞임 (대면 + 톡/전화)',
+};
+
+const MEDIUM_EN = {
+    messenger: 'Medium: this story is told mainly through text messages in a chat app (like KakaoTalk, LINE or SMS). The characters are usually in different places. Record who messaged whom and when (keep the in-story time stamps), what was said, asked, promised or left unanswered, read or unread messages and late replies, photos, stickers, voice notes or files sent, and calls made or missed. Where each person is and what they are doing is only what their own messages say; do not invent physical contact, shared locations or actions the messages do not state. Slang, abbreviations and emoticons (ㅋㅋ, ㅇㅇ, ㅠㅠ, emoji) are part of each character\'s voice. Text marked "(inner thought, not sent: ...)" and third-person prose about one character (for example after a "did not reply" marker) show that character\'s private side: the other person does not know it. "[phone screen] ..." is a screen the character sent (a call screen, a gift, a map). In the scene record, "present" means who is in the conversation and "place" is where each person says they are.',
+    phone: 'Medium: this story is told mainly through phone or video calls. The characters are in different places unless they say otherwise. Record who called whom and when, what was said and how the call ended, what could be heard in the background, and missed or declined calls. Only what can be heard (or seen on a video call) is known to the other person; do not invent shared locations or physical contact. In the scene record, "present" means who is on the call and "place" is where each person says they are.',
+    mixed: 'Medium: this story mixes in-person scenes with text messages and calls. Keep track of which parts happen in person and which by message or call (with in-story time stamps); a speaker marked "(messenger)" is texting and one marked "(in-person scene)" is in a face-to-face scene. People talking by message or call are not in the same place unless the story says so, and they only know what was said or shown to them. Text marked "(inner thought, not sent: ...)" is private and unknown to the other person. "[phone screen] ..." is a screen a character sent.',
+};
+
+const MEDIUM_CHECK_EN = {
+    messenger: 'This is a messenger story. Continuity means what each person has said in their messages, not physical details the other person cannot see. "(inner thought, not sent: ...)" is private: someone not knowing it is correct, and it is not something that was said. Report: time stamps going backwards with no reason, a character knowing something nobody messaged them, a character being somewhere or doing something that contradicts what they just messaged, mixing up who sent which message, or contradicting read/unread or no-reply states. Do not report physical details nobody could see.',
+    phone: 'This is a phone-call story. Continuity means what was said on the call. Report: a character knowing something nobody told them, contradicting where they said they are, mixing up who said what, or a call that had ended continuing with no explanation. Do not report visual details nobody could see (unless it is a video call).',
+    mixed: 'This story mixes in-person scenes with messages and calls. Do not treat people talking by message or call as being in the same place, and do not report physical details the other person could not see. "(inner thought, not sent: ...)" is private and was never said.',
+};
+
+const mediumCache = { key: '', value: 'inperson' };
+
+// Guesses the medium from the newest messages: time stamps, chat-app words and markup,
+// call words, and how long the messages are.
+function detectMedium() {
+    const { chat } = ctx();
+    const chatId = ctx().getCurrentChatId?.() || '';
+    const key = `${chatId}|${Math.floor((chat?.length || 0) / 25)}`;
+    if (mediumCache.key === key) return mediumCache.value;
+    const m35 = ctx().chatMetadata?.messenger35;
+    if (m35 && typeof m35 === 'object') {
+        const narrative = (m35.actions || []).some(a => a?.mode === 'narrative');
+        mediumCache.key = key;
+        mediumCache.value = narrative ? 'mixed' : 'messenger';
+        return mediumCache.value;
+    }
+    const msgs = (chat || []).filter(m => m && !m.extra?.isSmallSys && String(m.mes || '').trim()).slice(-40);
+    let msgr = 0;
+    let call = 0;
+    let len = 0;
+    const TIME = /(?:^|[\[\s(|])(?:오전|오후|AM|PM|am|pm)?\s?\d{1,2}:\d{2}(?:\s?(?:AM|PM|am|pm))?(?=$|[\]\s)|])/m;
+    const APP = /카톡|카카오톡|단톡|톡방|채팅방|메시지|문자|DM|디엠|읽음|안 ?읽|읽씹|안읽씹|답장|이모티콘|스티커|사진을 보냈|보낸 사진|📱|💬|class="[^"]*(?:kakao|talk|chat|msg|bubble|sms|messenger|imessage|line)/i;
+    const CALL = /전화|통화|📞|☎|부재중|수화기|발신|수신|영상통화|화상통화|\bcall(?:ing|ed)?\b|ringing/i;
+    for (const m of msgs) {
+        const raw = String(m.mes);
+        if (TIME.test(raw) || APP.test(raw)) msgr++;
+        if (CALL.test(raw)) call++;
+        len += stripMessage(raw).length;
+    }
+    const n = msgs.length || 1;
+    const avg = len / n;
+    let value = 'inperson';
+    if (msgs.length >= 4) {
+        const m = msgr / n;
+        const c = call / n;
+        if (m >= 0.45 && avg < 700) value = c >= 0.35 ? 'mixed' : 'messenger';
+        else if (c >= 0.45 && avg < 900) value = 'phone';
+        else if ((m >= 0.2 || c >= 0.2) && avg >= 300) value = 'mixed';
+    }
+    mediumCache.key = key;
+    mediumCache.value = value;
+    return value;
+}
+
+function storyMedium(frame) {
+    const set = frame?.medium || 'auto';
+    if (set !== 'auto') return set;
+    try { return detectMedium(); } catch { return 'inperson'; }
 }
 
 // World settings: when and where the story takes place, separate from the language it is written in.
@@ -608,15 +684,58 @@ function removeBlocks(text, tag) {
     return out + text.slice(pos);
 }
 
+// Chat-app layouts put each bubble in its own block and keep the sender and time in
+// attributes (<msg from="깡" time="15:12">). Dropping the tags glued everything into one line
+// and lost who said what, so keep line breaks, senders, times and image captions.
+const SENDER_ATTR = /\b(?:from|sender|speaker|name|who|author|nick|user|char)\s*=\s*["']([^"']{1,40})["']/i;
+const TIME_ATTR = /\b(?:time|ts|timestamp|date|at)\s*=\s*["']([^"']{1,30})["']/i;
+function htmlToLines(t) {
+    return t
+        .replace(/<img\b[^>]*?\balt\s*=\s*["']([^"']+)["'][^>]*>/gi, ' ($1) ')
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<([a-zA-Z][\w-]*)\b([^>]*)>/g, (m, tag, attrs) => {
+            const who = attrs.match(SENDER_ATTR)?.[1];
+            const when = attrs.match(TIME_ATTR)?.[1];
+            const lead = /^(div|p|li|tr|section|article|blockquote|h[1-6]|header|footer|ul|ol|table)$/i.test(tag) ? '\n' : ' ';
+            if (!who && !when) return lead;
+            return `\n${when ? `[${when}] ` : ''}${who ? `${who}: ` : ''}\u0001`;
+        })
+        .replace(/<\/(?:div|p|li|tr|section|article|blockquote|h[1-6]|header|footer|ul|ol|table)\s*>/gi, '\n')
+        .replace(/<\/?[a-zA-Z][^>]*>/g, ' ')
+        .replace(/[ \t]+/g, ' ')
+        .replace(/ *\n */g, '\n')
+        // The bubble text right after a sender/time prefix belongs on the same line.
+        .replace(/\u0001\s*/g, '');
+}
+
+// Messenger presets (e.g. Smartphone Messenger 3.5) put a character's private inner voice in
+// <messenger_thinking>, the chat time in a "chat-timestamp" element, and whole phone screens as
+// an HTML document in a code block. Keep what they mean instead of raw markup.
+function messengerMarkup(t) {
+    if (!t.includes('<')) return t;
+    return t
+        .replace(/<\s*messenger_thinking\s*>([\s\S]*?)<\s*\/\s*messenger_thinking\s*>/gi, (m, x) => `\n(inner thought, not sent: ${x.replace(/\s+/g, ' ').trim()})\n`)
+        .replace(/<([a-z][\w-]*)\b[^>]*\bclass\s*=\s*["'][^"']*(?:time|stamp)[^"']*["'][^>]*>\s*([^<]{1,24}?)\s*<\/\1\s*>/gi, (m, tag, x) => `\n[${x.trim()}]\n`)
+        .replace(/(`{3,})[^\n]*\n([\s\S]*?)\n?[ \t]*\1/g, (m, fence, doc) => {
+            if (!/<html\b|<!doctype/i.test(doc)) return m;
+            let body = removeBlocks(removeBlocks(doc, 'style'), 'script');
+            const title = (body.match(/<title[^>]*>([^<]{1,80})<\/title>/i) || [])[1];
+            body = removeBlocks(body, 'head').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+            const text = body.length > 300 ? `${body.slice(0, 300)}…` : body;
+            return `\n[phone screen${title ? `: ${title.trim()}` : ''}] ${text}\n`;
+        });
+}
+
 function stripMessage(text) {
     let t = String(text ?? '');
     // Embedded images and other blobs are megabytes of noise for a summary.
     if (t.includes(';base64,')) t = t.replace(/data:[a-z]+\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+/gi, '');
     t = removeBlocks(removeBlocks(t, 'think'), 'thinking');
+    t = messengerMarkup(t);
     if (getSettings().stripHtml) {
         t = removeBlocks(removeBlocks(t, 'style'), 'script');
         t = t.replace(/<!--[\s\S]*?-->/g, '');
-        t = t.replace(/<\/?[a-zA-Z][^>]*>/g, '');
+        if (t.includes('<')) t = htmlToLines(t);
     }
     t = t.replace(/\S{400,}/g, '');
     return t.replace(/\n{3,}/g, '\n\n').trim();
@@ -632,9 +751,33 @@ function isSummarizable(msg) {
 // messages are read again for every batch, recall and index pass. Cache per message object.
 const LINE_CACHE = new WeakMap();
 
+// The Smartphone Messenger extension records when a chat switches between messenger and
+// narrative (in-person scene) mode in chatMetadata.messenger35.actions, keyed "index:swipe:hash".
+const messengerModeCache = { key: '', marks: [] };
+function messengerModeAt(index) {
+    const meta = ctx().chatMetadata?.messenger35;
+    if (!meta || !Array.isArray(meta.actions)) return '';
+    const key = `${ctx().getCurrentChatId?.() || ''}|${meta.actions.length}`;
+    if (messengerModeCache.key !== key) {
+        messengerModeCache.key = key;
+        messengerModeCache.marks = meta.actions
+            .filter(a => a && (a.mode === 'messenger' || a.mode === 'narrative'))
+            .map(a => ({ at: Number(String(a.source || '').split(':')[0]), mode: a.mode }))
+            .filter(a => Number.isInteger(a.at))
+            .sort((a, b) => a.at - b.at);
+    }
+    let mode = 'messenger';
+    for (const m of messengerModeCache.marks) {
+        if (m.at < index) mode = m.mode;
+        else break;
+    }
+    return mode;
+}
+
 function messageLine(msg, index) {
     const { name1, name2 } = ctx();
-    const name = msg.name || (msg.is_user ? name1 : name2);
+    const mode = messengerModeAt(index);
+    const name = `${msg.name || (msg.is_user ? name1 : name2)}${mode ? (mode === 'narrative' ? ' (in-person scene)' : ' (messenger)') : ''}`;
     const strip = getSettings().stripHtml;
     let hit = LINE_CACHE.get(msg);
     if (!hit || hit.mes !== msg.mes || hit.strip !== strip) {
@@ -760,6 +903,8 @@ function frameText(frame) {
     }
     const world = worldText(f);
     if (world) parts.push(world);
+    const medium = MEDIUM_EN[storyMedium(f)];
+    if (medium) parts.push(medium);
     if (f.characters.trim()) parts.push(`Character notes (written by the user):\n${f.characters.trim()}`);
     if (f.notes.trim()) parts.push(`Additional notes (written by the user):\n${f.notes.trim()}`);
     return parts.join('\n\n');
@@ -1030,8 +1175,8 @@ function addQuotes(member, quotes, sourceText, at) {
 function linesBy(lines, name) {
     const n = normName(name);
     const own = lines.filter(line => {
-        const m = line.match(/^\[#\d+\]\s*([^:]+):/);
-        return m && normName(m[1]) === n;
+        const m = line.match(/^\[#\d+[^\]]*\]\s*([^:]+):/);
+        return m && normName(m[1].replace(/\s*\((?:messenger|in-person scene)\)$/, '')) === n;
     });
     return own.length ? own : lines;
 }
@@ -2213,7 +2358,7 @@ Reuse existing keys exactly when updating. Only emit operations for things that 
     check: {
         label: '모순 검사 기준',
         hint: '답변이 기억과 어긋나는지 볼 때의 기준. 경고 문구는 한국어로 나와요',
-        text: 'Report only real contradictions of established facts: dead or absent characters acting, wrong names, forgotten injuries, items in the wrong hands, characters knowing secrets they are not listed as knowing, broken promises with no explanation, wrong relationships or timeline. Also report small continuity slips against the recent messages: what someone is holding, eating or drinking, wearing, which hand or side, where people are standing or sitting, the time of day, unless the new reply shows the change happening. Do not report style, new information or plausible developments. Write each "problem" in Korean.',
+        text: 'Report only real contradictions of the latest established facts: dead or absent characters acting, wrong names, forgotten injuries, items in the wrong hands, characters knowing secrets they are not listed as knowing, broken promises with no explanation, wrong relationships or timeline. Also report small continuity slips against the recent messages: what someone is holding, eating or drinking, wearing, which hand or side, where people are standing or sitting, the time of day, unless the new reply or the recent messages show the change happening. Do not report style, new information, things the memory simply does not mention, or plausible developments. Write each "problem" in Korean.',
     },
     voiceCheck: {
         label: '캐해 검사 기준',
@@ -3180,6 +3325,10 @@ function applyLedgerOps(memory, ops, atIndex) {
 function planBatches(start, end, { includeHidden = false } = {}) {
     const s = getSettings();
     const { chat } = ctx();
+    // Chat-app and call messages are short, so allow more of them per request (the token
+    // limit still applies).
+    const medium = storyMedium(getMemory(false)?.frame);
+    const maxMessages = ['messenger', 'phone'].includes(medium) ? Math.min(150, s.batchMessages * 3) : s.batchMessages;
     const batches = [];
     let current = null;
     for (let i = start; i <= end; i++) {
@@ -3188,7 +3337,7 @@ function planBatches(start, end, { includeHidden = false } = {}) {
         if (!msg || !(isSummarizable(msg) || (msg.extra?.lm_hidden && String(msg.mes ?? '').trim()) || (includeHidden && String(msg.mes ?? '').trim()))) continue;
         const line = messageLine(msg, i);
         const tokens = estTokens(line);
-        if (current && (current.lines.length >= s.batchMessages || current.tokens + tokens > s.batchTokens)) {
+        if (current && (current.lines.length >= maxMessages || current.tokens + tokens > s.batchTokens)) {
             batches.push(current);
             current = null;
         }
@@ -3623,7 +3772,7 @@ const TURN_TIMEOUT_MS = 120000;
 const CHECK_SWIPE = 1002;
 const CHECK_CLEAR = 1003;
 
-function afterTurnSystemPrompt(doCheck, doState, doVoice = false) {
+function afterTurnSystemPrompt(doCheck, doState, doVoice = false, medium = 'inperson') {
     const parts = ['You review one new reply of an ongoing interactive story against its established memory.', ''];
     parts.push('Reply with only these blocks:');
     if (doCheck) {
@@ -3631,8 +3780,14 @@ function afterTurnSystemPrompt(doCheck, doState, doVoice = false) {
 <issues>
 [JSON array; [] if none]
 </issues>
-Each issue: {"quote":"<short quote from the new reply>","problem":"<what it contradicts and what the established fact is>"}
-${getPrompt('check')}${doVoice ? `
+Each issue: {"quote":"<short exact quote from the new reply>","evidence":"<short exact quote from the context that states the conflicting latest fact>","source":"<message number like #123, or memory, or cast>","problem":"<what it contradicts and what the established fact is>"}
+How to judge (these rules always apply):
+- The new reply continues directly from the last of the recent messages. Facts change as the story goes on, and the newest information wins: recent messages > established memory > related earlier moments. The memory only covers the story up to the message number it states and may be out of date.
+- Before reporting anything, look through ALL recent messages for something that changes, explains or sets up what the new reply says (a move, a new item, a healed wound, a changed relationship, a time skip). If you find it, it is not a contradiction.
+- Never report something only because the memory does not mention it, or because an older summary said otherwise while the recent messages moved on.
+- If part of the story after the memory is not shown to you, do not report a conflict with the memory that those messages could have changed.
+- When in doubt, do not report. A false warning is worse than a missed one.
+${MEDIUM_CHECK_EN[medium] ? `- ${MEDIUM_CHECK_EN[medium]}\n` : ''}${getPrompt('check')}${doVoice ? `
 ${getPrompt('voiceCheck')}` : ''}`);
     }
     if (doState) {
@@ -3671,17 +3826,29 @@ async function afterTurn(messageId) {
     const turnNotes = [];
     let turnLevel = 'ok';
     try {
-        // Recent turns, newest last, up to ~3500 tokens: small details such as what someone
-        // is holding or drinking usually live here, not in the summaries.
+        // Everything after the memory's cursor is what the chat model sees in full ("최근 원본"),
+        // and it is newer than the memory. Showing only the last few turns made the check judge
+        // the reply against an outdated summary, so show the whole gap (within a token budget),
+        // plus a few earlier turns when the gap is short.
         const recent = [];
         let recentTokens = 0;
-        for (let i = messageId - 1; i >= 0 && recent.length < 12; i--) {
-            if (!chat[i] || chat[i].is_system) continue;
+        let firstShown = messageId;
+        const gapStart = Math.max(0, memory.cursor + 1);
+        const budget = Math.max(2000, Number(s.checkContextTokens) || 12000);
+        let omittedFrom = -1;
+        for (let i = messageId - 1; i >= 0; i--) {
+            if (i < gapStart && recent.length >= 12) break;
+            if (!chat[i] || (chat[i].is_system && !chat[i].extra?.lm_hidden && i >= gapStart)) continue;
+            if (i < gapStart && chat[i].is_system) continue;
             const line = messageLine(chat[i], i);
             const t = estTokens(line);
-            if (recent.length && recentTokens + t > 3500) break;
+            if (recent.length && recentTokens + t > budget) {
+                if (i >= gapStart) omittedFrom = i;
+                break;
+            }
             recent.unshift(line);
             recentTokens += t;
+            firstShown = i;
         }
         const replyLine = messageLine(msg, messageId);
         const lore = await loreFor(`${recent.slice(-2).join('\n')}\n${replyLine}`, 1200);
@@ -3700,19 +3867,28 @@ async function afterTurn(messageId) {
         const user = [
             frameText(memory.frame) && `<story_frame>\n${frameText(memory.frame)}\n</story_frame>`,
             lore && `<lorebook_reference>\n${lore}\n</lorebook_reference>`,
-            `<established_memory>\n${scene ? `Current scene: ${scene}\n\n` : ''}${ledgerText(memory.ledger) || '(empty)'}\n\n${timelineText(memory, { lastN: 2 })}\n</established_memory>`,
-            past && `<related_earlier_moments>\n${past}\n</related_earlier_moments>`,
+            `<established_memory>\nSummary of the story up to message #${memory.cursor}. It is older than the recent messages below; where they differ, the recent messages are right.\n${scene ? `Last recorded scene: ${scene}\n\n` : ''}${ledgerText(memory.ledger) || '(empty)'}\n\n${timelineText(memory, { lastN: 2 })}\n</established_memory>`,
+            past && `<related_earlier_moments>\nOlder excerpts found by search, for background only. Anything later overrides them.\n${past}\n</related_earlier_moments>`,
             doVoice && `<cast>\n${castText(memory, { quotes: true })}\n</cast>`,
-            recent.length && `<recent_messages>\nThe turns right before the new reply. Small physical details here (what someone holds, wears, drinks, where they stand) count as established facts.\n${recent.join('\n\n')}\n</recent_messages>`,
+            recent.length && `<recent_messages>\nMessages #${firstShown}-#${messageId - 1}, right before the new reply, in order. ${omittedFrom >= 0 ? `Messages #${gapStart}-#${omittedFrom} (also after the memory) are not shown; do not report a conflict with the memory that they could explain. ` : 'Every message after the memory is included. '}These are the newest established facts, including small physical details (what someone holds, wears, drinks, where they stand).\n${recent.join('\n\n')}\n</recent_messages>`,
             `<new_reply>\n${replyLine}\n</new_reply>`,
         ].filter(Boolean).join('\n\n');
-        const out = await withTimeout(callModel(afterTurnSystemPrompt(doCheck, doState, doVoice), user, { retries: 0 }), TURN_TIMEOUT_MS);
+        const out = await withTimeout(callModel(afterTurnSystemPrompt(doCheck, doState, doVoice, storyMedium(memory.frame)), user, { retries: 0 }), TURN_TIMEOUT_MS);
         if (!stillSameChat(chatId) || ctx().chat[messageId] !== msg) return;
         if (doCheck) {
-            const issues = (parseJsonLenient(extractTag(out, 'issues') || '') || [])
+            let issues = (parseJsonLenient(extractTag(out, 'issues') || '') || [])
                 .filter(i => i && typeof i === 'object' && String(i.problem || '').trim())
                 .slice(0, 6)
-                .map(i => ({ quote: String(i.quote || '').slice(0, 200), problem: String(i.problem).slice(0, 400) }));
+                .map(i => ({ quote: String(i.quote || '').slice(0, 200), evidence: String(i.evidence || '').slice(0, 300), source: String(i.source || '').slice(0, 40), problem: String(i.problem).slice(0, 400) }));
+            issues = filterIssues(issues, user, replyLine, memory.cursor);
+            if (issues.length && s.checkDoubleCheck) {
+                try {
+                    issues = await doubleCheckIssues(issues, user);
+                    if (!stillSameChat(chatId) || ctx().chat[messageId] !== msg) return;
+                } catch (err) {
+                    console.warn(LOG_PREFIX, 'double check skipped', err);
+                }
+            }
             msg.extra = msg.extra || {};
             msg.extra.lm_check = { issues, at: Date.now(), swipe: msg.swipe_id ?? 0 };
             decorateMessage(messageId);
@@ -3753,6 +3929,48 @@ async function afterTurn(messageId) {
     }
 }
 
+// Drops issues the model could not back up: an "evidence" quote that is not in the context,
+// or a quote that is not in the reply. Model-invented facts were a common cause of false alarms.
+function filterIssues(issues, context, reply, cursor) {
+    const ctxNorm = normQuote(context);
+    const replyNorm = normQuote(reply);
+    const found = (text, hay) => {
+        const n = normQuote(text);
+        if (n.length < 4) return false;
+        if (hay.includes(n)) return true;
+        // Allow quotes shortened with an ellipsis: every longer piece must be present.
+        const pieces = String(text).split(/\.{3}|…/).map(normQuote).filter(x => x.length >= 4);
+        return pieces.length > 1 && pieces.every(x => hay.includes(x));
+    };
+    return issues.filter(i => {
+        if (i.quote && !found(i.quote, replyNorm)) return false;
+        if (i.problem.startsWith('[캐해]')) return true;
+        if (!i.evidence) return false;
+        return found(i.evidence, ctxNorm);
+    });
+}
+
+// Second opinion on flagged issues only: is each one still a contradiction once the recent
+// messages are taken into account?
+async function doubleCheckIssues(issues, context) {
+    const system = `You double-check warnings from a continuity checker for an ongoing interactive story. The checker often makes these mistakes: it trusts an older summary over newer messages, it misses that the recent messages already changed or explained something, it treats new information as a contradiction, or it misreads who did what.
+
+For each numbered warning, look again at the recent messages (newest information wins) and decide whether the new reply really contradicts the latest established state. Keep a warning only if you are sure.
+
+Reply with only:
+<verdicts>
+[{"i":<warning number>,"keep":true|false,"why":"<one short reason>"}]
+</verdicts>`;
+    const list = issues.map((x, i) => `${i}. reply says: "${x.quote}" | conflicts with: "${x.evidence}" (${x.source || '?'}) | ${x.problem}`).join('\n');
+    const out = await withTimeout(callModel(system, `${context}\n\n<warnings>\n${list}\n</warnings>`, { retries: 0, expectTag: 'verdicts' }), TURN_TIMEOUT_MS);
+    const verdicts = parseJsonLenient(extractTag(out, 'verdicts') || '');
+    if (!Array.isArray(verdicts)) return issues;
+    const keep = new Set(verdicts.filter(v => v && (v.keep === true || v.keep === 'true')).map(v => Number(v.i)));
+    const judged = new Set(verdicts.map(v => Number(v?.i)));
+    // A warning the second pass did not mention at all stays.
+    return issues.filter((_, i) => keep.has(i) || !judged.has(i));
+}
+
 async function showCheckIssues(messageId) {
     const c = ctx();
     const msg = c.chat[messageId];
@@ -3763,6 +3981,7 @@ async function showCheckIssues(messageId) {
 <article class="lm-result lm-issue">
   ${i.quote ? `<p class="lm-quote">“${esc(i.quote)}”</p>` : ''}
   <p>${esc(i.problem)}</p>
+  ${i.evidence ? `<p class="lm-hint">근거: “${esc(i.evidence)}”${i.source ? ` (${esc(i.source === 'memory' ? '기억' : i.source === 'cast' ? '캐해' : i.source)})` : ''}</p>` : ''}
 </article>`).join('');
     const wrap = document.createElement('div');
     wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>기억과 다른 부분</h3></div><p class="lm-hint lm-pane-intro">코끼리가 기억과 맞지 않는다고 본 곳이에요. 맞지 않으면 새로 생성하거나, 괜찮으면 경고를 지우세요.</p><div class="lm-results">${list}</div></div>`;
@@ -3788,7 +4007,7 @@ function decorateMessage(id) {
     const extra = el.querySelector('.extraMesButtons');
     if (extra && !extra.querySelector('.lm-mes-pin')) {
         const view = document.createElement('div');
-        view.className = 'mes_button lm-mes-view fa-solid fa-book-open';
+        view.className = 'mes_button lm-mes-view fa-solid fa-layer-group';
         view.title = '코끼리: 이 메시지가 들어간 기억 보기';
         view.tabIndex = 0;
         const pin = document.createElement('div');
@@ -5419,9 +5638,11 @@ function settingsHtml() {
           ${numberRow('autoCompressAt', '자동 압축 기준', 5, 100000, '미요약 메시지가 이만큼 쌓이면')}
           ${checkRow('checkContradictions', '모순 검사', '답변이 기억과 다르면 메시지 이름 옆에 ⚠ 표시를 해요')}
           ${checkRow('checkCharacter', '캐해 검사', '모순 검사를 할 때 말투·호칭·성격이 캐해와 어긋나는지도 같이 봐요 (추가 호출 없음)')}
+          ${checkRow('checkDoubleCheck', '모순 한 번 더 확인', '모순을 찾았을 때만, 최근 대화로 바뀐 내용인지 한 번 더 따져서 잘못된 경고를 걸러요 (그때만 1번 더 호출)')}
+          ${advanced(`${numberRow('checkContextTokens', '검사에 보여줄 최근 대화', 2000, 200000, '아직 요약하지 않은 최근 원본을 이 토큰만큼 검사 모델에게 보여줘요. 최근 원본 유지 개수만큼 다 들어가야 정확해요')}`)}
           ${checkRow('liveStateUpdate', '현재 상태 실시간 갱신', '시간·장소·함께 있는 인물·약속을 답변마다 기록부에 반영해요')}
           ${checkRow('autoForgetDeleted', '메시지를 지우면 그 기억도 지우기', '일부만 지우면 "다시 요약" 표시를 해요')}
-          <p class="lm-hint lm-note">모순 검사와 실시간 갱신은 둘 다 켜도 답변마다 요약 모델을 1번만 불러요. 요약 모델 프로필을 따로 지정하면 대화와 겹치지 않아요.</p>
+          <p class="lm-hint lm-note">모순 검사와 실시간 갱신은 둘 다 켜도 답변마다 요약 모델을 1번만 불러요. 모순을 찾았고 '한 번 더 확인'이 켜져 있을 때만 1번 더 불러요. 요약 모델 프로필을 따로 지정하면 대화와 겹치지 않아요.</p>
           ${advanced(`${numberRow('remindAt', '압축 알림 기준', 0, 100000, '미요약이 이만큼 쌓이면 알려줘요. 0이면 끔')}`)}
           ${resetFoot()}
         </section>
@@ -6567,6 +6788,10 @@ function managerHtml(memory) {
     </div>
     <h4 class="lm-subhead">세계와 언어</h4>
     <div class="lm-card-group lm-world">
+      <div class="lm-field lm-field-stack lm-span-2">
+        <div class="lm-field-text"><span class="lm-field-label">대화 방식</span><span class="lm-hint">톡·문자·전화로 진행하는 채팅이면 요약과 검사를 그에 맞게 해요. 자동이면 최근 메시지로 알아봐요 (지금: ${esc(MEDIUMS[storyMedium({ medium: 'auto' })])})</span></div>
+        <select class="text_pole" id="lm_f_medium">${selectOptions(MEDIUMS, f.medium || 'auto')}</select>
+      </div>
       <div class="lm-field lm-field-stack">
         <div class="lm-field-text"><span class="lm-field-label">시대</span></div>
         <select class="text_pole" id="lm_f_era">${selectOptions(ERAS, f.era)}</select>
@@ -6696,6 +6921,7 @@ function collectManager(root, memory) {
         cultureCustom: root.querySelector('#lm_f_culture_custom').value,
         storyLanguage: root.querySelector('#lm_f_lang').value,
         nameStyle: root.querySelector('#lm_f_names').value,
+        medium: root.querySelector('#lm_f_medium')?.value || 'auto',
     };
     out.saga.text = root.querySelector('#lm_saga').value;
     const byId = new Map(memory.timeline.map(n => [n.id, n]));
