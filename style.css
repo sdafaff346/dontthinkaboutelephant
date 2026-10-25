@@ -1859,3 +1859,4 @@
 .lm-root textarea, .lm-root input[type="text"], .lm-root input[type="number"], .lm-root select { max-width: 100%; box-sizing: border-box; }
 .lm-root .lm-actions-inline .lm-btn { max-width: 100%; min-width: 0; white-space: normal; text-align: center; line-height: 1.35; padding-top: 6px; padding-bottom: 6px; }
 .lm-root .lm-btn > span { min-width: 0; overflow-wrap: anywhere; }
+.lm-check-badge.lm-check-muted { color: var(--SmartThemeQuoteColor, #8A8FA8); opacity: 0.55; animation: none; }

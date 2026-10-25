@@ -3880,17 +3880,25 @@ async function afterTurn(messageId) {
                 .filter(i => i && typeof i === 'object' && String(i.problem || '').trim())
                 .slice(0, 6)
                 .map(i => ({ quote: String(i.quote || '').slice(0, 200), evidence: String(i.evidence || '').slice(0, 300), source: String(i.source || '').slice(0, 40), problem: String(i.problem).slice(0, 400) }));
-            issues = filterIssues(issues, user, replyLine, memory.cursor);
+            const found = issues.length;
+            const { sure, unsure } = filterIssues(issues, user, replyLine);
+            let filtered = [];
+            let rechecked = false;
+            issues = [...sure, ...unsure];
             if (issues.length && s.checkDoubleCheck) {
                 try {
-                    issues = await doubleCheckIssues(issues, user);
+                    const res = await doubleCheckIssues(issues, user);
                     if (!stillSameChat(chatId) || ctx().chat[messageId] !== msg) return;
+                    issues = res.kept;
+                    filtered = res.dropped;
+                    rechecked = true;
                 } catch (err) {
                     console.warn(LOG_PREFIX, 'double check skipped', err);
                 }
             }
+            const stats = { found, unverified: unsure.length, dropped: filtered.length, rechecked };
             msg.extra = msg.extra || {};
-            msg.extra.lm_check = { issues, at: Date.now(), swipe: msg.swipe_id ?? 0 };
+            msg.extra.lm_check = { issues, filtered, stats, at: Date.now(), swipe: msg.swipe_id ?? 0 };
             decorateMessage(messageId);
             ctx().saveMetadataDebounced ? ctx().saveMetadataDebounced() : await persistChat();
             if (issues.length) toastr.warning(`기억과 다른 부분 ${issues.length}개를 찾았어요. 메시지 이름 옆 ⚠ 표시를 눌러 확인하세요.`, APP_NAME);
@@ -3898,6 +3906,14 @@ async function afterTurn(messageId) {
             turnNotes.push(issues.length
                 ? `#${messageId} 모순 ${issues.length - ooc}개${ooc ? ` · 캐해 어긋남 ${ooc}개` : ''}`
                 : `#${messageId} 모순 없음${doVoice ? ' · 캐해 유지' : ''}`);
+            // How the warnings were narrowed down, so users can tell if the check is too strict or too loose.
+            if (found) {
+                const steps = [
+                    stats.unverified ? `근거 확인 안 됨 ${stats.unverified}개` : '',
+                    rechecked ? `재확인에서 ${stats.dropped}개 걸러짐` : (s.checkDoubleCheck ? '재확인 실패(걸러내지 않음)' : '재확인 꺼짐'),
+                ].filter(Boolean).join(' · ');
+                turnNotes.push(`찾은 경고 ${found}개 → ${steps} → 최종 ${issues.length}개`);
+            }
             if (issues.length) turnLevel = 'warn';
         }
         if (doState) {
@@ -3931,7 +3947,7 @@ async function afterTurn(messageId) {
 
 // Drops issues the model could not back up: an "evidence" quote that is not in the context,
 // or a quote that is not in the reply. Model-invented facts were a common cause of false alarms.
-function filterIssues(issues, context, reply, cursor) {
+function filterIssues(issues, context, reply) {
     const ctxNorm = normQuote(context);
     const replyNorm = normQuote(reply);
     const found = (text, hay) => {
@@ -3942,12 +3958,18 @@ function filterIssues(issues, context, reply, cursor) {
         const pieces = String(text).split(/\.{3}|…/).map(normQuote).filter(x => x.length >= 4);
         return pieces.length > 1 && pieces.every(x => hay.includes(x));
     };
-    return issues.filter(i => {
-        if (i.quote && !found(i.quote, replyNorm)) return false;
-        if (i.problem.startsWith('[캐해]')) return true;
-        if (!i.evidence) return false;
-        return found(i.evidence, ctxNorm);
-    });
+    // Unverified warnings are not thrown away: models often paraphrase or skip the evidence even
+    // when the contradiction is real. They go to the second check, which must confirm them.
+    const sure = [];
+    const unsure = [];
+    for (const i of issues) {
+        let why = '';
+        if (i.quote && !found(i.quote, replyNorm)) why = 'quote';
+        else if (!i.problem.startsWith('[캐해]') && (!i.evidence || !found(i.evidence, ctxNorm))) why = 'evidence';
+        if (why) unsure.push({ ...i, unverified: why });
+        else sure.push(i);
+    }
+    return { sure, unsure };
 }
 
 // Second opinion on flagged issues only: is each one still a contradiction once the recent
@@ -3961,30 +3983,46 @@ Reply with only:
 <verdicts>
 [{"i":<warning number>,"keep":true|false,"why":"<one short reason>"}]
 </verdicts>`;
-    const list = issues.map((x, i) => `${i}. reply says: "${x.quote}" | conflicts with: "${x.evidence}" (${x.source || '?'}) | ${x.problem}`).join('\n');
+    const list = issues.map((x, i) => `${i}. reply says: "${x.quote}" | conflicts with: "${x.evidence || '(no evidence given)'}" (${x.source || '?'}) | ${x.problem}${x.unverified ? ` [the checker's ${x.unverified === 'quote' ? 'quote from the reply' : 'evidence'} was not found word for word; check the text yourself and keep it only if the contradiction is clearly real]` : ''}`).join('\n');
     const out = await withTimeout(callModel(system, `${context}\n\n<warnings>\n${list}\n</warnings>`, { retries: 0, expectTag: 'verdicts' }), TURN_TIMEOUT_MS);
     const verdicts = parseJsonLenient(extractTag(out, 'verdicts') || '');
-    if (!Array.isArray(verdicts)) return issues;
-    const keep = new Set(verdicts.filter(v => v && (v.keep === true || v.keep === 'true')).map(v => Number(v.i)));
-    const judged = new Set(verdicts.map(v => Number(v?.i)));
-    // A warning the second pass did not mention at all stays.
-    return issues.filter((_, i) => keep.has(i) || !judged.has(i));
+    if (!Array.isArray(verdicts)) throw new Error('재확인 응답을 해석하지 못했어요');
+    const byIndex = new Map(verdicts.filter(v => v && Number.isInteger(Number(v.i))).map(v => [Number(v.i), v]));
+    const kept = [];
+    const dropped = [];
+    issues.forEach((x, i) => {
+        const v = byIndex.get(i);
+        const yes = v && (v.keep === true || v.keep === 'true');
+        // A verified warning the second pass did not mention stays; an unverified one needs a clear yes.
+        if (yes || (!v && !x.unverified)) kept.push(x);
+        else dropped.push({ ...x, why: String(v?.why || (v ? '' : '재확인에서 언급 없음')).slice(0, 200) });
+    });
+    return { kept, dropped };
 }
 
 async function showCheckIssues(messageId) {
     const c = ctx();
     const msg = c.chat[messageId];
-    const issues = msg?.extra?.lm_check?.issues || [];
-    if (!issues.length) return;
+    const check = msg?.extra?.lm_check || {};
+    const issues = check.issues || [];
+    const filtered = check.filtered || [];
+    if (!issues.length && !filtered.length) return;
     const isLast = messageId === c.chat.length - 1;
-    const list = issues.map(i => `
+    const sourceLabel = (x) => (x === 'memory' ? '기억' : x === 'cast' ? '캐해' : x);
+    const card = (i, extra = '') => `
 <article class="lm-result lm-issue">
   ${i.quote ? `<p class="lm-quote">“${esc(i.quote)}”</p>` : ''}
   <p>${esc(i.problem)}</p>
-  ${i.evidence ? `<p class="lm-hint">근거: “${esc(i.evidence)}”${i.source ? ` (${esc(i.source === 'memory' ? '기억' : i.source === 'cast' ? '캐해' : i.source)})` : ''}</p>` : ''}
-</article>`).join('');
+  ${i.evidence ? `<p class="lm-hint">근거: “${esc(i.evidence)}”${i.source ? ` (${esc(sourceLabel(i.source))})` : ''}</p>` : ''}
+  ${i.unverified ? `<p class="lm-hint">${i.unverified === 'quote' ? '답변에서 이 문장을 그대로 찾지 못했어요.' : '근거 문장을 원문에서 그대로 찾지 못했어요.'}</p>` : ''}
+  ${extra}
+</article>`;
+    const list = issues.map(i => card(i)).join('') || '<p class="lm-hint">남은 경고는 없어요.</p>';
+    const st = check.stats;
+    const summary = st?.found ? `<p class="lm-hint">점검 모델이 찾은 경고 ${st.found}개 중 ${st.unverified ? `근거를 그대로 찾지 못한 것 ${st.unverified}개, ` : ''}${st.rechecked ? `재확인에서 걸러진 것 ${st.dropped}개` : '재확인은 하지 않았어요'} → 남은 경고 ${issues.length}개</p>` : '';
+    const dropped = filtered.length ? `<details class="lm-more"><summary>걸러진 경고 ${filtered.length}개 보기</summary><div class="lm-results">${filtered.map(i => card(i, i.why ? `<p class="lm-hint">걸러진 이유: ${esc(i.why)}</p>` : '')).join('')}</div><p class="lm-hint">걸러진 것 중 진짜 모순이 있었다면 알려 주세요. 점검 기준을 맞추는 데 도움이 돼요.</p></details>` : '';
     const wrap = document.createElement('div');
-    wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>기억과 다른 부분</h3></div><p class="lm-hint lm-pane-intro">코끼리가 기억과 맞지 않는다고 본 곳이에요. 맞지 않으면 새로 생성하거나, 괜찮으면 경고를 지우세요.</p><div class="lm-results">${list}</div></div>`;
+    wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>기억과 다른 부분</h3></div><p class="lm-hint lm-pane-intro">코끼리가 기억과 맞지 않는다고 본 곳이에요. 맞지 않으면 새로 생성하거나, 괜찮으면 경고를 지우세요.</p>${summary}<div class="lm-results">${list}</div>${dropped}</div>`;
     applyThemeMode(wrap.firstElementChild);
     const buttons = [{ text: '경고 지우기', result: CHECK_CLEAR, icon: 'fa-eraser' }];
     if (isLast) buttons.unshift({ text: '새로 생성', result: CHECK_SWIPE, icon: 'fa-rotate-right' });
@@ -4042,15 +4080,21 @@ function decorateMessage(id) {
     const view = el.querySelector('.lm-mes-view');
     if (view) view.style.display = msg.extra?.lm_owner && msg.extra.lm_owner !== SAGA_OWNER ? '' : 'none';
     const check = msg.extra?.lm_check;
-    const show = !!check?.issues?.length && (check.swipe ?? 0) === (msg.swipe_id ?? 0);
+    const sameSwipe = (check?.swipe ?? 0) === (msg.swipe_id ?? 0);
+    const warn = sameSwipe && !!check?.issues?.length;
+    const quiet = sameSwipe && !warn && !!check?.filtered?.length;
     let badge = el.querySelector('.lm-check-badge');
-    if (show && !badge) {
+    if (badge && ((warn && badge.classList.contains('lm-check-muted')) || (quiet && !badge.classList.contains('lm-check-muted')))) {
+        badge.remove();
+        badge = null;
+    }
+    if ((warn || quiet) && !badge) {
         badge = document.createElement('span');
-        badge.className = 'lm-check-badge fa-solid fa-triangle-exclamation';
-        badge.title = `코끼리: 기억과 다른 부분 ${check.issues.length}개`;
+        badge.className = warn ? 'lm-check-badge fa-solid fa-triangle-exclamation' : 'lm-check-badge lm-check-muted fa-solid fa-circle-info';
+        badge.title = warn ? `코끼리: 기억과 다른 부분 ${check.issues.length}개` : `코끼리: 경고 ${check.filtered.length}개를 찾았다가 재확인에서 걸렀어요 (눌러서 보기)`;
         badge.tabIndex = 0;
         el.querySelector('.name_text')?.after(badge);
-    } else if (!show && badge) {
+    } else if (!warn && !quiet && badge) {
         badge.remove();
     }
 }
