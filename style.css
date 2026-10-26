@@ -1906,3 +1906,12 @@
 .lm-root.lm-searching .lm-pane-foot,
 .lm-root.lm-searching .lm-pane-intro { display: none !important; }
 .lm-root.lm-searching .lm-tabs .lm-tab.active { background: transparent; box-shadow: none; }
+
+/* v1.9.37: QR message sorter */
+.lm-qrsort-list { display: flex; flex-direction: column; gap: 6px; }
+.lm-qrsort-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--lm-line); border-radius: 10px; background: var(--lm-card); }
+.lm-qrsort-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+.lm-qrsort-text b { font-size: 13px; }
+.lm-qrsort-text em { font-style: normal; font-size: 11px; color: var(--lm-accent-ink); }
+.lm-qrsort-text span { color: var(--lm-muted); overflow-wrap: anywhere; }
+.lm-root .lm-qrsort-row .lm-select { flex: 0 0 auto; max-width: 110px; }

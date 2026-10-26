@@ -149,6 +149,7 @@ const defaultSettings = Object.freeze({
     checkContradictions: false,
     liveStateUpdate: false,
     liveStateUndo: true,
+    qrMessages: 'aside',
     queryExpansion: false,
     expansionTimeoutMs: 15000,
     autoBackupEvery: 10,
@@ -742,8 +743,120 @@ function stripMessage(text) {
     return t.replace(/\n{3,}/g, '\n\n').trim();
 }
 
+// Quick Reply scripts post their results with slash commands: /comment (a note, type 'comment'),
+// /sys (narrator) and /sendas. SillyTavern marks all of these with extra.model 'slash command'.
+// Comments are never story; the other two can be either, so that is the user's choice.
+const QR_MODES = {
+    aside: '코멘트와 번외편만 빼기',
+    all: 'QR·슬래시 명령으로 넣은 메시지 전부 빼기',
+    keep: '빼지 않기',
+};
+
+// Many QRs "pause the role-play" and generate a side piece (a balance game, a time-loop what-if,
+// an ideal-type survey) that is posted as the character with /sendas, or sent with /send and
+// answered with /trigger. Those are not part of the story. They are recognised by the
+// instruction that produced them and tagged extra.lm_qr = 'aside' ('story' for QRs that just
+// move the scene along, like "finish the scene").
+const ASIDE_RE = /\b(pause|stop|halt|suspend|interrupt)\b[^.\n]{0,40}\b(role-?play|rp|scenario|story|roleplay)\b|\bpause\s+rp\b|set aside all prior prompts|(롤플|역할극|RP)[^\n]{0,12}(멈|중단|정지|잠깐)/i;
+
+function isQrMessage(msg) {
+    const extra = msg?.extra;
+    if (!extra) return false;
+    const mode = getSettings().qrMessages === 'comment' ? 'aside' : (getSettings().qrMessages || 'aside');
+    if (mode === 'keep') return false;
+    if (extra.type === 'comment' || extra.lm_qr === 'aside') return true;
+    return mode === 'all' && (extra.type === 'narrator' || extra.model === 'slash command');
+}
+
+let lastQuietPrompt = null;
+function onGenerationStarted(type, params) {
+    if (type === 'quiet' && params?.quiet_prompt) lastQuietPrompt = { text: String(params.quiet_prompt), at: Date.now() };
+}
+
+function previousUserMessage(id) {
+    const { chat } = ctx();
+    for (let i = id - 1; i >= 0 && i >= id - 3; i--) {
+        if (chat[i]?.is_user) return { msg: chat[i], i };
+    }
+    return null;
+}
+
+// Tags a new message as a QR side piece or a story continuation. Returns true if it is a side piece.
+function tagQrMessage(id, type) {
+    const msg = ctx().chat[id];
+    if (!msg || msg.is_user) return false;
+    msg.extra = msg.extra || {};
+    if (msg.extra.lm_qr) return msg.extra.lm_qr === 'aside';
+    let tag = '';
+    if (msg.extra.model === 'slash command' && type === 'command') {
+        const recent = lastQuietPrompt && Date.now() - lastQuietPrompt.at < 30 * 60 * 1000 ? lastQuietPrompt : null;
+        if (recent) tag = ASIDE_RE.test(recent.text) ? 'aside' : 'story';
+        lastQuietPrompt = null;
+    } else {
+        // "/send <System> Pause the RP ..." then "/trigger": the user line itself is the instruction.
+        const prev = previousUserMessage(id);
+        if (prev && ASIDE_RE.test(String(prev.msg.mes || '')) && /<\s*system\s*>|\[system|\(ooc|ooc:/i.test(String(prev.msg.mes || ''))) {
+            tag = 'aside';
+            prev.msg.extra = prev.msg.extra || {};
+            prev.msg.extra.lm_qr = 'aside';
+        }
+    }
+    if (!tag) return false;
+    msg.extra.lm_qr = tag;
+    setTimeout(() => { persistChat().catch(() => {}); }, 400);
+    if (tag === 'aside') logActivity('check', `#${id}은 롤플을 멈추고 만든 QR 번외편이라 기억에 넣지 않아요`);
+    return tag === 'aside';
+}
+
+// Lets users sort QR messages that were posted before tagging existed.
+async function openQrSorter() {
+    const c = ctx();
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    const rows = [];
+    c.chat.forEach((m, i) => {
+        if (!m || m.extra?.type === 'comment') return;
+        const fromCommand = m.extra?.model === 'slash command';
+        const userAside = m.is_user && ASIDE_RE.test(String(m.mes || ''));
+        if (!fromCommand && !userAside && !m.extra?.lm_qr) return;
+        const guess = m.extra?.lm_qr || 'aside';
+        rows.push({ i, m, guess, known: !!m.extra?.lm_qr });
+    });
+    if (!rows.length) return toastr.info('이 채팅에는 QR·슬래시 명령으로 넣은 메시지가 없어요.', APP_NAME);
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `<div class="lm-root lm-manager lm-qrsort"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>QR 메시지 분류</h3></div>
+  <p class="lm-hint lm-pane-intro">QR이나 슬래시 명령으로 들어온 메시지예요. 롤플을 멈추고 만든 번외편(밸런스 게임, 타임루프, 설문 같은 것)은 <b>번외편</b>, 이야기를 이어 가는 것은 <b>이야기</b>로 두세요. 번외편은 요약·회상·답변 점검에서 빠져요. 이미 요약에 들어간 번외편은 그 기억에 '다시 요약' 표시가 붙어요.</p>
+  <div class="lm-qrsort-list">${rows.map(r => `
+    <div class="lm-qrsort-row" data-i="${r.i}">
+      <div class="lm-qrsort-text"><b>#${r.i} ${esc(r.m.name || '')}</b>${r.known ? '' : '<em>추정</em>'}<span>${esc(stripMessage(r.m.mes).replace(/\s+/g, ' ').slice(0, 120))}</span></div>
+      <select class="text_pole lm-select"><option value="aside" ${r.guess === 'aside' ? 'selected' : ''}>번외편</option><option value="story" ${r.guess === 'story' ? 'selected' : ''}>이야기</option></select>
+    </div>`).join('')}</div></div>`;
+    applyThemeMode(wrap.firstElementChild);
+    const result = await new c.Popup(wrap, c.POPUP_TYPE.CONFIRM, '', { okButton: '저장', cancelButton: '취소', wide: true, allowVerticalScrolling: true, leftAlign: true }).show();
+    if (result !== c.POPUP_RESULT.AFFIRMATIVE) return;
+    const memory = getMemory(false);
+    let asides = 0;
+    let stale = 0;
+    wrap.querySelectorAll('.lm-qrsort-row').forEach(row => {
+        const m = c.chat[Number(row.dataset.i)];
+        if (!m) return;
+        const value = row.querySelector('select').value;
+        const before = m.extra?.lm_qr;
+        m.extra = m.extra || {};
+        m.extra.lm_qr = value;
+        if (value === 'aside') asides++;
+        if (value === 'aside' && before !== 'aside' && memory && m.extra.lm_owner) {
+            const node = memory.timeline.find(n => n.id === m.extra.lm_owner);
+            if (node && !node.stale) { node.stale = true; stale++; }
+        }
+    });
+    await persistChat();
+    updateStatus();
+    toastr.success(`번외편 ${asides}개를 기억에서 뺐어요.${stale ? ` 이미 요약된 기억 ${stale}개에 '다시 요약' 표시를 했어요.` : ''}`, APP_NAME);
+}
+
 function isSummarizable(msg) {
     if (!msg) return false;
+    if (isQrMessage(msg)) return false;
     if (!msg.is_system) return true;
     return msg.extra?.type === 'narrator';
 }
@@ -1436,6 +1549,7 @@ function buildCorpus(memory) {
             const msg = chat[i];
             if (!msg) continue;
             // All mode: every message with text, including ones hidden by us, by /hide or by other extensions.
+            if (isQrMessage(msg)) continue;
             if (!allMode && !(hidden.has(i) || isSummarizable(msg))) continue;
             if (allMode && msg.extra?.isSmallSys) continue;
             const line = messageLine(msg, i);
@@ -3482,7 +3596,7 @@ function planBatches(start, end, { includeHidden = false } = {}) {
     for (let i = start; i <= end; i++) {
         const msg = chat[i];
         // Messages this extension hid (kept hidden after a reset or a deleted memory) can be summarized again.
-        if (!msg || !(isSummarizable(msg) || (msg.extra?.lm_hidden && String(msg.mes ?? '').trim()) || (includeHidden && String(msg.mes ?? '').trim()))) continue;
+        if (!msg || isQrMessage(msg) || !(isSummarizable(msg) || (msg.extra?.lm_hidden && String(msg.mes ?? '').trim()) || (includeHidden && String(msg.mes ?? '').trim()))) continue;
         const line = messageLine(msg, i);
         const tokens = estTokens(line);
         if (current && (current.lines.length >= maxMessages || current.tokens + tokens > s.batchTokens)) {
@@ -3860,7 +3974,7 @@ async function resummarizeNode(nodeId, { notes = '' } = {}) {
     const { chat } = ctx();
     const indices = [];
     chat.forEach((m, i) => { if (m?.extra?.lm_owner === nodeId) indices.push(i); });
-    const lines = indices.filter(i => chat[i]?.extra?.lm_hidden || isSummarizable(chat[i]) || (node.includeHidden && String(chat[i]?.mes ?? '').trim())).map(i => messageLine(chat[i], i));
+    const lines = indices.filter(i => !isQrMessage(chat[i])).filter(i => chat[i]?.extra?.lm_hidden || isSummarizable(chat[i]) || (node.includeHidden && String(chat[i]?.mes ?? '').trim())).map(i => messageLine(chat[i], i));
     if (!lines.length) return toastr.warning('원본 메시지를 찾지 못했어요.');
     if (estTokens(lines.join('\n')) > s.batchTokens) {
         return toastr.warning('이 구간은 한 번에 다시 요약하기엔 길어요. 설정의 "한 구간 최대 토큰"을 늘려주세요.');
@@ -3967,7 +4081,7 @@ async function afterTurn(messageId) {
     const doVoice = doCheck && s.voiceEnabled && s.checkCharacter && memory.cast.some(m => m.core || m.speech);
     const { chat } = ctx();
     const msg = chat[messageId];
-    if (!msg || msg.is_user || msg.is_system) return;
+    if (!msg || msg.is_user || msg.is_system || isQrMessage(msg)) return;
     const chatId = ctx().getCurrentChatId();
     turnBusy = true;
     turnStartedAt = Date.now();
@@ -3987,7 +4101,7 @@ async function afterTurn(messageId) {
         let omittedFrom = -1;
         for (let i = messageId - 1; i >= 0; i--) {
             if (i < gapStart && recent.length >= 12) break;
-            if (!chat[i] || (chat[i].is_system && !chat[i].extra?.lm_hidden && i >= gapStart)) continue;
+            if (!chat[i] || isQrMessage(chat[i]) || (chat[i].is_system && !chat[i].extra?.lm_hidden && i >= gapStart)) continue;
             if (i < gapStart && chat[i].is_system) continue;
             const line = messageLine(chat[i], i);
             const t = estTokens(line);
@@ -4289,6 +4403,7 @@ function onMessageReceived(id, type) {
     updateStatus();
     decorateMessage(Number(id));
     if (['quiet', 'impersonate', 'first_message'].includes(type)) return;
+    try { if (tagQrMessage(Number(id), type)) return; } catch (err) { console.warn(LOG_PREFIX, 'qr tag failed', err); }
     maybeAutoCompress();
     setTimeout(() => afterTurn(Number(id)), 0);
 }
@@ -5836,6 +5951,8 @@ function settingsHtml() {
           ${checkRow('softenSensitive', '민감한 장면 순화 (기본 꺼짐)', '꺼져 있으면 모든 장면을 있는 그대로 요약해요. 켜면 야하거나 잔인한 장면을 짧고 덤덤하게 줄여 적어서 검열에 덜 걸리지만, 그만큼 덜 자세히 기억해요')}
           ${selectRow('language', '요약 언어', selectOptions(LANGUAGES, s.language), s.language, 'English가 토큰을 가장 적게 써요')}
           ${selectRow('detail', '상세도', selectOptions({ concise: '간결', standard: '보통', detailed: '상세' }, s.detail), s.detail, '상세할수록 오래 기억하지만 토큰이 늘어요')}
+          ${selectRow('qrMessages', 'QR·슬래시 명령 메시지', selectOptions(QR_MODES, s.qrMessages === 'comment' ? 'aside' : s.qrMessages), s.qrMessages === 'comment' ? 'aside' : s.qrMessages, '빠른 답장(QR)으로 만든 분석(/comment)과 롤플을 멈추고 만든 번외편(밸런스 게임, 타임루프 같은 시뮬레이션)을 요약·회상·답변 점검에서 빼요. "마무리", "빨리빨리"처럼 이야기를 이어 가는 QR은 그대로 기억해요')}
+          <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_qrsort">${icon('ledger')}<span>QR 메시지 분류</span></button><span class="lm-hint">이 버전 전에 들어온 QR 메시지를 번외편/이야기로 직접 골라요</span></div>
           ${numberRow('keepRecent', '최근 원본 유지', 0, 5000, '이만큼의 최근 메시지는 요약하지 않고 그대로 둬요')}
           ${group('함께 챙길 것', '캐해·검수·복선')}
           ${checkRow('voiceEnabled', '캐해 보존', '캐릭터 카드로 핵심 성격과 말투를 정리해 고정하고, 요약할 때 실제 대사 샘플을 모아 AI에게 함께 보여줘요. 기억장 → 캐릭터 탭에서 고칠 수 있어요')}
@@ -6162,6 +6279,7 @@ function bindSettings(root) {
     root.querySelector('#lm_apply_preset').addEventListener('click', () => applyPreset(presetSelect.value));
     root.querySelector('#lm_btn_search').addEventListener('click', () => openSearchTest());
     root.querySelector('#lm_btn_test').addEventListener('click', () => testConnection());
+    root.querySelector('#lm_btn_qrsort')?.addEventListener('click', () => openQrSorter());
     renderPromptEditors(root);
     let pickedStyle = s.promptStyle || 'default';
     renderStyleList(root, pickedStyle);
@@ -6376,7 +6494,7 @@ function estimateCorpusSize(memory) {
     if ((s.indexAllMessages || s.indexRawMessages) && rawEnd >= 0) {
         for (let i = 0; i <= rawEnd; i++) {
             const m = chat[i];
-            if (m && !m.extra?.isSmallSys && String(m.mes ?? '').length >= 8 && (s.indexAllMessages || m.is_system || isSummarizable(m))) raw++;
+            if (m && !m.extra?.isSmallSys && !isQrMessage(m) && String(m.mes ?? '').length >= 8 && (s.indexAllMessages || m.is_system || isSummarizable(m))) raw++;
         }
     }
     return (memory.events?.length || 0) + (memory.archive?.length || 0) + Math.ceil(raw / Math.max(1, s.rawChunkMessages));
@@ -7837,7 +7955,7 @@ function nodeBatch(node) {
     const { chat } = ctx();
     const indices = [];
     chat.forEach((m, i) => { if (m?.extra?.lm_owner === node.id) indices.push(i); });
-    const kept = indices.filter(i => chat[i]?.extra?.lm_hidden || isSummarizable(chat[i]) || (node.includeHidden && String(chat[i]?.mes ?? '').trim()));
+    const kept = indices.filter(i => !isQrMessage(chat[i])).filter(i => chat[i]?.extra?.lm_hidden || isSummarizable(chat[i]) || (node.includeHidden && String(chat[i]?.mes ?? '').trim()));
     if (!kept.length) return null;
     return { from: indices[0], to: indices[indices.length - 1], lines: kept.map(i => messageLine(chat[i], i)), indices, tokens: 0 };
 }
@@ -9131,6 +9249,7 @@ let commandsRegistered = false;
     eventSource.on(event_types.MORE_MESSAGES_LOADED, () => decorateAll());
     document.addEventListener('click', onDocumentClick, true);
     eventSource.on(event_types.MESSAGE_SENT, updateStatus);
+    if (event_types.GENERATION_STARTED) eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
     // Keeps the "n분 전" labels in the status panel fresh without touching anything else.
     setInterval(() => {
         if (document.getElementById('lm_fold')?.closest('.inline-drawer-content')?.offsetParent) renderLive();
