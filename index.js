@@ -1554,11 +1554,62 @@ function collectionId() {
     return `longmem_${hashString(String(ctx().getCurrentChatId()))}`;
 }
 
+// ST's vector settings default to "Local (Transformers)" even for people who never turned
+// Vector Storage on. That loads an ONNX model inside the SillyTavern server; on phones
+// (Termux) and small machines it can take the whole server down. So the local model is only
+// used when someone actually chose it, a phone must confirm once, and a crash while it was
+// loading turns it off until the embedding settings change.
+const LOCAL_EMBED_PENDING = 'lm_local_embed_pending';
+
+function resolvedEmbedSource() {
+    const s = getSettings();
+    const vs = ctx().extensionSettings?.vectors || {};
+    return s.embedSource === 'inherit' ? (vs.source || 'transformers') : s.embedSource;
+}
+
+function embedSignature() {
+    const vs = ctx().extensionSettings?.vectors || {};
+    return `${getSettings().embedSource}|${vs.source || ''}`;
+}
+
+const isPhone = () => /Android|iPhone|iPad|Mobile/i.test(globalThis.navigator?.userAgent || '');
+
+function localEmbedBlock() {
+    if (resolvedEmbedSource() !== 'transformers') return '';
+    const s = getSettings();
+    const vs = ctx().extensionSettings?.vectors || {};
+    if (s.localEmbedCrashed && s.localEmbedCrashed === embedSignature()) return 'crashed';
+    if (s.embedSource === 'inherit' && !vs.enabled_chats && !vs.enabled_files) return 'unchosen';
+    if (isPhone() && !s.localEmbedPhoneOk) return 'phone';
+    return '';
+}
+
+const LOCAL_BLOCK_TEXT = {
+    unchosen: '의미 검색은 임베딩 소스를 고르면 켜져요 (지금은 키워드 검색). ST 기본값인 로컬 임베딩은 서버를 멈추게 할 수 있어 자동으로 쓰지 않아요',
+    phone: '휴대폰에서는 로컬 임베딩이 실리태번을 끌 수 있어 쉬고 있어요 (지금은 키워드 검색). 회상 탭의 임베딩 테스트로 켜거나 다른 임베딩 소스를 골라 주세요',
+    crashed: '지난번 로컬 임베딩을 불러오다 실리태번이 꺼진 것 같아 쉬고 있어요 (지금은 키워드 검색). 임베딩 소스를 바꾸거나 임베딩 테스트로 다시 켜요',
+};
+
+function denseAllowed() {
+    return getSettings().vectorEnabled && !localEmbedBlock();
+}
+
+function checkLocalEmbedCrash() {
+    let pending = null;
+    try { pending = localStorage.getItem(LOCAL_EMBED_PENDING); localStorage.removeItem(LOCAL_EMBED_PENDING); } catch { /* storage unavailable */ }
+    if (!pending) return;
+    const s = getSettings();
+    s.localEmbedCrashed = pending;
+    ctx().saveSettingsDebounced();
+    logActivity('index', '로컬 임베딩을 불러오던 중 실리태번이 다시 시작됐어요. 로컬 임베딩을 쉬고 키워드 검색으로 찾아요.', 'warn');
+    toastr.warning('로컬 임베딩 모델(transformers.js)을 불러오다 실리태번이 꺼진 것 같아요. 다시 꺼지지 않게 로컬 임베딩을 쉬고 키워드 검색으로 회상해요. 의미 검색을 쓰려면 설정 → 회상에서 임베딩 소스를 Google AI Studio 같은 API로 바꿔 주세요.', APP_NAME, { timeOut: 20000 });
+}
+
 function vectorBody(extra = {}) {
     const s = getSettings();
     const c = ctx();
     const vs = c.extensionSettings.vectors || {};
-    const source = s.embedSource === 'inherit' ? (vs.source || 'transformers') : s.embedSource;
+    const source = resolvedEmbedSource();
     if (UNSUPPORTED_EMBED.has(source)) throw new Error(`${source} 임베딩은 지원하지 않습니다. 다른 임베딩 소스를 선택해 주세요.`);
     const override = s.embedModel.trim();
     const body = { ...extra, source };
@@ -1624,6 +1675,8 @@ async function vectorRequest(path, body, signal = null, { retries = 0, shouldSto
                 await sleep(500);
             }
         }
+        const local = body?.source === 'transformers' && path !== 'purge' && path !== 'list';
+        if (local) { try { localStorage.setItem(LOCAL_EMBED_PENDING, embedSignature()); } catch { /* ignore */ } }
         try {
             const response = await fetch(`/api/vector/${path}`, {
                 method: 'POST',
@@ -1641,6 +1694,8 @@ async function vectorRequest(path, body, signal = null, { retries = 0, shouldSto
         } catch (err) {
             if (signal?.aborted || String(err?.message) === 'aborted') throw err;
             lastErr = err;
+        } finally {
+            if (local) { try { localStorage.removeItem(LOCAL_EMBED_PENDING); } catch { /* ignore */ } }
         }
     }
     throw lastErr;
@@ -1671,6 +1726,11 @@ function vectorErrorText(err) {
 
 async function testEmbedding() {
     const s = getSettings();
+    if (resolvedEmbedSource() === 'transformers') {
+        const vs = ctx().extensionSettings?.vectors || {};
+        const ok = await ctx().Popup.show.confirm('로컬 임베딩', `${isPhone() ? '휴대폰(Termux)에서는 ' : ''}로컬 임베딩 모델(transformers.js)을 실리태번 서버 안에서 불러와요. 메모리가 부족하면 실리태번이 꺼질 수 있어요. 그래도 시험해 볼까요?${s.embedSource === 'inherit' && !vs.enabled_chats && !vs.enabled_files ? ' 성공하면 회상 탭의 임베딩 소스가 로컬로 정해져요.' : ''}`);
+        if (!ok) return;
+    }
     let body;
     try {
         body = vectorBody({ collectionId: 'longmem_probe', searchText: '코끼리는 잊지 않아요', topK: 1 });
@@ -1683,6 +1743,13 @@ async function testEmbedding() {
         await vectorRequest('query', body);
         const ms = Date.now() - started;
         markVectorOk();
+        if (body.source === 'transformers') {
+            if (s.embedSource === 'inherit') s.embedSource = 'transformers';
+            s.localEmbedPhoneOk = true;
+            s.localEmbedCrashed = '';
+            ctx().saveSettingsDebounced();
+            syncSettingInputs?.();
+        }
         toastr.success(`${esc(EMBED_LABEL(body.source))}${body.model ? ` · ${esc(body.model)}` : ''} (${(ms / 1000).toFixed(1)}초)`, '임베딩 정상', { escapeHtml: false });
         logActivity('index', `임베딩 연결 정상 · ${EMBED_LABEL(body.source)}${body.model ? ` ${body.model}` : ''}`);
         if (s.vectorEnabled && s.recallEnabled && s.autoIndex && syncState.error) syncVectors({ notify: true });
@@ -1714,14 +1781,15 @@ async function syncVectors({ notify = false, full = false } = {}) {
         }
         if (!s.recallEnabled) return toastr.info('회상이 꺼져 있어요. 회상 탭에서 켜주세요.');
         const memory = getMemory(true);
-        if (!s.vectorEnabled) {
+        if (!denseAllowed()) {
             const n = buildCorpus(memory).length;
             logActivity('index', `키워드 검색 대상 ${n.toLocaleString()}개`);
-            return toastr.info(`의미 검색이 꺼져 있어 키워드 검색으로 ${n.toLocaleString()}개를 찾아요. 벡터 색인은 필요 없어요.`, APP_NAME);
+            const why = s.vectorEnabled ? LOCAL_BLOCK_TEXT[localEmbedBlock()] : '의미 검색이 꺼져 있어';
+            return toastr.info(`${why}. 키워드 검색으로 ${n.toLocaleString()}개를 찾아요. 벡터 색인은 필요 없어요.`, APP_NAME, { timeOut: 12000 });
         }
         if (syncing) return toastr.info('이미 색인하는 중이에요.');
     }
-    if (!s.vectorEnabled || !s.recallEnabled || syncing || !hasChat()) return;
+    if (!denseAllowed() || !s.recallEnabled || syncing || !hasChat()) return;
     if (!full && !notify && vectorCooling()) return;
     const memory = full ? getMemory(true) : getMemory(false);
     if (!memory) return;
@@ -1834,7 +1902,7 @@ async function hybridRecall(memory, query, { useDense = true, topK = null, budge
     const lists = [];
     let dense = false;
     for (const q of queries) {
-        if (useDense && s.vectorEnabled && !vectorCooling()) {
+        if (useDense && denseAllowed() && !vectorCooling()) {
             try {
                 const hashes = await denseSearch(q, pool);
                 const items = hashes.map(h => byHash.get(h)).filter(Boolean);
@@ -6198,6 +6266,7 @@ function renderLive() {
                 : `자동 색인 꺼짐 · 회상 탭의 전체 색인 버튼으로 색인해요`, ix?.t, 'autoIndex'));
         }
         else if (!s.vectorEnabled) rows.push(liveRow('on', '색인', `키워드 검색 ${count.toLocaleString()}개 · ${scope}`));
+        else if (localEmbedBlock()) rows.push(liveRow('off', '색인', `키워드 검색 ${count.toLocaleString()}개 · ${scope}<span class="lm-live-sub">${esc(LOCAL_BLOCK_TEXT[localEmbedBlock()])}</span>`));
         else if (syncState.error && syncState.chatId === ctx().getCurrentChatId()) {
             const wait = vectorCooling() ? ` · ${Math.max(1, Math.round((vectorHealth.coolUntil - Date.now()) / 60000))}분 뒤 다시 시도` : '';
             rows.push(liveRow('err', '색인', `벡터 오류 · 키워드 검색으로 대체 중${s.autoIndex ? wait : autoNote}<span class="lm-live-sub">${esc(syncState.error)}</span><button type="button" class="lm-link-btn lm-live-fix" data-lm-embed-test>${icon('plug')}임베딩 테스트</button>`, null, 'autoIndex'));
@@ -8860,6 +8929,7 @@ let commandsRegistered = false;
 
 (function init() {
     getSettings();
+    try { checkLocalEmbedCrash(); } catch (err) { console.warn(LOG_PREFIX, 'local embed check failed', err); }
     const { eventSource, event_types } = ctx();
     try { loadFont(); } catch { /* cosmetic only */ }
     // Show the panel right away. Waiting only for APP_READY left it missing whenever another
