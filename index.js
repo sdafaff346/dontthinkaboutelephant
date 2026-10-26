@@ -3559,6 +3559,7 @@ function undoRemovedLiveTurns() {
             const idx = entries.findIndex(x => ledgerKey(x.cat, x.key) === k);
             const now = idx >= 0 ? entries[idx] : null;
             if (!same(now, turn.after.entries[k])) continue; // changed again later: keep the newer state
+            if (same(prev, turn.after.entries[k])) continue; // this reply did not really change it
             if (prev === null) { if (idx >= 0) entries.splice(idx, 1); }
             else if (idx >= 0) entries[idx] = structuredClone(prev);
             else entries.push(structuredClone(prev));
@@ -3578,8 +3579,8 @@ function undoRemovedLiveTurns() {
     }
     if (restored) {
         const where = [...new Set(gone.map(t => `#${t.at}`))].join(', ');
+        // Quiet on purpose: this happens on every reroll, so it only goes to the activity log.
         logActivity('check', `지워지거나 바뀐 답변(${where})에서 실시간으로 바꿨던 기록 ${restored}건을 되돌렸어요`);
-        toastr.info(`지운 답변 때문에 바뀌었던 기록부 ${restored}건을 원래대로 돌려놨어요.`, APP_NAME, { timeOut: 5000 });
     }
     return restored;
 }
