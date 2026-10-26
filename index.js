@@ -148,6 +148,7 @@ const defaultSettings = Object.freeze({
     autoForgetDeleted: true,
     checkContradictions: false,
     liveStateUpdate: false,
+    liveStateUndo: true,
     queryExpansion: false,
     expansionTimeoutMs: 15000,
     autoBackupEvery: 10,
@@ -3383,6 +3384,85 @@ function applyLedgerOps(memory, ops, atIndex) {
     return applied;
 }
 
+// ---------------------------------------------------------------- undo live updates of deleted replies
+// "현재 상태 실시간 갱신" changes the fact sheet after every reply. When that reply is deleted
+// or swiped away, those changes should go too. Each live update remembers what it changed
+// (before/after of the touched entries and the scene) and is tagged on the message
+// (extra.lm_turn). When the tagged reply is no longer in the chat, the change is rolled back,
+// newest first, but only where nothing later changed the same entry again.
+const ledgerKey = (cat, key) => `${String(cat).toLowerCase()}|${String(key).trim().toLowerCase()}`;
+
+function ledgerSnapshot(memory, ops) {
+    const entries = {};
+    for (const op of ops || []) {
+        const kind = String(op?.op || '').toLowerCase();
+        if (kind === 'scene' || !op?.cat || !op?.key) continue;
+        const k = ledgerKey(op.cat, op.key);
+        if (k in entries) continue;
+        const e = memory.ledger.entries.find(x => ledgerKey(x.cat, x.key) === k);
+        entries[k] = e ? structuredClone(e) : null;
+    }
+    return { scene: structuredClone(memory.ledger.scene || {}), entries };
+}
+
+function recordLiveTurn(memory, msg, messageId, ops, before) {
+    if (!getSettings().liveStateUndo) return;
+    const after = ledgerSnapshot(memory, ops);
+    const id = newId();
+    msg.extra = msg.extra || {};
+    msg.extra.lm_turn = id;
+    memory.liveTurns = [...(memory.liveTurns || []), { id, at: messageId, ops, before, after }].slice(-40);
+}
+
+function undoRemovedLiveTurns() {
+    const memory = getMemory(false);
+    if (!memory?.liveTurns?.length) return 0;
+    const shown = new Set(ctx().chat.map(m => m?.extra?.lm_turn).filter(Boolean));
+    // Swiping back to a reply whose changes were rolled back applies them again.
+    let redone = 0;
+    for (const t of memory.liveTurns) {
+        if (!t.reverted || !shown.has(t.id) || !Array.isArray(t.ops)) continue;
+        t.before = ledgerSnapshot(memory, t.ops);
+        applyLedgerOps(memory, t.ops, t.at);
+        t.after = ledgerSnapshot(memory, t.ops);
+        t.reverted = false;
+        redone++;
+    }
+    const gone = memory.liveTurns.filter(t => !t.reverted && !shown.has(t.id));
+    if (!gone.length && !redone) return 0;
+    const same = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+    let restored = 0;
+    for (const turn of gone.slice().reverse()) {
+        for (const [k, prev] of Object.entries(turn.before.entries)) {
+            const entries = memory.ledger.entries;
+            const idx = entries.findIndex(x => ledgerKey(x.cat, x.key) === k);
+            const now = idx >= 0 ? entries[idx] : null;
+            if (!same(now, turn.after.entries[k])) continue; // changed again later: keep the newer state
+            if (prev === null) { if (idx >= 0) entries.splice(idx, 1); }
+            else if (idx >= 0) entries[idx] = structuredClone(prev);
+            else entries.push(structuredClone(prev));
+            restored++;
+        }
+        if (same(memory.ledger.scene, turn.after.scene) && !same(turn.before.scene, turn.after.scene)) {
+            memory.ledger.scene = structuredClone(turn.before.scene);
+            restored++;
+        }
+    }
+    for (const t of gone) t.reverted = true;
+    if (redone) logActivity('check', `다시 보이는 답변의 실시간 갱신 ${redone}건을 다시 적용했어요`);
+    if (restored || redone) {
+        ctx().saveMetadataDebounced ? ctx().saveMetadataDebounced() : persistChat();
+        refreshInjection();
+        updateStatus();
+    }
+    if (restored) {
+        const where = [...new Set(gone.map(t => `#${t.at}`))].join(', ');
+        logActivity('check', `지워지거나 바뀐 답변(${where})에서 실시간으로 바꿨던 기록 ${restored}건을 되돌렸어요`);
+        toastr.info(`지운 답변 때문에 바뀌었던 기록부 ${restored}건을 원래대로 돌려놨어요.`, APP_NAME, { timeOut: 5000 });
+    }
+    return restored;
+}
+
 function planBatches(start, end, { includeHidden = false } = {}) {
     const s = getSettings();
     const { chat } = ctx();
@@ -3984,7 +4064,9 @@ async function afterTurn(messageId) {
                 if (kind === 'scene') return true;
                 return ['set', 'close'].includes(kind) && ['character', 'relation', 'thread', 'item'].includes(String(op.cat || '').toLowerCase());
             });
+            const before = ledgerSnapshot(memory, ops);
             if (applyLedgerOps(memory, ops, messageId)) {
+                recordLiveTurn(memory, msg, messageId, ops, before);
                 turnNotes.push(`상태 ${ops.length}건 갱신`);
                 ctx().saveMetadataDebounced ? ctx().saveMetadataDebounced() : await persistChat();
                 refreshInjection();
@@ -5763,6 +5845,7 @@ function settingsHtml() {
           ${checkRow('checkDoubleCheck', '모순 한 번 더 확인', '모순을 찾았을 때만, 최근 대화로 바뀐 내용인지 한 번 더 따져서 잘못된 경고를 걸러요 (그때만 1번 더 호출)')}
           ${advanced(`${numberRow('checkContextTokens', '검사에 보여줄 최근 대화', 2000, 200000, '아직 요약하지 않은 최근 원본을 이 토큰만큼 검사 모델에게 보여줘요. 최근 원본 유지 개수만큼 다 들어가야 정확해요')}`)}
           ${checkRow('liveStateUpdate', '현재 상태 실시간 갱신', '시간·장소·함께 있는 인물·약속을 답변마다 기록부에 반영해요')}
+          ${checkRow('liveStateUndo', '답변을 지우면 그 갱신도 되돌리기', '실시간 갱신한 답변을 지우거나 다른 답변으로 넘기면, 그 답변 때문에 바뀐 기록부를 원래대로 돌려요')}
           ${checkRow('autoForgetDeleted', '메시지를 지우면 그 기억도 지우기', '일부만 지우면 "다시 요약" 표시를 해요')}
           <p class="lm-hint lm-note">모순 검사와 실시간 갱신은 둘 다 켜도 답변마다 요약 모델을 1번만 불러요. 모순을 찾았고 '한 번 더 확인'이 켜져 있을 때만 1번 더 불러요. 요약 모델 프로필을 따로 지정하면 대화와 겹치지 않아요.</p>
           ${advanced(`${numberRow('remindAt', '압축 알림 기준', 0, 100000, '미요약이 이만큼 쌓이면 알려줘요. 0이면 끔')}`)}
@@ -8907,6 +8990,12 @@ async function onMessageDeleted() {
     } catch (err) {
         console.error(LOG_PREFIX, 'deletion reconcile failed', err);
     }
+    try { undoRemovedLiveTurns(); } catch (err) { console.error(LOG_PREFIX, 'live state undo failed', err); }
+}
+
+function onMessageSwiped(id) {
+    onMessageEdited(id);
+    try { undoRemovedLiveTurns(); } catch (err) { console.error(LOG_PREFIX, 'live state undo failed', err); }
 }
 
 // ---------------------------------------------------------------- init
@@ -8957,7 +9046,7 @@ let commandsRegistered = false;
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
     eventSource.on(event_types.MESSAGE_DELETED, onMessageDeleted);
     eventSource.on(event_types.MESSAGE_EDITED, onMessageEdited);
-    eventSource.on(event_types.MESSAGE_SWIPED, onMessageEdited);
+    eventSource.on(event_types.MESSAGE_SWIPED, onMessageSwiped);
     eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (id) => decorateMessage(Number(id)));
     eventSource.on(event_types.USER_MESSAGE_RENDERED, (id) => decorateMessage(Number(id)));
