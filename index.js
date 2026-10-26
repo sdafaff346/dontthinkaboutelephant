@@ -5744,6 +5744,11 @@ function ledgerGroups(memory) {
     }).join('');
 }
 
+// Small titled groups inside a settings tab, so related switches sit together.
+function group(title, hint = '') {
+    return `<div class="lm-setgroup"><span class="lm-setgroup-title">${title}</span>${hint ? `<span class="lm-setgroup-hint">${hint}</span>` : ''}</div>`;
+}
+
 function advanced(content, label = '고급 설정') {
     return `<details class="lm-more"><summary>${label}</summary>${content}</details>`;
 }
@@ -5811,22 +5816,30 @@ function settingsHtml() {
           <button type="button" class="lm-tab" data-lm-tab="auto" role="tab">${icon('rotate')}<span>자동</span></button>
           <button type="button" class="lm-tab" data-lm-tab="recall" role="tab">${icon('bulb')}<span>회상</span></button>
           <button type="button" class="lm-tab" data-lm-tab="lore" role="tab">${icon('wiki')}<span>로어북</span></button>
-          <button type="button" class="lm-tab" data-lm-tab="tidy" role="tab">${icon('archive')}<span>용량</span></button>
-          <button type="button" class="lm-tab" data-lm-tab="inject" role="tab">${icon('plug')}<span>주입</span></button>
+          <button type="button" class="lm-tab" data-lm-tab="tidy" role="tab">${icon('archive')}<span>기억 크기</span></button>
+          <button type="button" class="lm-tab" data-lm-tab="inject" role="tab">${icon('plug')}<span>넣는 위치</span></button>
           <button type="button" class="lm-tab" data-lm-tab="prompt" role="tab">${icon('frame')}<span>프롬프트</span></button>
         </div>
+        <div class="lm-setsearch">
+          ${icon('search')}
+          <input type="search" class="text_pole" id="lm_setsearch" placeholder="설정 찾기 (예: 모순, 임베딩, 미리보기)" aria-label="설정 찾기" autocomplete="off">
+        </div>
+        <p class="lm-hint lm-setsearch-empty" id="lm_setsearch_empty" hidden>찾는 설정이 없어요. 다른 말로 찾아보세요.</p>
         <div class="lm-panes">
 
-        <section class="lm-pane active" data-lm-pane="summary" role="tabpanel">
+        <section class="lm-pane active" data-lm-pane="summary" role="tabpanel" data-lm-pane-title="요약">
+          ${group('요약 모델', '어떤 모델로 요약할지')}
           ${selectRow('', '요약 모델', profileOptions(s.profileId), s.profileId, 'Connection Manager에 저장한 프로필. 비우면 지금 쓰는 API를 써요', 'lm_profile')}
           <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_test">${icon('plug')}<span>연결 테스트</span></button><span class="lm-hint">요약 모델이 응답하는지 바로 확인해요</span></div>
           ${selectRow('', '검열되면 대신 쓸 모델', profileOptions(s.fallbackProfileId, '사용 안 함'), s.fallbackProfileId, '요약 모델이 거부하거나 막힐 때만 이 프로필로 다시 보내요. Gemini를 쓴다면 DeepSeek·GLM 같은 다른 회사 모델을 추천해요', 'lm_fallback')}
+          ${group('요약 방식', '무엇을 얼마나 자세히 남길지')}
           ${checkRow('softenSensitive', '민감한 장면 순화 (기본 꺼짐)', '꺼져 있으면 모든 장면을 있는 그대로 요약해요. 켜면 야하거나 잔인한 장면을 짧고 덤덤하게 줄여 적어서 검열에 덜 걸리지만, 그만큼 덜 자세히 기억해요')}
           ${selectRow('language', '요약 언어', selectOptions(LANGUAGES, s.language), s.language, 'English가 토큰을 가장 적게 써요')}
           ${selectRow('detail', '상세도', selectOptions({ concise: '간결', standard: '보통', detailed: '상세' }, s.detail), s.detail, '상세할수록 오래 기억하지만 토큰이 늘어요')}
           ${numberRow('keepRecent', '최근 원본 유지', 0, 5000, '이만큼의 최근 메시지는 요약하지 않고 그대로 둬요')}
+          ${group('함께 챙길 것', '캐해·검수·복선')}
           ${checkRow('voiceEnabled', '캐해 보존', '캐릭터 카드로 핵심 성격과 말투를 정리해 고정하고, 요약할 때 실제 대사 샘플을 모아 AI에게 함께 보여줘요. 기억장 → 캐릭터 탭에서 고칠 수 있어요')}
-          ${checkRow('previewBeforeSave', '저장 전에 미리보기', '압축할 때마다 결과를 보고 고치거나 다시 요약해요')}
+          ${checkRow('previewBeforeSave', '저장 전에 미리보기', '직접 압축할 때마다 결과를 보고 고치거나 다시 요약해요. 자동 압축은 대화가 끊기지 않게 바로 저장해요')}
           ${selectRow('verifySummaries', '요약 자동 검수', selectOptions(VERIFY_MODES, s.verifySummaries), s.verifySummaries, '요약을 원본과 한 번 더 대조해서 지어낸 내용이나 빠진 중요 장면을 찾아요. 구간마다 API를 한 번 더 써요')}
           ${checkRow('hooksEnabled', '복선 추적', '나중에 회수될 암시·수수께끼·약속을 따로 모아 두고, 안 풀린 것은 AI가 잊지 않게 알려줘요. 기억장 → 복선 탭')}
           ${advanced(`
@@ -5844,27 +5857,34 @@ function settingsHtml() {
           ${resetFoot()}
         </section>
 
-        <section class="lm-pane" data-lm-pane="auto" role="tabpanel">
+        <section class="lm-pane" data-lm-pane="auto" role="tabpanel" data-lm-pane-title="자동">
+          ${group('자동 압축', '대화가 쌓이면 알아서 요약')}
           ${checkRow('autoCompress', '자동 압축', '답변이 끝날 때 미요약이 기준만큼 쌓였으면 한 구간을 압축해요')}
           ${numberRow('autoCompressAt', '자동 압축 기준', 5, 100000, '미요약 메시지가 이만큼 쌓이면')}
+          ${numberRow('remindAt', '압축 알림 기준', 0, 100000, '자동 압축을 끈 경우, 미요약이 이만큼 쌓이면 알려줘요. 0이면 끔')}
+          ${group('답변 점검', '새 답변이 기억과 맞는지 확인')}
           ${checkRow('checkContradictions', '모순 검사', '답변이 기억과 다르면 메시지 이름 옆에 ⚠ 표시를 해요')}
           ${checkRow('checkCharacter', '캐해 검사', '모순 검사를 할 때 말투·호칭·성격이 캐해와 어긋나는지도 같이 봐요 (추가 호출 없음)')}
           ${checkRow('checkDoubleCheck', '모순 한 번 더 확인', '모순을 찾았을 때만, 최근 대화로 바뀐 내용인지 한 번 더 따져서 잘못된 경고를 걸러요 (그때만 1번 더 호출)')}
-          ${advanced(`${numberRow('checkContextTokens', '검사에 보여줄 최근 대화', 2000, 200000, '아직 요약하지 않은 최근 원본을 이 토큰만큼 검사 모델에게 보여줘요. 최근 원본 유지 개수만큼 다 들어가야 정확해요')}`)}
+          ${numberRow('checkContextTokens', '검사에 보여줄 최근 대화', 2000, 200000, '아직 요약하지 않은 최근 원본을 이 토큰만큼 검사 모델에게 보여줘요. 최근 원본 유지 개수만큼 다 들어가야 정확해요')}
+          ${group('실시간 갱신', '답변마다 기록부를 최신으로')}
           ${checkRow('liveStateUpdate', '현재 상태 실시간 갱신', '시간·장소·함께 있는 인물·약속을 답변마다 기록부에 반영해요')}
           ${checkRow('liveStateUndo', '답변을 지우면 그 갱신도 되돌리기', '실시간 갱신한 답변을 지우거나 다른 답변으로 넘기면, 그 답변 때문에 바뀐 기록부를 원래대로 돌려요')}
-          ${checkRow('autoForgetDeleted', '메시지를 지우면 그 기억도 지우기', '일부만 지우면 "다시 요약" 표시를 해요')}
           <p class="lm-hint lm-note">모순 검사와 실시간 갱신은 둘 다 켜도 답변마다 요약 모델을 1번만 불러요. 모순을 찾았고 '한 번 더 확인'이 켜져 있을 때만 1번 더 불러요. 요약 모델 프로필을 따로 지정하면 대화와 겹치지 않아요.</p>
-          ${advanced(`${numberRow('remindAt', '압축 알림 기준', 0, 100000, '미요약이 이만큼 쌓이면 알려줘요. 0이면 끔')}`)}
+          ${group('메시지를 지울 때')}
+          ${checkRow('autoForgetDeleted', '메시지를 지우면 그 기억도 지우기', '일부만 지우면 "다시 요약" 표시를 해요')}
           ${resetFoot()}
         </section>
 
-        <section class="lm-pane" data-lm-pane="recall" role="tabpanel">
+        <section class="lm-pane" data-lm-pane="recall" role="tabpanel" data-lm-pane-title="회상">
+          ${group('회상', '답변 직전에 지난 장면을 꺼내 넣기')}
           ${checkRow('recallEnabled', '회상 사용', '답변 직전에 지금 장면과 관련된 과거를 찾아 넣어요')}
+          ${checkRow('queryExpansion', '돌려 말해도 찾기', '"그때 그 일" 같은 말을 구체적인 검색어로 바꿔요. 답변마다 짧은 호출이 1번 늘어요')}
+          ${group('검색 방식', '키워드 검색은 늘 켜져 있어요')}
           ${checkRow('vectorEnabled', '의미 검색', '끄면 키워드 검색만 해요')}
           ${checkRow('autoIndex', '자동 색인', '압축하거나 기억이 바뀔 때마다 알아서 색인을 맞춰요. 끄면 "전체 색인" 버튼을 누를 때만 색인해요 (이미 만든 색인으로 검색은 계속돼요)')}
           ${checkRow('indexAllMessages', '숨긴 메시지까지 전부 색인', '요약 여부와 상관없이, 숨김 처리된 메시지까지 모든 원본 대사를 검색 대상에 넣어요 (최근 원본은 빼고)')}
-          ${checkRow('queryExpansion', '돌려 말해도 찾기', '"그때 그 일" 같은 말을 구체적인 검색어로 바꿔요. 답변마다 짧은 호출이 1번 늘어요')}
+          ${group('임베딩', '의미 검색에 쓸 모델')}
           ${selectRow('embedSource', '임베딩 소스', selectOptions(EMBED_SOURCES, s.embedSource), s.embedSource, 'API 키는 ST의 API 연결 화면에 저장된 것을 써요')}
           ${textRow('embedModel', '임베딩 모델', '비우면 ST 벡터 저장소 설정을 따라가요. Google AI Studio는 gemini-embedding-001, Vertex는 text-embedding-005가 안정적이에요', '예: gemini-embedding-001')}
           <div class="lm-actions lm-actions-inline">
@@ -5890,7 +5910,7 @@ function settingsHtml() {
           ${resetFoot()}
         </section>
 
-        <section class="lm-pane" data-lm-pane="lore" role="tabpanel">
+        <section class="lm-pane" data-lm-pane="lore" role="tabpanel" data-lm-pane-title="로어북">
           ${checkRow('loreEnabled', '로어북 참고', '요약, 모순 검사, 위키, 질문에서 관련 항목만 골라 함께 넘겨요')}
           ${checkRow('loreUseCharacter', '캐릭터 로어북 자동 포함')}
           ${checkRow('loreUseChat', '채팅 로어북 자동 포함')}
@@ -5902,9 +5922,11 @@ function settingsHtml() {
           ${resetFoot()}
         </section>
 
-        <section class="lm-pane" data-lm-pane="tidy" role="tabpanel">
-          ${numberRow('memoryBudget', '기억 예산', 500, 2000000, '넘으면 덜 중요한 기억부터 압축해요')}
+        <section class="lm-pane" data-lm-pane="tidy" role="tabpanel" data-lm-pane-title="기억 크기">
+          ${group('기억 크기', 'AI에게 보내는 기억의 최대 크기')}
+          ${numberRow('memoryBudget', '기억 크기 한도 (기억 예산)', 500, 2000000, '넘으면 덜 중요한 기억부터 줄이고 오래된 걸 합쳐요')}
           ${checkRow('autoCompact', '예산을 넘으면 자동 정리')}
+          ${group('백업')}
           ${numberRow('autoBackupEvery', '자동 백업 간격', 0, 1000, '압축을 이만큼 할 때마다 백업해요. 0이면 끔')}
           ${advanced(`
             ${numberRow('protectRecent', '최신 에피소드 보호', 0, 1000, '가장 최근 에피소드는 줄이지 않아요')}
@@ -5920,7 +5942,7 @@ function settingsHtml() {
           ${resetFoot()}
         </section>
 
-        <section class="lm-pane" data-lm-pane="inject" role="tabpanel">
+        <section class="lm-pane" data-lm-pane="inject" role="tabpanel" data-lm-pane-title="넣는 위치">
           ${selectRow('injectPreset', '주입 프리셋', selectOptions(Object.fromEntries(Object.entries(INJECT_PRESETS).map(([k, v]) => [k, v.label])), s.injectPreset), s.injectPreset, '')}
           <div class="lm-preset-row"><span class="lm-hint" id="lm_preset_desc">${esc(INJECT_PRESETS[s.injectPreset]?.desc || '')}</span><button type="button" class="lm-chipbtn" id="lm_apply_preset">${icon('check')}<span>적용</span></button></div>
           ${checkRow('anchorEnabled', '현재 상태 리마인더', '최근 대화 근처에 짧게 넣어 긴 채팅에서도 흐름과 말투를 놓치지 않게 해요')}
@@ -5933,7 +5955,7 @@ function settingsHtml() {
             ${numberRow('recallDepth', '회상 넣을 깊이', 0, 10000, '0이면 마지막 메시지 바로 뒤')}`)}
           ${resetFoot()}
         </section>
-        <section class="lm-pane" data-lm-pane="prompt" role="tabpanel">
+        <section class="lm-pane" data-lm-pane="prompt" role="tabpanel" data-lm-pane-title="프롬프트">
           <p class="lm-hint lm-note">이 확장이 AI에게 보내는 기본 프롬프트를 전부 여기서 고칠 수 있어요. 칸에 적힌 게 지금 쓰는 프롬프트고, 고치면 그게 새 기본값이 돼요. 결과 형식(&lt;episode&gt; 같은 블록)은 뒤에 자동으로 붙어서 고쳐도 요약이 깨지지 않아요. <b>{{user}}</b>, <b>{{char}}</b>, <b>{{language}}</b>(요약 언어 지시)를 어디서든 쓸 수 있어요.</p>
           <div class="lm-style">
             <div class="lm-field-text"><span class="lm-field-label">지시문 방식</span><span class="lm-hint">목적에 맞게 미리 다듬어 둔 지시문 묶음이에요. 하나를 고르고 적용하면 아래 프롬프트가 그 방식으로 바뀌어요. 적용한 뒤에도 칸마다 더 고칠 수 있어요.</span></div>
@@ -5983,6 +6005,54 @@ function settingsHtml() {
 </div>`;
 }
 
+// Typing in "설정 찾기" shows every matching setting from all tabs at once (labels and hints),
+// opening "고급 설정" folds that contain a match. Clicking a tab or clearing the box goes back.
+function bindSettingsSearch(root) {
+    const input = root.querySelector('#lm_setsearch');
+    const empty = root.querySelector('#lm_setsearch_empty');
+    if (!input) return;
+    const norm = (t) => String(t || '').toLowerCase().replace(/\s+/g, '');
+    const ITEMS = '.lm-field, .lm-inline-action, .lm-prompt-item, .lm-actions, .lm-style, .lm-preset-row, .lm-note';
+    const run = () => {
+        const q = norm(input.value);
+        root.classList.toggle('lm-searching', !!q);
+        let hits = 0;
+        root.querySelectorAll('.lm-panes > .lm-pane').forEach(pane => {
+            let paneHits = 0;
+            pane.querySelectorAll(ITEMS).forEach(item => {
+                if (item.parentElement?.closest(ITEMS)) return;
+                const text = norm(item.querySelector('summary')?.textContent ?? '') + norm(item.textContent);
+                const ok = !q || text.includes(q);
+                item.classList.toggle('lm-search-miss', !ok);
+                if (q && ok) paneHits++;
+            });
+            pane.querySelectorAll('details.lm-more').forEach(d => {
+                if (q) {
+                    if (d.dataset.lmWasOpen === undefined) d.dataset.lmWasOpen = d.open ? '1' : '0';
+                    d.open = !!d.querySelector(`:is(${ITEMS}):not(.lm-search-miss)`);
+                } else if (d.dataset.lmWasOpen !== undefined) {
+                    d.open = d.dataset.lmWasOpen === '1';
+                    delete d.dataset.lmWasOpen;
+                }
+            });
+            // Headings, notes and folds with nothing matching inside are hidden too.
+            [...pane.children].forEach(child => {
+                if (child.matches(ITEMS)) return;
+                const keep = !q || !!child.querySelector(`:is(${ITEMS}):not(.lm-search-miss)`);
+                child.classList.toggle('lm-search-miss', !keep);
+            });
+            pane.classList.toggle('lm-search-hit', !!q && paneHits > 0);
+            hits += paneHits;
+        });
+        if (empty) empty.hidden = !q || hits > 0;
+    };
+    input.addEventListener('input', run);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Escape') { input.value = ''; run(); } });
+    root.querySelectorAll('.lm-tab').forEach(tab => tab.addEventListener('click', () => {
+        if (input.value) { input.value = ''; run(); }
+    }));
+}
+
 function bindSettings(root) {
     const s = getSettings();
     const { saveSettingsDebounced } = ctx();
@@ -6005,6 +6075,7 @@ function bindSettings(root) {
             el.addEventListener('blur', () => { el.value = s[key]; });
         }
     });
+    bindSettingsSearch(root);
     const fold = root.querySelector('#lm_fold');
     fold.open = !!s.uiSettingsOpen;
     fold.addEventListener('toggle', () => {

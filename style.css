@@ -1860,3 +1860,49 @@
 .lm-root .lm-actions-inline .lm-btn { max-width: 100%; min-width: 0; white-space: normal; text-align: center; line-height: 1.35; padding-top: 6px; padding-bottom: 6px; }
 .lm-root .lm-btn > span { min-width: 0; overflow-wrap: anywhere; }
 .lm-check-badge.lm-check-muted { color: var(--SmartThemeQuoteColor, #8A8FA8); opacity: 0.55; animation: none; }
+
+/* v1.9.35: easier to read and find settings */
+.lm-root .lm-setgroup {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    margin: 18px 0 2px;
+    padding: 0 0 6px 10px;
+    border-left: 3px solid var(--lm-accent);
+}
+.lm-root .lm-pane > .lm-setgroup:first-child { margin-top: 12px; }
+.lm-root .lm-setgroup-title { font-size: 14.5px; font-weight: 700; color: var(--lm-text); letter-spacing: -0.01em; }
+.lm-root .lm-setgroup-hint { font-size: 12px; color: var(--lm-muted); }
+.lm-root .lm-pane .lm-field-label { font-size: 14px; }
+.lm-root .lm-pane .lm-field .lm-hint { font-size: 12.5px; line-height: 1.55; }
+
+.lm-root .lm-setsearch {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0 10px;
+    padding: 0 12px;
+    border: 1px solid var(--lm-line-strong);
+    border-radius: 10px;
+    background: var(--lm-field);
+    color: var(--lm-muted);
+}
+.lm-root .lm-setsearch:focus-within { box-shadow: var(--lm-ring); border-color: var(--lm-accent); }
+.lm-root .lm-setsearch input { flex: 1 1 auto; min-width: 0; margin: 0; border: 0 !important; background: transparent !important; box-shadow: none !important; padding: 9px 0; font-size: 14px; color: var(--lm-text); }
+.lm-root .lm-setsearch-empty { margin: 0 2px 10px; }
+
+.lm-root.lm-searching .lm-panes > .lm-pane { display: none; }
+.lm-root.lm-searching .lm-panes > .lm-pane.lm-search-hit { display: block; margin-bottom: 10px; }
+.lm-root.lm-searching .lm-panes > .lm-pane.lm-search-hit::before {
+    content: attr(data-lm-pane-title);
+    display: block;
+    margin: 10px 0 2px;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--lm-accent-ink);
+}
+.lm-root.lm-searching .lm-search-miss,
+.lm-root.lm-searching .lm-setgroup,
+.lm-root.lm-searching .lm-pane-foot,
+.lm-root.lm-searching .lm-pane-intro { display: none !important; }
+.lm-root.lm-searching .lm-tabs .lm-tab.active { background: transparent; box-shadow: none; }
