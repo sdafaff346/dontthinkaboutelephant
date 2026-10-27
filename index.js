@@ -987,11 +987,11 @@ const QR_MODES = {
     keep: '빼지 않기',
 };
 
-// Many QRs "pause the role-play" and generate a side piece (a balance game, a time-loop what-if,
-// an ideal-type survey) that is posted as the character with /sendas, or sent with /send and
+// Many QRs "pause the role-play" and generate a side piece (a quiz, a what-if,
+// an interview) that is posted as the character with /sendas, or sent with /send and
 // answered with /trigger. Those are not part of the story. They are recognised by the
 // instruction that produced them and tagged extra.lm_qr = 'aside' ('story' for QRs that just
-// move the scene along, like "finish the scene").
+// move the scene along, like "skip ahead").
 const ASIDE_RE = /\b(pause|stop|halt|suspend|interrupt)\b[^.\n]{0,40}\b(role-?play|rp|scenario|story|roleplay)\b|\bpause\s+rp\b|set aside all prior prompts|(롤플|역할극|RP)[^\n]{0,12}(멈|중단|정지|잠깐)/i;
 
 function isQrMessage(msg) {
@@ -1059,7 +1059,7 @@ async function openQrSorter() {
     if (!rows.length) return toastr.info('이 채팅에는 QR·슬래시 명령으로 넣은 메시지가 없어요.', APP_NAME);
     const wrap = document.createElement('div');
     wrap.innerHTML = `<div class="lm-root lm-manager lm-qrsort"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>QR 메시지 분류</h3></div>
-  <p class="lm-hint lm-pane-intro">QR이나 슬래시 명령으로 들어온 메시지예요. 롤플을 멈추고 만든 번외편(밸런스 게임, 타임루프, 설문 같은 것)은 <b>번외편</b>, 이야기를 이어 가는 것은 <b>이야기</b>로 두세요. 번외편은 요약·회상·답변 점검에서 빠져요. 이미 요약에 들어간 번외편은 그 기억에 '다시 요약' 표시가 붙어요.</p>
+  <p class="lm-hint lm-pane-intro">QR이나 슬래시 명령으로 들어온 메시지예요. 롤플을 멈추고 만든 번외편(퀴즈, 만약에 시뮬레이션, 인터뷰 같은 것)은 <b>번외편</b>, 이야기를 이어 가는 것은 <b>이야기</b>로 두세요. 번외편은 요약·회상·답변 점검에서 빠져요. 이미 요약에 들어간 번외편은 그 기억에 '다시 요약' 표시가 붙어요.</p>
   <div class="lm-qrsort-list">${rows.map(r => `
     <div class="lm-qrsort-row" data-i="${r.i}">
       <div class="lm-qrsort-text"><b>#${r.i} ${esc(r.m.name || '')}</b>${r.known ? '' : '<em>추정</em>'}<span>${esc(stripMessage(r.m.mes).replace(/\s+/g, ' ').slice(0, 120))}</span></div>
@@ -6273,7 +6273,7 @@ function settingsHtml() {
           ${checkRow('softenSensitive', '민감한 장면 순화 (기본 꺼짐)', '꺼져 있으면 모든 장면을 있는 그대로 요약해요. 켜면 야하거나 잔인한 장면을 짧고 덤덤하게 줄여 적어서 검열에 덜 걸리지만, 그만큼 덜 자세히 기억해요')}
           ${selectRow('language', '요약 언어', selectOptions(LANGUAGES, s.language), s.language, 'English가 토큰을 가장 적게 써요')}
           ${selectRow('detail', '상세도', selectOptions({ concise: '간결', standard: '보통', detailed: '상세' }, s.detail), s.detail, '상세할수록 오래 기억하지만 토큰이 늘어요')}
-          ${selectRow('qrMessages', 'QR·슬래시 명령 메시지', selectOptions(QR_MODES, s.qrMessages === 'comment' ? 'aside' : s.qrMessages), s.qrMessages === 'comment' ? 'aside' : s.qrMessages, '빠른 답장(QR)으로 만든 분석(/comment)과 롤플을 멈추고 만든 번외편(밸런스 게임, 타임루프 같은 시뮬레이션)을 요약·회상·답변 점검에서 빼요. "마무리", "빨리빨리"처럼 이야기를 이어 가는 QR은 그대로 기억해요')}
+          ${selectRow('qrMessages', 'QR·슬래시 명령 메시지', selectOptions(QR_MODES, s.qrMessages === 'comment' ? 'aside' : s.qrMessages), s.qrMessages === 'comment' ? 'aside' : s.qrMessages, '빠른 답장(QR)으로 만든 분석(/comment)과 롤플을 멈추고 만든 번외편(퀴즈, 인터뷰, 만약에 시뮬레이션 같은 것)을 요약·회상·답변 점검에서 빼요. 장면을 넘기거나 이어 쓰게 하는 QR은 그대로 기억해요')}
           <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_qrsort">${icon('ledger')}<span>QR 메시지 분류</span></button><span class="lm-hint">이 버전 전에 들어온 QR 메시지를 번외편/이야기로 직접 골라요</span></div>
           ${group('상태창', '답변에 붙는 시간·날짜·장소·날씨 줄')}
           ${selectRow('statusMode', '상태창 기억', selectOptions(STATUS_MODES, s.statusMode), s.statusMode, '[ 🌙 오후 8:15 · 1943년 12월 9일 (목) · 호그와트 → 병동 · ❄️ 눈발, -1°C ] 같은 상태창이나 "📅 날짜: / 📍 장소:" 줄을 답변에서 그대로 읽어요. API는 쓰지 않아요')}
