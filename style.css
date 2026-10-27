@@ -1915,3 +1915,14 @@
 .lm-qrsort-text em { font-style: normal; font-size: 11px; color: var(--lm-accent-ink); }
 .lm-qrsort-text span { color: var(--lm-muted); overflow-wrap: anywhere; }
 .lm-root .lm-qrsort-row .lm-select { flex: 0 0 auto; max-width: 110px; }
+
+/* status bar memory */
+.lm-status-latest { display: flex; flex-direction: column; gap: 4px; margin: 0 0 12px; padding: 10px 12px; border: 1px solid var(--lm-line); border-left: 3px solid var(--lm-accent); border-radius: 10px; background: var(--lm-card); }
+.lm-root .lm-status-latest pre { margin: 0; padding: 0; background: none; border: 0; font-family: inherit; font-size: 13.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--lm-text); }
+.lm-status-list { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
+.lm-root .lm-status-row { all: unset; box-sizing: border-box; display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; width: 100%; padding: 8px 12px; border: 1px solid var(--lm-line); border-radius: 10px; background: var(--lm-card); font-size: 13px; color: var(--lm-text); cursor: pointer; }
+.lm-root .lm-status-row:hover, .lm-root .lm-status-row:focus-visible { border-color: var(--lm-accent); }
+.lm-status-row .lm-range { flex: 0 0 auto; }
+.lm-status-when { font-weight: 600; overflow-wrap: anywhere; }
+.lm-status-place { color: var(--lm-muted); overflow-wrap: anywhere; }
+.lm-status-weather { color: var(--lm-muted); font-size: 12px; overflow-wrap: anywhere; }

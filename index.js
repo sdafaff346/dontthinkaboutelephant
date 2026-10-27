@@ -150,6 +150,10 @@ const defaultSettings = Object.freeze({
     liveStateUpdate: false,
     liveStateUndo: true,
     qrMessages: 'aside',
+    statusMode: 'auto',
+    statusPattern: '',
+    statusInject: true,
+    statusWhen: true,
     queryExpansion: false,
     expansionTimeoutMs: 15000,
     autoBackupEvery: 10,
@@ -380,6 +384,7 @@ function emptyMemory() {
         castSeeded: false,
         hooks: [],
         merged: [],
+        statusBar: null,
     };
 }
 
@@ -743,6 +748,236 @@ function stripMessage(text) {
     return t.replace(/\n{3,}/g, '\n\n').trim();
 }
 
+// ---------------------------------------------------------------- status bar
+// Many presets end (or start) every reply with a status bar such as
+// "[ 🌙 오후 8:15 · 1943년 12월 9일 (목) · 호그와트 → 병동 · ❄️ 눈발, -1°C ]" or a few labelled
+// lines ("📅 날짜: … / 📍 장소: …"). It is read straight from the messages, without a model call:
+// the latest one is shown to the AI so time and place carry on, and the in-story time of each
+// summary comes from the status bars of the messages it covers.
+const STATUS_MODES = {
+    auto: '자동으로 찾기',
+    custom: '직접 정한 모양으로 찾기',
+    off: '쓰지 않기',
+};
+const SB_CLOCK = /\d{1,2}\s*:\s*\d{2}|(?:오전|오후|새벽|아침|점심|낮|저녁|밤|심야|자정|정오)\s*\d{1,2}\s*시|\d{1,2}\s*시\s*\d{1,2}\s*분|\b\d{1,2}\s*(?:am|pm|a\.m\.|p\.m\.)(?![a-z])|\b(?:am|pm)\s*\d{1,2}\b/i;
+const SB_DATE = /\d{1,4}\s*년|\d{1,2}\s*월\s*\d{1,2}\s*일|\b\d{4}[-./]\d{1,2}[-./]\d{1,2}\b|[(（]\s*[월화수목금토일]\s*[)）]|[월화수목금토일]요일|\d+\s*일\s*차|\bday\s*\d+\b|\bD\s*[+-]\s*\d+\b|\b(?:mon|tue|wed|thu|fri|sat|sun)(?:day)?\b|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b|[春夏秋冬]|(?:봄|여름|가을|겨울)(?:\s|$|,)/i;
+const SB_WEATHER = /[☀🌤⛅🌥☁🌦🌧⛈🌩🌨❄☃⛄🌫🌪🌬☔🌈]|-?\d+(?:\.\d+)?\s*(?:°\s*[CF]?|℃|℉)|영[하상]\s*\d+\s*도|맑음|흐림|구름\s*(?:많음|조금)|소나기|폭우|폭설|눈발|함박눈|진눈깨비|가랑비|이슬비|보슬비|장대비|안개|황사|미세먼지|강풍|무더위|폭염|한파|화창|\b(?:sunny|cloudy|rainy|raining|snowy|snowing|foggy|stormy|overcast|windy|drizzle)\b/iu;
+const SB_PLACE = /→|->|⇒|➡|📍|🗺/;
+const SB_LABEL = /^[\s>*_\-•·|]*(?:[\p{Extended_Pictographic}️‍]+\s*)?[*_]*\s*([^:：\n]{1,14}?)\s*[*_]*\s*[:：]\s*(.+)$/u;
+const SB_LABEL_KIND = [
+    [/^(날짜|일자|요일|일시|계절|date|day|season)$/i, 'date'],
+    [/^(시간|시각|현재\s*시각|현재\s*시간|time|clock)$/i, 'time'],
+    [/^(장소|위치|현재\s*위치|현재\s*장소|location|place|where)$/i, 'place'],
+    [/^(날씨|기온|weather|temp|temperature)$/i, 'weather'],
+];
+const SB_EMOJI = /[\p{Extended_Pictographic}️‍]/gu;
+const STATUS_CACHE = new WeakMap();
+let statusCutoff = null;
+
+function sbClean(s) {
+    return String(s || '').replace(SB_EMOJI, '').replace(/\*\*|__|`/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function sbLabelKind(label) {
+    const key = sbClean(label);
+    for (const [re, kind] of SB_LABEL_KIND) if (re.test(key)) return kind;
+    return '';
+}
+
+// Turns the parts of a one-line status bar into fields.
+function statusFields(parts) {
+    const f = { when: [], place: '', weather: [], extra: [] };
+    const rest = [];
+    for (const raw of parts) {
+        const p = sbClean(raw);
+        if (!p) continue;
+        const label = p.match(/^([^:：]{1,14})\s*[:：]\s*(.+)$/);
+        const kind = label ? sbLabelKind(label[1]) : '';
+        const value = label && kind ? label[2].trim() : p;
+        // "☀️ 오전 7:30" is a time with a sun icon; only weather words or a temperature make it weather.
+        if (kind === 'date' || kind === 'time' || (!kind && (SB_DATE.test(p) || SB_CLOCK.test(p)) && !SB_WEATHER.test(p))) f.when.push(value);
+        else if (kind === 'place' || (!kind && SB_PLACE.test(raw))) f.place = f.place ? `${f.place}, ${value}` : value;
+        else if (kind === 'weather' || (!kind && SB_WEATHER.test(raw))) f.weather.push(value);
+        else rest.push(value);
+    }
+    // A bar without an arrow usually still names the place: the first plain words without numbers.
+    if (!f.place) {
+        const i = rest.findIndex(p => p.length <= 40 && !/\d/.test(p));
+        if (i >= 0) f.place = rest.splice(i, 1)[0];
+    }
+    f.extra = rest.slice(0, 8);
+    return {
+        when: f.when.join(' ').slice(0, 80),
+        place: f.place.replace(/\s*(?:->|⇒|➡)\s*/g, ' → ').slice(0, 80),
+        weather: f.weather.join(', ').slice(0, 60),
+        extra: f.extra.join(' · ').slice(0, 160),
+    };
+}
+
+function splitStatusLine(inner) {
+    return inner.split(/\s*[·•|｜∙ㆍ]\s*|\s+\/\s+/).map(p => p.trim()).filter(Boolean);
+}
+
+// One line that looks like a status bar, or null.
+function statusFromLine(line) {
+    let t = line.trim().replace(/^(?:>\s*)+/, '').replace(/^[*_`#\s]+|[*_`\s]+$/g, '');
+    if (t.length < 8 || t.length > 320) return null;
+    if (/^["“”'‘’「]/.test(t) && !/^「[^」]*[·|]/.test(t)) return null;
+    const wrap = t.match(/^[[【〔「『〈(（<]\s*([\s\S]+?)\s*[\]】〕」』〉)）>]$/);
+    const inner = wrap ? wrap[1] : t;
+    const parts = splitStatusLine(inner);
+    if (parts.length < 2) return null;
+    const has = { clock: false, date: false, weather: false, place: false };
+    for (const p of parts) {
+        if (SB_CLOCK.test(p)) has.clock = true;
+        if (SB_DATE.test(p)) has.date = true;
+        if (SB_WEATHER.test(p)) has.weather = true;
+        if (SB_PLACE.test(p)) has.place = true;
+    }
+    const score = Object.values(has).filter(Boolean).length;
+    if (!has.clock && !has.date) return null;
+    if (!(wrap ? score >= 2 : score >= 3 && parts.length >= 3)) return null;
+    // Story prose with a middle dot is long and has sentence endings; a bar is short fields.
+    if (parts.some(p => p.length > 60) || /[.!?。]\s*$/.test(inner) && !wrap) return null;
+    return { raw: line.trim(), ...statusFields(parts) };
+}
+
+// Consecutive "label: value" lines (📅 날짜: … / ⏰ 시간: … / 📍 장소: …) with at least two known labels.
+function statusFromLabels(lines, start) {
+    const run = [];
+    const kinds = new Set();
+    let i = start;
+    for (; i < lines.length && run.length < 12; i++) {
+        const l = lines[i].trim();
+        if (!l) break;
+        const m = l.match(SB_LABEL);
+        if (!m || m[2].length > 120) break;
+        run.push(l);
+        const kind = sbLabelKind(m[1]);
+        if (kind) kinds.add(kind);
+    }
+    if (kinds.size < 2 || !(kinds.has('date') || kinds.has('time'))) return null;
+    return { end: i, bar: { raw: run.join('\n'), ...statusFields(run.map(l => sbClean(l).replace(/^[>*_\-•·|\s]+/, ''))) } };
+}
+
+function statusRegex() {
+    const s = getSettings();
+    if (s.statusMode !== 'custom' || !String(s.statusPattern || '').trim()) return null;
+    try {
+        return new RegExp(s.statusPattern, 'gim');
+    } catch {
+        return null;
+    }
+}
+
+// All status bars in a message text, in order.
+function findStatusBars(text) {
+    const s = getSettings();
+    if (s.statusMode === 'off' || !text) return [];
+    const re = statusRegex();
+    if (re) {
+        const out = [];
+        for (const m of String(text).matchAll(re)) {
+            if (!m[0].trim()) continue;
+            const body = (m[1] ?? m[0]).trim();
+            const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
+            const labelled = lines.length > 1 ? statusFromLabels(lines, 0) : null;
+            const fields = labelled ? labelled.bar : statusFields(splitStatusLine(body.replace(/^[[【〔「『〈(（]\s*|\s*[\]】〕」』〉)）]$/g, '')));
+            out.push({ ...fields, raw: m[0].trim() });
+            if (out.length >= 6) break;
+        }
+        return out;
+    }
+    const lines = String(text).split('\n');
+    const out = [];
+    for (let i = 0; i < lines.length && out.length < 6; i++) {
+        const bar = statusFromLine(lines[i]);
+        if (bar) { out.push(bar); continue; }
+        if (SB_LABEL.test(lines[i])) {
+            const hit = statusFromLabels(lines, i);
+            if (hit) { out.push(hit.bar); i = hit.end - 1; }
+        }
+    }
+    return out;
+}
+
+function statusSettingsKey() {
+    const s = getSettings();
+    return `${s.statusMode}|${s.statusMode === 'custom' ? s.statusPattern : ''}|${s.stripHtml}`;
+}
+
+// Status bars of one chat message, cached per message text.
+function messageStatusBars(msg) {
+    if (!msg || msg.is_user || isQrMessage(msg) || getSettings().statusMode === 'off') return [];
+    const key = statusSettingsKey();
+    let hit = STATUS_CACHE.get(msg);
+    if (!hit || hit.mes !== msg.mes || hit.key !== key) {
+        let bars = [];
+        try { bars = findStatusBars(stripMessage(msg.mes)); } catch (err) { console.warn(LOG_PREFIX, 'status bar read failed', err); }
+        hit = { mes: msg.mes, key, bars };
+        STATUS_CACHE.set(msg, hit);
+    }
+    return hit.bars;
+}
+
+// The newest status bar in the chat (hidden messages count too), or the last one remembered.
+function latestStatus(memory = getMemory(false), before = null) {
+    if (getSettings().statusMode === 'off') return null;
+    const { chat } = ctx();
+    const end = Math.min(chat.length, before ?? chat.length) - 1;
+    for (let i = end; i >= 0 && i > end - 300; i--) {
+        const bars = messageStatusBars(chat[i]);
+        if (bars.length) {
+            const bar = { at: i, ...bars[bars.length - 1] };
+            if (memory && before === null && (memory.statusBar?.at !== bar.at || memory.statusBar?.raw !== bar.raw)) memory.statusBar = bar;
+            return bar;
+        }
+    }
+    return before === null && memory?.statusBar?.raw ? memory.statusBar : null;
+}
+
+function statusOneLine(bar) {
+    if (!bar) return '';
+    if (!bar.raw.includes('\n') && bar.raw.length <= 220) return bar.raw;
+    return [bar.when, bar.place, bar.weather, bar.extra].filter(Boolean).join(' · ').slice(0, 260);
+}
+
+// In-story time covered by a set of messages, read from their status bars.
+function statusSpan(indices) {
+    if (getSettings().statusMode === 'off' || !getSettings().statusWhen) return '';
+    const { chat } = ctx();
+    const whens = [];
+    for (const i of indices || []) {
+        for (const bar of messageStatusBars(chat[i])) if (bar.when) whens.push(bar.when);
+    }
+    if (!whens.length) return '';
+    const first = whens[0];
+    const last = whens[whens.length - 1];
+    if (first === last) return first.slice(0, 80);
+    const span = `${first} ~ ${last}`;
+    if (span.length <= 80) return span;
+    // Too long: keep the dates and drop the clock times.
+    const dateOnly = (w) => w.replace(SB_CLOCK, '').replace(/\s+/g, ' ').trim() || w;
+    const a = dateOnly(first);
+    const b = dateOnly(last);
+    return (a === b ? a : `${a} ~ ${b}`).slice(0, 80);
+}
+
+// Status bars of every story message, oldest first, with repeats folded together.
+function statusHistory() {
+    const { chat } = ctx();
+    const rows = [];
+    for (let i = 0; i < chat.length; i++) {
+        const bars = messageStatusBars(chat[i]);
+        if (!bars.length) continue;
+        const bar = bars[bars.length - 1];
+        const prev = rows[rows.length - 1];
+        if (prev && prev.when === bar.when && prev.place === bar.place && prev.weather === bar.weather) { prev.to = i; continue; }
+        rows.push({ at: i, to: i, ...bar });
+    }
+    return rows;
+}
+
 // Quick Reply scripts post their results with slash commands: /comment (a note, type 'comment'),
 // /sys (narrator) and /sendas. SillyTavern marks all of these with extra.model 'slash command'.
 // Comments are never story; the other two can be either, so that is the user's choice.
@@ -852,6 +1087,83 @@ async function openQrSorter() {
     await persistChat();
     updateStatus();
     toastr.success(`번외편 ${asides}개를 기억에서 뺐어요.${stale ? ` 이미 요약된 기억 ${stale}개에 '다시 요약' 표시를 했어요.` : ''}`, APP_NAME);
+}
+
+// Fills the in-story time of existing summaries from the status bars of the messages they cover.
+function fillWhenFromStatus(memory) {
+    const { chat } = ctx();
+    const owned = new Map();
+    chat.forEach((m, i) => {
+        const owner = m?.extra?.lm_owner;
+        if (!owner) return;
+        if (!owned.has(owner)) owned.set(owner, []);
+        owned.get(owner).push(i);
+    });
+    let changed = 0;
+    for (const node of memory.timeline) {
+        if (node.from < 0) continue;
+        let indices = owned.get(node.id);
+        if (!indices?.length) {
+            indices = [];
+            for (let i = Math.max(0, node.from); i <= Math.min(chat.length - 1, node.to); i++) indices.push(i);
+        }
+        const span = statusSpan(indices);
+        if (span && span !== node.when) { node.when = span; changed++; }
+    }
+    return changed;
+}
+
+async function openStatusHistory() {
+    const c = ctx();
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    const s = getSettings();
+    if (s.statusMode === 'off') return toastr.info('설정 → 요약 → 상태창 기억이 꺼져 있어요.', APP_NAME);
+    if (s.statusMode === 'custom' && String(s.statusPattern || '').trim() && !statusRegex()) {
+        return toastr.warning('직접 정한 상태창 모양(정규식)이 올바르지 않아요. 설정에서 고쳐 주세요.', APP_NAME);
+    }
+    const memory = getMemory(false);
+    const rows = statusHistory();
+    const latest = latestStatus(memory);
+    const nodes = memory?.timeline.filter(n => n.from >= 0).length || 0;
+    const wrap = document.createElement('div');
+    const row = (r) => `
+    <button type="button" class="lm-status-row" data-jump="${r.at}">
+      <span class="lm-range">#${r.at}${r.to > r.at ? `~#${r.to}` : ''}</span>
+      <span class="lm-status-when">${esc(r.when || '시간 없음')}</span>
+      <span class="lm-status-place">${esc(r.place || '')}</span>
+      ${r.weather ? `<span class="lm-status-weather">${esc(r.weather)}</span>` : ''}
+    </button>`;
+    wrap.innerHTML = `<div class="lm-root lm-manager lm-statuslog"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>상태창 기록</h3></div>
+  <p class="lm-hint lm-pane-intro">답변에 붙은 상태창을 그대로 읽어서 모아 둔 거예요. 가장 최근 상태창은 AI에게 알려 줘서 시간·날짜·장소가 이어지게 하고, 요약할 때 에피소드의 작중 시간으로 써요. API는 쓰지 않아요.</p>
+  ${latest ? `<div class="lm-status-latest"><span class="lm-field-label">가장 최근 상태창 · #${latest.at}</span><pre>${esc(latest.raw)}</pre><span class="lm-hint">읽은 값: ${esc([latest.when && `시간 ${latest.when}`, latest.place && `장소 ${latest.place}`, latest.weather && `날씨 ${latest.weather}`].filter(Boolean).join(' / ') || '없음')}</span></div>` : `<div class="lm-empty">이 채팅에서 상태창을 찾지 못했어요. 상태창 모양이 특이하면 설정 → 요약 → 상태창 기억을 '직접 정한 모양으로 찾기'로 바꾸고 정규식을 적어 주세요.</div>`}
+  ${nodes && rows.length ? `<div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_status_fill">${icon('rotate')}<span>지난 요약의 작중 시간 채우기</span></button><span class="lm-hint">이미 만든 에피소드·챕터의 작중 시간을 상태창 기준으로 다시 적어요. 연표가 정확해져요</span></div>` : ''}
+  ${rows.length ? `<div class="lm-status-list">${rows.slice(-300).reverse().map(row).join('')}</div>` : ''}
+</div>`;
+    applyThemeMode(wrap.firstElementChild);
+    const popup = new c.Popup(wrap, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, allowVerticalScrolling: true, leftAlign: true });
+    wrap.querySelectorAll('[data-jump]').forEach(btn => btn.addEventListener('click', async () => {
+        await popup.completeCancelled();
+        jumpToMessage(Number(btn.dataset.jump));
+    }));
+    wrap.querySelector('#lm_status_fill')?.addEventListener('click', async (e) => {
+        const mem = getMemory(false);
+        if (!mem) return;
+        const before = JSON.stringify(mem.timeline.map(n => n.when || ''));
+        pushHistory(mem, '작중 시간 채우기');
+        const changed = fillWhenFromStatus(mem);
+        if (!changed || JSON.stringify(mem.timeline.map(n => n.when || '')) === before) {
+            mem.history.pop();
+            toastr.info('바꿀 작중 시간이 없어요. 이미 상태창과 같거나, 요약한 메시지에 상태창이 없어요.', APP_NAME);
+            return;
+        }
+        await persistChat();
+        refreshInjection();
+        updateStatus();
+        e.currentTarget.disabled = true;
+        logActivity('compress', `상태창으로 기억 ${changed}개의 작중 시간을 채웠어요`);
+        toastr.success(`기억 ${changed}개의 작중 시간을 상태창 기준으로 채웠어요. 되돌리기로 돌릴 수 있어요.`, APP_NAME);
+    });
+    await popup.show();
 }
 
 function isSummarizable(msg) {
@@ -1443,8 +1755,11 @@ function buildAnchorText(memory) {
     if (!memory) return '';
     const sc = memory.ledger.scene || {};
     const bits = [];
-    const scene = [sc.time, sc.place, sc.present].filter(Boolean).join(' | ');
-    if (scene) bits.push(`Now: ${scene}`);
+    // A status bar in the chat is newer and more exact than the time and place in the fact sheet.
+    const status = getSettings().statusInject ? latestStatus(memory, statusCutoff) : null;
+    const scene = (status ? [sc.present] : [sc.time, sc.place, sc.present]).filter(Boolean).join(' | ');
+    if (status) bits.push(`Latest status bar (message #${status.at}): ${statusOneLine(status)}. Carry the in-story time, date and place on from here; move them forward only as the story does`);
+    if (scene) bits.push(`${status ? 'Present' : 'Now'}: ${scene}`);
     const threads = memory.ledger.entries
         .filter(e => e.cat === 'thread' && e.status !== 'closed')
         .sort((a, b) => b.importance - a.importance)
@@ -2195,7 +2510,9 @@ async function refreshRecall(recentChat) {
 globalThis.longMemoryInterceptor = async function (chat, _contextSize, _abort, type) {
     if (type === 'quiet') return;
     try {
-        refreshInjection();
+        // A swipe rewrites the last reply, so its old status bar must not count as "latest".
+        statusCutoff = type === 'swipe' ? ctx().chat.length - 1 : null;
+        try { refreshInjection(); } finally { statusCutoff = null; }
         const recalled = await refreshRecall(chat);
         const s = getSettings();
         const memory = s.enabled ? getMemory(false) : null;
@@ -3747,6 +4064,9 @@ async function summarizeBatchOnce(memory, batch) {
         hooks = getSettings().hooksEnabled ? parseJsonLenient(extractTag(out, 'hooks') || '') : null;
     }
     if (!node) throw new Error('요약 응답을 해석하지 못했습니다.');
+    // The status bars written in the messages give the exact in-story time.
+    const span = statusSpan(batch.indices);
+    if (span) node.when = span;
     return { node, ops, events, voices, hooks: Array.isArray(hooks) ? hooks : [] };
 }
 
@@ -4405,6 +4725,7 @@ function onMessageReceived(id, type) {
     decorateMessage(Number(id));
     if (['quiet', 'impersonate', 'first_message'].includes(type)) return;
     try { if (tagQrMessage(Number(id), type)) return; } catch (err) { console.warn(LOG_PREFIX, 'qr tag failed', err); }
+    try { latestStatus(); } catch (err) { console.warn(LOG_PREFIX, 'status bar read failed', err); }
     maybeAutoCompress();
     setTimeout(() => afterTurn(Number(id)), 0);
 }
@@ -5954,6 +6275,12 @@ function settingsHtml() {
           ${selectRow('detail', '상세도', selectOptions({ concise: '간결', standard: '보통', detailed: '상세' }, s.detail), s.detail, '상세할수록 오래 기억하지만 토큰이 늘어요')}
           ${selectRow('qrMessages', 'QR·슬래시 명령 메시지', selectOptions(QR_MODES, s.qrMessages === 'comment' ? 'aside' : s.qrMessages), s.qrMessages === 'comment' ? 'aside' : s.qrMessages, '빠른 답장(QR)으로 만든 분석(/comment)과 롤플을 멈추고 만든 번외편(밸런스 게임, 타임루프 같은 시뮬레이션)을 요약·회상·답변 점검에서 빼요. "마무리", "빨리빨리"처럼 이야기를 이어 가는 QR은 그대로 기억해요')}
           <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_qrsort">${icon('ledger')}<span>QR 메시지 분류</span></button><span class="lm-hint">이 버전 전에 들어온 QR 메시지를 번외편/이야기로 직접 골라요</span></div>
+          ${group('상태창', '답변에 붙는 시간·날짜·장소·날씨 줄')}
+          ${selectRow('statusMode', '상태창 기억', selectOptions(STATUS_MODES, s.statusMode), s.statusMode, '[ 🌙 오후 8:15 · 1943년 12월 9일 (목) · 호그와트 → 병동 · ❄️ 눈발, -1°C ] 같은 상태창이나 "📅 날짜: / 📍 장소:" 줄을 답변에서 그대로 읽어요. API는 쓰지 않아요')}
+          ${textRow('statusPattern', '직접 정한 모양 (정규식)', "'직접 정한 모양으로 찾기'일 때만 써요. 괄호 ( )로 묶은 부분을 상태창 내용으로 읽어요", '예: ^\\[(.+)\\]$')}
+          ${checkRow('statusInject', '마지막 상태창을 AI에게 알려주기', '요약으로 옛 답변이 숨겨져도 가장 최근 상태창을 리마인더에 넣어서 시간·날짜·장소가 끊기지 않게 해요')}
+          ${checkRow('statusWhen', '작중 시간은 상태창 기준으로', '요약할 때 그 구간 상태창의 첫 시간과 끝 시간을 에피소드의 작중 시간으로 써요. 연표가 정확해져요')}
+          <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_status">${icon('calendar')}<span>상태창 기록</span></button><span class="lm-hint">찾은 상태창을 확인하고, 지난 요약의 작중 시간을 채워요</span></div>
           ${numberRow('keepRecent', '최근 원본 유지', 0, 5000, '이만큼의 최근 메시지는 요약하지 않고 그대로 둬요')}
           ${group('함께 챙길 것', '캐해·검수·복선')}
           ${checkRow('voiceEnabled', '캐해 보존', '캐릭터 카드로 핵심 성격과 말투를 정리해 고정하고, 요약할 때 실제 대사 샘플을 모아 AI에게 함께 보여줘요. 기억장 → 캐릭터 탭에서 고칠 수 있어요')}
@@ -6281,6 +6608,7 @@ function bindSettings(root) {
     root.querySelector('#lm_btn_search').addEventListener('click', () => openSearchTest());
     root.querySelector('#lm_btn_test').addEventListener('click', () => testConnection());
     root.querySelector('#lm_btn_qrsort')?.addEventListener('click', () => openQrSorter());
+    root.querySelector('#lm_btn_status')?.addEventListener('click', () => openStatusHistory());
     renderPromptEditors(root);
     let pickedStyle = s.promptStyle || 'default';
     renderStyleList(root, pickedStyle);
@@ -7265,7 +7593,12 @@ function managerHtml(memory) {
   <section class="lm-pane" data-lm-pane="ledger" role="tabpanel">
     <div class="lm-wiki-tools">
       ${tool('lm_relmap', 'graph', '관계도 보기', '', '관계 항목을 인물 그림으로 그려요')}
+      ${getSettings().statusMode !== 'off' ? tool('lm_statuslog', 'calendar', '상태창 기록', '', '답변에서 읽은 상태창을 모아 봐요') : ''}
     </div>
+    ${(() => {
+        const bar = getSettings().statusMode !== 'off' ? latestStatus(memory) : null;
+        return bar ? `<div class="lm-status-latest lm-status-inline"><span class="lm-field-label">가장 최근 상태창 · #${bar.at}</span><pre>${esc(bar.raw)}</pre><span class="lm-hint">답변마다 새로 읽어요. 아래 칸은 요약할 때 정리한 상황이에요</span></div>` : '';
+    })()}
     <div class="lm-scene">
       <div class="lm-field lm-field-stack"><div class="lm-field-text"><span class="lm-field-label">시간</span></div><input class="text_pole" id="lm_s_time" value="${esc(sc.time)}"></div>
       <div class="lm-field lm-field-stack"><div class="lm-field-text"><span class="lm-field-label">장소</span></div><input class="text_pole" id="lm_s_place" value="${esc(sc.place)}"></div>
@@ -7655,7 +7988,7 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
         }
         const menu = root.querySelector('.lm-menu');
         if (menu?.open && !event.target.closest('.lm-menu > summary')) menu.open = false;
-        const tool = event.target.closest('#lm_ko, #lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_relmap, #lm_verify');
+        const tool = event.target.closest('#lm_ko, #lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_relmap, #lm_statuslog, #lm_verify');
         if (!tool) return;
         switch (tool.id) {
             case 'lm_chron':
@@ -7663,6 +7996,13 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
                 break;
             case 'lm_relmap':
                 await openRelationMap(collectManager(root, memory));
+                break;
+            case 'lm_statuslog':
+                // Filling in-story times edits the timeline, so save and reopen around it.
+                await saveThen(async () => {
+                    await openStatusHistory();
+                    openManager({ tab: 'ledger' });
+                });
                 break;
             case 'lm_verify':
                 await saveThen(async () => {
@@ -8942,6 +9282,7 @@ function registerCommands() {
         helpString: `<div>코끼리를 생각하지마: ${help}</div>`,
     }));
     simple('lm-chronicle', '작중 시간 순서로 묶은 연표를 엽니다.', () => { openChronicle(); return ''; });
+    simple('lm-status', '답변에서 읽은 상태창 기록을 엽니다.', () => { openStatusHistory(); return ''; });
     simple('lm-relations', '기록부의 관계 항목으로 인물 관계도를 그립니다.', () => { openRelationMap(); return ''; });
     simple('lm-merge', '다른 채팅이나 파일의 기억을 지금 기억에 합칩니다.', async () => { await openMerge(); return ''; });
     simple('lm-compare', '같은 대화를 두 지시문 방식으로 요약해 비교합니다.', async () => { await compareStyles(); return ''; });
