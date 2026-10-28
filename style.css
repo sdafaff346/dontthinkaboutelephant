@@ -1926,3 +1926,9 @@
 .lm-status-when { font-weight: 600; overflow-wrap: anywhere; }
 .lm-status-place { color: var(--lm-muted); overflow-wrap: anywhere; }
 .lm-status-weather { color: var(--lm-muted); font-size: 12px; overflow-wrap: anywhere; }
+
+/* warning on hold while the user edits the reply */
+.lm-check-held { margin-left: 6px; font-size: 0.85em; color: var(--SmartThemeQuoteColor, #8A8FA8); opacity: 0.75; }
+.lm-check-held.fa-hourglass-half { animation: lm-held-spin 1.6s ease-in-out infinite; }
+@keyframes lm-held-spin { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .lm-check-held.fa-hourglass-half { animation: none; } }
