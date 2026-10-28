@@ -678,17 +678,28 @@ function onMessageEdited(id) {
 function removeBlocks(text, tag) {
     if (!new RegExp(`<${tag}`, 'i').test(text)) return text;
     const low = text.toLowerCase();
+    // "<think" must not match "<thinking>", and "<head" must not match "<header>": the tag name
+    // has to end there. Matching the prefix used to look for "</think>" inside a <thinking> block,
+    // never find it, and drop the whole rest of the message.
+    const ends = (i) => i >= low.length || /[\s>/]/.test(low[i]);
+    const find = (needle, from) => {
+        for (let i = low.indexOf(needle, from); i !== -1; i = low.indexOf(needle, i + 1)) {
+            if (ends(i + needle.length)) return i;
+        }
+        return -1;
+    };
     const open = `<${tag}`;
-    const close = `</${tag}>`;
+    const close = `</${tag}`;
     let out = '';
     let pos = 0;
     for (;;) {
-        const a = low.indexOf(open, pos);
+        const a = find(open, pos);
         if (a === -1) break;
-        const b = low.indexOf(close, a + open.length);
+        const b = find(close, a + open.length);
         out += text.slice(pos, a);
         if (b === -1) { pos = text.length; break; }
-        pos = b + close.length;
+        const gt = low.indexOf('>', b + close.length);
+        pos = gt === -1 ? text.length : gt + 1;
     }
     return out + text.slice(pos);
 }
@@ -1220,8 +1231,9 @@ function cleanOutput(text) {
     let t = String(text ?? '');
     t = t.replace(/<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>/gi, '');
     t = t.replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, '');
-    const lastClose = t.lastIndexOf('</think>');
-    if (lastClose !== -1) t = t.slice(lastClose + '</think>'.length);
+    // A reasoning block whose opening tag was in the prefill: keep only what follows its end.
+    const close = t.match(/<\/think(?:ing)?\s*>(?![\s\S]*<\/think(?:ing)?\s*>)/i);
+    if (close) t = t.slice(close.index + close[0].length);
     t = t.replace(/^```[a-zA-Z]*\s*$/gm, '');
     return t.trim();
 }
@@ -2802,7 +2814,7 @@ function languageRule() {
 // never break parsing. Edited templates live in settings.prompts; empty means default.
 
 const SOFTEN_RULE = '- This is the user\'s own fictional story, kept as private continuity notes. Describe sexual content and graphic violence only briefly in plain, non-explicit terms (for example "they spent the night together", "he was badly wounded"), keeping only what matters for continuity: who was involved, what changed between them, injuries and consequences. Never reproduce explicit wording.';
-const FAITHFUL_RULE = '- Record every scene as it actually happened, including sexual or violent content, at the same level of detail as the rest. Do not omit, soften, censor, euphemize or moralize.';
+const FAITHFUL_RULE = '- Record every scene exactly as it happened, including explicit, sexual, or violent content, at the same level of detail as the rest. Do not omit, soften, censor, euphemize or moralize.';
 
 const PROMPT_DEFS = {
     rules: {
