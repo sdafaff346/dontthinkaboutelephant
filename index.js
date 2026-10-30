@@ -4424,6 +4424,11 @@ async function afterTurn(messageId, { recheck = false } = {}) {
     const msg = chat[messageId];
     if (!msg || msg.is_user || msg.is_system || isQrMessage(msg)) return;
     const chatId = ctx().getCurrentChatId();
+    // Swipes share one message object. Remember which swipe (and text) is being checked, so a
+    // result that arrives after the user swiped to another reply is not pinned on that reply.
+    const startSwipe = msg.swipe_id ?? 0;
+    const startMes = msg.mes;
+    const moved = () => (msg.swipe_id ?? 0) !== startSwipe || msg.mes !== startMes;
     turnBusy = true;
     turnStartedAt = Date.now();
     renderLive();
@@ -4501,8 +4506,21 @@ async function afterTurn(messageId, { recheck = false } = {}) {
                 }
             }
             const stats = { found, unverified: unsure.length, dropped: filtered.length, rechecked };
+            const result = { issues, filtered, stats, at: Date.now(), swipe: startSwipe, hash: hashString(startMes), ...(recheck ? { edited: true } : {}) };
+            if (moved()) {
+                // The user swiped (or edited) while this ran: file the result under the swipe it
+                // belongs to, quietly, and leave the reply on screen alone.
+                const info = msg.swipe_info?.[startSwipe];
+                if (!recheck && info && msg.swipes?.[startSwipe] === startMes) {
+                    info.extra = info.extra || {};
+                    info.extra.lm_check = result;
+                    ctx().saveMetadataDebounced?.();
+                }
+                logActivity('check', `#${messageId} 점검하는 동안 다른 답변으로 바뀌어서, 결과는 원래 답변(${startSwipe + 1}번째)에만 남겼어요`);
+                return;
+            }
             msg.extra = msg.extra || {};
-            msg.extra.lm_check = { issues, filtered, stats, at: Date.now(), swipe: msg.swipe_id ?? 0, ...(recheck ? { edited: true } : {}) };
+            msg.extra.lm_check = result;
             if (recheck) heldChecks.delete(msg);
             decorateMessage(messageId);
             ctx().saveMetadataDebounced ? ctx().saveMetadataDebounced() : await persistChat();
@@ -4525,7 +4543,7 @@ async function afterTurn(messageId, { recheck = false } = {}) {
             }
             if (issues.length) turnLevel = 'warn';
         }
-        if (doState) {
+        if (doState && !moved()) {
             const ops = (parseJsonLenient(extractTag(out, 'ledger') || '') || []).filter(op => {
                 const kind = String(op?.op || '').toLowerCase();
                 if (kind === 'scene') return true;
@@ -4707,7 +4725,9 @@ async function recheckEditedMessage(msg) {
     } catch (err) {
         console.warn(LOG_PREFIX, 'recheck failed', err);
     } finally {
-        // Not checked (no memory, chat changed, error): the old warning stays.
+        // Not checked (no memory, chat changed, error): the old warning stays, now on the edited text.
+        const check = msg.extra?.lm_check;
+        if (heldChecks.get(msg) && check?.hash && check.hash !== hashString(msg.mes)) check.hash = hashString(msg.mes);
         heldChecks.delete(msg);
         const id = ctx().chat.indexOf(msg);
         if (id >= 0) decorateMessage(id);
@@ -4758,7 +4778,9 @@ function decorateMessage(id) {
     const view = el.querySelector('.lm-mes-view');
     if (view) view.style.display = msg.extra?.lm_owner && msg.extra.lm_owner !== SAGA_OWNER ? '' : 'none';
     const check = msg.extra?.lm_check;
-    const sameSwipe = (check?.swipe ?? 0) === (msg.swipe_id ?? 0);
+    // The warning belongs to one swipe and one text: after a swipe is deleted (indexes shift) or
+    // the reply is edited by hand, an old warning must not land on different text.
+    const sameSwipe = (check?.swipe ?? 0) === (msg.swipe_id ?? 0) && (!check?.hash || check.hash === hashString(msg.mes));
     const held = heldChecks.get(msg);
     const warn = !held && sameSwipe && !!check?.issues?.length;
     const quiet = !held && sameSwipe && !warn && !!check?.filtered?.length;
@@ -4825,6 +4847,11 @@ function onDocumentClick(event) {
 }
 
 function onMessageReceived(id, type) {
+    // A new swipe starts from a copy of the previous swipe's extra, so that swipe's warning and
+    // live-update tag came along. They belong to the other reply: drop them here.
+    if (type === 'swipe') {
+        try { forgetCarriedSwipeData(Number(id)); } catch (err) { console.warn(LOG_PREFIX, 'swipe cleanup failed', err); }
+    }
     updateStatus();
     decorateMessage(Number(id));
     if (['quiet', 'impersonate', 'first_message'].includes(type)) return;
@@ -9624,6 +9651,18 @@ function onChatChanged() {
     setTimeout(decorateAll, 300);
     if (getMemory(false)) syncAfter();
     setTimeout(offerHandoff, 600);
+}
+
+function forgetCarriedSwipeData(id) {
+    const msg = ctx().chat[id];
+    if (!msg?.extra) return;
+    let changed = false;
+    if (msg.extra.lm_check) { delete msg.extra.lm_check; changed = true; }
+    if (msg.extra.lm_turn) { delete msg.extra.lm_turn; changed = true; }
+    if (!changed) return;
+    decorateMessage(id);
+    // The swipe the user left made live changes to the fact sheet; roll them back like a swipe away.
+    undoRemovedLiveTurns();
 }
 
 async function onMessageDeleted() {
