@@ -149,6 +149,8 @@ const defaultSettings = Object.freeze({
     checkContradictions: false,
     liveStateUpdate: false,
     liveStateUndo: true,
+    yieldToReply: true,
+    recallMaxWaitMs: 5000,
     qrMessages: 'aside',
     statusMode: 'auto',
     statusPattern: '',
@@ -1017,8 +1019,31 @@ function isQrMessage(msg) {
 }
 
 let lastQuietPrompt = null;
-function onGenerationStarted(type, params) {
+// Background work that calls the model (answer check, auto compress) can make the user's reply
+// wait when the API or proxy handles one request at a time. When a reply starts, that work steps
+// aside. Auto compress gives way at most 3 times in a row so it still finishes in a busy chat.
+let compressIsAuto = false;
+let compressYielded = false;
+let autoYields = 0;
+let slowHintShown = false;
+function onGenerationStarted(type, params, dryRun) {
     if (type === 'quiet' && params?.quiet_prompt) lastQuietPrompt = { text: String(params.quiet_prompt), at: Date.now() };
+    if (dryRun || type === 'quiet' || !getSettings().yieldToReply) return;
+    const stopped = [];
+    if (turnBusy && turnController && !turnController.signal.aborted) {
+        turnController.abort();
+        stopped.push('답변 점검');
+    }
+    if (busy && compressIsAuto && abortController && !abortController.signal.aborted && autoYields < 3) {
+        autoYields++;
+        compressYielded = true;
+        abortController.abort();
+        stopped.push('자동 압축');
+    }
+    if (stopped.length && !slowHintShown) {
+        slowHintShown = true;
+        toastr.info(`새 답변을 먼저 받으려고 코끼리의 ${stopped.join('·')}을(를) 잠시 멈췄어요. 같은 API로 동시에 요청하면 답이 늦어질 수 있어서예요. 설정 → 자동 → '답변 생성 중엔 양보하기'에서 바꿀 수 있어요.`, APP_NAME, { timeOut: 9000 });
+    }
 }
 
 function previousUserMessage(id) {
@@ -2345,23 +2370,22 @@ async function hybridRecall(memory, query, { useDense = true, topK = null, budge
     const byHash = new Map(searchable.map(x => [x.hash, x]));
     const lists = [];
     let dense = false;
-    for (const q of queries) {
-        if (useDense && denseAllowed() && !vectorCooling()) {
-            try {
-                const hashes = await denseSearch(q, pool);
-                const items = hashes.map(h => byHash.get(h)).filter(Boolean);
-                if (items.length) lists.push(items);
-                dense = true;
-            } catch (err) {
-                console.warn(LOG_PREFIX, 'dense search skipped', err);
-                if (!(err?.name === 'AbortError')) {
-                    markVectorFailure();
-                    logActivity('recall', `의미 검색 실패, 키워드 검색으로 대체 · ${vectorErrorText(err)}`, 'warn');
-                }
-            }
-        }
-        lists.push(bm25Search(searchable, q, pool));
+    // Meaning searches for all queries run at the same time instead of one after another.
+    const denseOn = useDense && denseAllowed() && !vectorCooling();
+    const denseLists = denseOn ? await Promise.all(queries.map(q => denseSearch(q, pool).then(
+        hashes => { dense = true; return hashes.map(h => byHash.get(h)).filter(Boolean); },
+        err => { console.warn(LOG_PREFIX, 'dense search skipped', err); return err; },
+    ))) : [];
+    const denseErr = denseLists.find(x => x instanceof Error && x.name !== 'AbortError');
+    if (denseErr) {
+        markVectorFailure();
+        logActivity('recall', `의미 검색 실패, 키워드 검색으로 대체 · ${vectorErrorText(denseErr)}`, 'warn');
     }
+    queries.forEach((q, i) => {
+        const items = denseLists[i];
+        if (Array.isArray(items) && items.length) lists.push(items);
+        lists.push(bm25Search(searchable, q, pool));
+    });
 
     // Reciprocal rank fusion, then rerank by relevance, importance and recency.
     const fused = new Map();
@@ -2503,19 +2527,37 @@ async function refreshRecall(recentChat) {
     const memory = s.enabled && s.recallEnabled ? getMemory(false) : null;
     let text = '';
     if (memory) {
-        const queries = [recallQuery(recentChat)];
+        const started = Date.now();
+        const base = recallQuery(recentChat);
+        // The reply waits for this, so it has a hard time limit. Query expansion and meaning
+        // search are extras; past the limit the keyword search (instant, no network) is used.
+        const full = (async () => {
+            const queries = [base];
+            try {
+                queries.push(...await expandQueries(memory, recentChat));
+            } catch (err) {
+                console.warn(LOG_PREFIX, 'query expansion skipped', err);
+            }
+            return { ...(await hybridRecall(memory, queries)), queries: queries.length };
+        })();
+        let outcome;
+        let late = false;
         try {
-            queries.push(...await expandQueries(memory, recentChat));
+            outcome = await withTimeout(full, Math.max(1000, Number(s.recallMaxWaitMs) || 5000));
         } catch (err) {
-            console.warn(LOG_PREFIX, 'query expansion skipped', err);
+            if (String(err?.message) !== 'timeout') console.warn(LOG_PREFIX, 'recall failed', err);
+            late = String(err?.message) === 'timeout';
+            full.catch(() => {});
+            outcome = { ...(await hybridRecall(memory, [base], { useDense: false })), queries: 1 };
         }
-        const { results, dense } = await hybridRecall(memory, queries);
+        const { results, dense, queries } = outcome;
         lastRecall = results;
         text = recallText(results);
         const raw = results.filter(r => r.item?.kind === 'raw').length;
-        logActivity('recall', results.length
-            ? `${results.length}개 찾아 넣음${raw ? ` (원본 대사 ${raw})` : ''} · ${dense ? '의미+키워드' : '키워드'}${queries.length > 1 ? ` · 검색어 ${queries.length}개` : ''}`
-            : '관련된 과거를 찾지 못했어요');
+        const secs = ((Date.now() - started) / 1000).toFixed(1);
+        logActivity('recall', `${results.length
+            ? `${results.length}개 찾아 넣음${raw ? ` (원본 대사 ${raw})` : ''} · ${dense ? '의미+키워드' : '키워드'}${queries > 1 ? ` · 검색어 ${queries}개` : ''}`
+            : '관련된 과거를 찾지 못했어요'} · ${secs}초${late ? ` · 시간 제한(${(s.recallMaxWaitMs / 1000).toFixed(0)}초)을 넘어서 키워드 검색만 썼어요` : ''}`, late ? 'warn' : 'ok');
     }
     setExtensionPrompt(PROMPT_KEY_RECALL, text, POSITIONS.in_chat, s.recallDepth, false, ROLES.system);
     return text;
@@ -2574,16 +2616,26 @@ function profileName(id) {
     return (ctx().extensionSettings.connectionManager?.profiles ?? []).find(p => p.id === id)?.name || id;
 }
 
-async function callModel(systemText, userText, { retries = null, expectTag = null, profileId = undefined, noFallback = false } = {}) {
+function untilAborted(promise, signal) {
+    if (!signal) return promise;
+    if (signal.aborted) return Promise.reject(new Error('aborted'));
+    return new Promise((resolve, reject) => {
+        const stop = () => reject(new Error('aborted'));
+        signal.addEventListener('abort', stop, { once: true });
+        promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', stop));
+    });
+}
+
+async function callModel(systemText, userText, { retries = null, expectTag = null, profileId = undefined, noFallback = false, signal = null } = {}) {
     const s = getSettings();
     const primary = profileId === undefined ? s.profileId : profileId;
     try {
-        return await callModelOnce(systemText, userText, { retries, expectTag, profileId: primary });
+        return await callModelOnce(systemText, userText, { retries, expectTag, profileId: primary, signal });
     } catch (err) {
         const fallback = s.fallbackProfileId;
-        if (noFallback || !fallback || fallback === primary || !isBlockError(err) || abortController?.signal.aborted) throw err;
+        if (noFallback || !fallback || fallback === primary || !isBlockError(err) || abortController?.signal.aborted || signal?.aborted) throw err;
         logActivity('model', `${profileName(primary)}이(가) 거부해서 ${profileName(fallback)}(으)로 다시 보냈어요`, 'warn');
-        return callModelOnce(systemText, userText, { retries, expectTag, profileId: fallback });
+        return callModelOnce(systemText, userText, { retries, expectTag, profileId: fallback, signal });
     }
 }
 
@@ -2712,7 +2764,7 @@ function noticeAuthFallback(profileId, how) {
     );
 }
 
-async function callModelOnce(systemText, userText, { retries = null, expectTag = null, profileId = '' } = {}) {
+async function callModelOnce(systemText, userText, { retries = null, expectTag = null, profileId = '', signal = null } = {}) {
     const s = getSettings();
     const c = ctx();
     const maxRetries = retries ?? s.retries;
@@ -2731,8 +2783,11 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
     let authStep = 0;
     let regionTries = null;
     let regionOverride = null;
+    // The answer check passes its own signal so a new reply can cut it short; summaries use the
+    // signal of the running compress job.
+    const sig = signal ?? abortController?.signal ?? null;
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        if (abortController?.signal.aborted) throw new Error('aborted');
+        if (sig?.aborted) throw new Error('aborted');
         try {
             let raw;
             if (profileId) {
@@ -2741,17 +2796,18 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
                     profileId,
                     messages,
                     s.maxOutputTokens,
-                    { stream: false, signal: abortController?.signal ?? null, extractData: true, includePreset: s.includePreset },
+                    { stream: false, signal: sig, extractData: true, includePreset: s.includePreset },
                     { ...(repair?.payload ?? await profileBasePayload(profileId)), ...(regionOverride ? { vertexai_region: regionOverride } : {}) },
                 );
                 raw = typeof result === 'string' ? result : (result?.content ?? '');
             } else {
-                raw = await c.generateRaw({
+                // generateRaw cannot be cancelled, but stop waiting for it once aborted.
+                raw = await untilAborted(c.generateRaw({
                     systemPrompt: s.systemAsUser ? '' : systemText,
                     prompt: s.systemAsUser ? `${systemText}\n\n${userText}` : userText,
                     responseLength: s.maxOutputTokens,
                     prefill: prefill.trim() ? prefill : '',
-                });
+                }), sig);
             }
             // Providers return only the continuation; put an opening tag from the prefill back.
             if (prefill.includes('<') && !String(raw).trimStart().startsWith(prefill.trim())) raw = `${prefill}${raw}`;
@@ -2766,7 +2822,7 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
             return cleaned;
         } catch (err) {
             lastError = err;
-            if (abortController?.signal.aborted) throw new Error('aborted');
+            if (sig?.aborted) throw new Error('aborted');
             // A blocked request fails the same way every time; do not burn retries on it.
             if (isBlockError(err)) break;
             if (profileId) {
@@ -4135,6 +4191,8 @@ async function runCompress({ all = false, auto = false } = {}) {
     const chatId = ctx().getCurrentChatId();
     busy = true;
     abortController = new AbortController();
+    compressIsAuto = auto;
+    compressYielded = false;
     setBusyUI(true);
     let done = 0;
     let gaps = 0;
@@ -4229,8 +4287,12 @@ async function runCompress({ all = false, auto = false } = {}) {
         if (done && stillSameChat(chatId)) syncAfter();
     } catch (err) {
         if (String(err?.message) === 'aborted') {
-            toastr.info(`중지했습니다. (${done}개 구간 완료)`);
-            logActivity(auto ? 'auto' : 'compress', `중지 (${done}개 구간 완료)`, 'warn');
+            if (auto && compressYielded) {
+                logActivity('auto', `새 답변 생성이 시작돼서 자동 압축을 잠시 멈췄어요 (${done}개 구간 완료). 답변이 오면 이어서 해요`, 'warn');
+            } else {
+                toastr.info(`중지했습니다. (${done}개 구간 완료)`);
+                logActivity(auto ? 'auto' : 'compress', `중지 (${done}개 구간 완료)`, 'warn');
+            }
         }
         else {
             reportError('압축 실패', err);
@@ -4239,8 +4301,10 @@ async function runCompress({ all = false, auto = false } = {}) {
         if (dirty && stillSameChat(chatId)) {
             try { await persistChat(); } catch (err) { console.warn(LOG_PREFIX, 'final save failed', err); }
         }
+        if (auto && done && !compressYielded) autoYields = 0;
         busy = false;
         abortController = null;
+        compressIsAuto = false;
         setBusyUI(false);
         setProgress('');
         refreshInjection();
@@ -4364,6 +4428,8 @@ async function resummarizeNode(nodeId, { notes = '' } = {}) {
 
 let turnBusy = false;
 let turnStartedAt = 0;
+// Lets a new reply cut the answer check of the previous one short (see onGenerationStarted).
+let turnController = null;
 let pendingTurn = null;
 const TURN_TIMEOUT_MS = 120000;
 const CHECK_SWIPE = 1002;
@@ -4430,6 +4496,8 @@ async function afterTurn(messageId, { recheck = false } = {}) {
     const startMes = msg.mes;
     const moved = () => (msg.swipe_id ?? 0) !== startSwipe || msg.mes !== startMes;
     turnBusy = true;
+    turnController = new AbortController();
+    const turnSignal = turnController.signal;
     turnStartedAt = Date.now();
     renderLive();
     const turnNotes = [];
@@ -4482,7 +4550,7 @@ async function afterTurn(messageId, { recheck = false } = {}) {
             recent.length && `<recent_messages>\nMessages #${firstShown}-#${messageId - 1}, right before the new reply, in order. ${omittedFrom >= 0 ? `Messages #${gapStart}-#${omittedFrom} (also after the memory) are not shown; do not report a conflict with the memory that they could explain. ` : 'Every message after the memory is included. '}These are the newest established facts, including small physical details (what someone holds, wears, drinks, where they stand).\n${recent.join('\n\n')}\n</recent_messages>`,
             `<new_reply>\n${replyLine}\n</new_reply>`,
         ].filter(Boolean).join('\n\n');
-        const out = await withTimeout(callModel(afterTurnSystemPrompt(doCheck, doState, doVoice, storyMedium(memory.frame)), user, { retries: 0 }), TURN_TIMEOUT_MS);
+        const out = await withTimeout(callModel(afterTurnSystemPrompt(doCheck, doState, doVoice, storyMedium(memory.frame)), user, { retries: 0, signal: turnSignal }), TURN_TIMEOUT_MS);
         if (!stillSameChat(chatId) || ctx().chat[messageId] !== msg) return;
         if (doCheck) {
             let issues = (parseJsonLenient(extractTag(out, 'issues') || '') || [])
@@ -4496,12 +4564,13 @@ async function afterTurn(messageId, { recheck = false } = {}) {
             issues = [...sure, ...unsure];
             if (issues.length && s.checkDoubleCheck) {
                 try {
-                    const res = await doubleCheckIssues(issues, user);
+                    const res = await doubleCheckIssues(issues, user, turnSignal);
                     if (!stillSameChat(chatId) || ctx().chat[messageId] !== msg) return;
                     issues = res.kept;
                     filtered = res.dropped;
                     rechecked = true;
                 } catch (err) {
+                    if (turnSignal.aborted) throw err;
                     console.warn(LOG_PREFIX, 'double check skipped', err);
                 }
             }
@@ -4562,6 +4631,14 @@ async function afterTurn(messageId, { recheck = false } = {}) {
         logActivity('check', turnNotes.join(' · '), turnLevel);
         if (recheck) return true;
     } catch (err) {
+        if (turnSignal.aborted) {
+            logActivity('check', `#${messageId} 새 답변 생성이 시작돼서 점검을 멈췄어요 (답변이 먼저예요)`, 'warn');
+            if (recheck) {
+                toastr.info('새 답변 생성이 시작돼서 다시 점검을 멈췄어요. 이전 경고를 그대로 둘게요.', APP_NAME);
+                return false;
+            }
+            return;
+        }
         if (recheck) {
             toastr.warning(`수정한 답변을 다시 점검하지 못해서 이전 경고를 그대로 둘게요. ${errorDetail(err)}`, APP_NAME);
             return false;
@@ -4572,6 +4649,7 @@ async function afterTurn(messageId, { recheck = false } = {}) {
             : `점검 실패: ${errorDetail(err)}`, 'err');
     } finally {
         turnBusy = false;
+        turnController = null;
         renderLive();
         const next = pendingTurn;
         pendingTurn = null;
@@ -4608,7 +4686,7 @@ function filterIssues(issues, context, reply) {
 
 // Second opinion on flagged issues only: is each one still a contradiction once the recent
 // messages are taken into account?
-async function doubleCheckIssues(issues, context) {
+async function doubleCheckIssues(issues, context, signal = null) {
     const system = `You double-check warnings from a continuity checker for an ongoing interactive story. The checker often makes these mistakes: it trusts an older summary over newer messages, it misses that the recent messages already changed or explained something, it treats new information as a contradiction, or it misreads who did what.
 
 For each numbered warning, look again at the recent messages (newest information wins) and decide whether the new reply really contradicts the latest established state. Keep a warning only if you are sure.
@@ -4618,7 +4696,7 @@ Reply with only:
 [{"i":<warning number>,"keep":true|false,"why":"<one short reason>"}]
 </verdicts>`;
     const list = issues.map((x, i) => `${i}. reply says: "${x.quote}" | conflicts with: "${x.evidence || '(no evidence given)'}" (${x.source || '?'}) | ${x.problem}${x.unverified ? ` [the checker's ${x.unverified === 'quote' ? 'quote from the reply' : 'evidence'} was not found word for word; check the text yourself and keep it only if the contradiction is clearly real]` : ''}`).join('\n');
-    const out = await withTimeout(callModel(system, `${context}\n\n<warnings>\n${list}\n</warnings>`, { retries: 0, expectTag: 'verdicts' }), TURN_TIMEOUT_MS);
+    const out = await withTimeout(callModel(system, `${context}\n\n<warnings>\n${list}\n</warnings>`, { retries: 0, expectTag: 'verdicts', signal }), TURN_TIMEOUT_MS);
     const verdicts = parseJsonLenient(extractTag(out, 'verdicts') || '');
     if (!Array.isArray(verdicts)) throw new Error('재확인 응답을 해석하지 못했어요');
     const byIndex = new Map(verdicts.filter(v => v && Number.isInteger(Number(v.i))).map(v => [Number(v.i), v]));
@@ -6186,7 +6264,7 @@ const UNITS = {
     remindAt: '개', autoBackupEvery: '번', backupKeep: '개', expansionTimeoutMs: 'ms', memoryBudget: '토큰', protectRecent: '개', maxEpisodes: '개', chapterSize: '개',
     maxChapters: '개', sagaMaxWords: '단어', staleAfter: '메시지', archiveMax: '개', maxUndo: '회',
     voiceQuotes: '줄', voiceKeep: '줄', recallTopK: '개', recallTokenBudget: '토큰', recallScan: '개', vectorThreshold: '%', rawChunkMessages: '개',
-    rawChunkChars: '자', eventMax: '개', queryTimeoutMs: 'ms', loreTokenBudget: '토큰',
+    rawChunkChars: '자', eventMax: '개', queryTimeoutMs: 'ms', recallMaxWaitMs: 'ms', loreTokenBudget: '토큰',
 };
 
 function numberRow(key, label, min, max, hint = '') {
@@ -6447,6 +6525,8 @@ function settingsHtml() {
           ${checkRow('liveStateUpdate', '현재 상태 실시간 갱신', '시간·장소·함께 있는 인물·약속을 답변마다 기록부에 반영해요')}
           ${checkRow('liveStateUndo', '답변을 지우면 그 갱신도 되돌리기', '실시간 갱신한 답변을 지우거나 다른 답변으로 넘기면, 그 답변 때문에 바뀐 기록부를 원래대로 돌려요')}
           <p class="lm-hint lm-note">모순 검사와 실시간 갱신은 둘 다 켜도 답변마다 요약 모델을 1번만 불러요. 모순을 찾았고 '한 번 더 확인'이 켜져 있을 때만 1번 더 불러요. 요약 모델 프로필을 따로 지정하면 대화와 겹치지 않아요.</p>
+          ${group('답변 속도', '답변이 늦게 올 때')}
+          ${checkRow('yieldToReply', '답변 생성 중엔 양보하기', '새 답변을 생성하기 시작하면 아직 돌고 있는 답변 점검과 자동 압축을 멈춰요. API나 프록시가 요청을 한 번에 하나씩만 받으면, 코끼리 작업이 끝날 때까지 답변이 기다리는 걸 막아요. 멈춘 자동 압축은 답변이 온 뒤 다시 해요')}
           ${group('메시지를 지울 때')}
           ${checkRow('autoForgetDeleted', '메시지를 지우면 그 기억도 지우기', '일부만 지우면 "다시 요약" 표시를 해요')}
           ${resetFoot()}
@@ -6456,6 +6536,7 @@ function settingsHtml() {
           ${group('회상', '답변 직전에 지난 장면을 꺼내 넣기')}
           ${checkRow('recallEnabled', '회상 사용', '답변 직전에 지금 장면과 관련된 과거를 찾아 넣어요')}
           ${checkRow('queryExpansion', '돌려 말해도 찾기', '"그때 그 일" 같은 말을 구체적인 검색어로 바꿔요. 답변마다 짧은 호출이 1번 늘어요')}
+          ${numberRow('recallMaxWaitMs', '답변 전 최대 대기', 1000, 60000, '답변을 생성하기 전 기억 검색에 쓰는 시간의 상한이에요. 넘으면 키워드 검색 결과만 넣고 바로 답변을 생성해요. 걸린 시간은 활동 기록에 남아요')}
           ${group('검색 방식', '키워드 검색은 늘 켜져 있어요')}
           ${checkRow('vectorEnabled', '의미 검색', '끄면 키워드 검색만 해요')}
           ${checkRow('autoIndex', '자동 색인', '압축하거나 기억이 바뀔 때마다 알아서 색인을 맞춰요. 끄면 "전체 색인" 버튼을 누를 때만 색인해요 (이미 만든 색인으로 검색은 계속돼요)')}
