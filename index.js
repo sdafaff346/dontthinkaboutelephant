@@ -142,6 +142,7 @@ const defaultSettings = Object.freeze({
     promptUserSuffix: '',
     promptPrefill: '',
     uiSettingsOpen: false,
+    uiShowAll: false,
     previewBeforeSave: false,
     autoCompress: false,
     autoCompressAt: 40,
@@ -650,9 +651,8 @@ async function reconcileAfterDeletion() {
     memory.cursor = maxOwned >= 0 ? maxOwned : Math.min(memory.cursor, chat.length - 1, removed ? -1 : memory.cursor);
     memory.hiddenRanges = listToRanges(hidden);
     await ctx().saveMetadata();
-    if (removed) toastr.info(`삭제된 메시지에 대한 기억 ${removed}개를 지웠어요.`, APP_NAME);
-    if (removed || staled) logActivity('forget', `지운 기억 ${removed} · 다시 요약 표시 ${staled}`, staled ? 'warn' : 'ok');
-    if (staled) toastr.info(`메시지가 일부 지워진 기억 ${staled}개에 "다시 요약" 표시를 했어요.`, APP_NAME);
+    // Background bookkeeping: the activity log and the timeline badges say it, no pop-up.
+    if (removed || staled) logActivity('forget', `지운 메시지의 기억 ${removed}개를 지움 · 일부가 지워진 기억 ${staled}개에 다시 요약 표시`, staled ? 'warn' : 'ok');
     refreshInjection();
     updateStatus();
     if (removed || staled) syncAfter();
@@ -670,7 +670,7 @@ function onMessageEdited(id) {
     node.stale = true;
     ctx().saveMetadataDebounced?.();
     updateStatus();
-    toastr.info('요약된 메시지가 바뀌었어요. 기억장에서 그 구간을 다시 요약할 수 있어요.', APP_NAME);
+    logActivity('forget', `#${id} 요약된 메시지가 바뀌어서 그 기억에 다시 요약 표시를 했어요`, 'warn');
 }
 
 // ---------------------------------------------------------------- text helpers
@@ -2283,6 +2283,8 @@ async function syncVectors({ notify = false, full = false } = {}) {
         for (let i = 0; i < toInsert.length; i += size) {
             if (!stillSameChat(chatId)) return;
             if (syncStop) throw new Error('aborted');
+            // Embedding requests share the SillyTavern server with the reply; wait while one is generated.
+            for (let w = 0; w < 600 && stIsGenerating(); w++) await sleep(500);
             setProgress(`벡터 색인 중 ${Math.min(i + size, toInsert.length).toLocaleString()}/${toInsert.length.toLocaleString()}`, { toast: loud });
             const items = toInsert.slice(i, i + size).map(x => ({ hash: x.hash, text: x.text.slice(0, 6000), index: x.from ?? 0 }));
             await vectorRequest('insert', { ...base, items }, null, { retries: 3, shouldStop: () => syncStop || !stillSameChat(chatId) });
@@ -4277,8 +4279,9 @@ async function runCompress({ all = false, auto = false } = {}) {
             await sleep(0);
         }
         if (done) {
-            toastr.success(auto ? `자동 압축: ${done}개 구간을 기억했어요.` : `${done}개 구간을 기억에 저장했습니다.`, auto ? APP_NAME : undefined);
-            if (reviews) toastr.warning(`검수에서 원본과 다른 곳이 나온 요약 ${reviews}개에 "검토 필요"를 표시했어요. 기억장 → 타임라인에서 확인할 수 있어요.`, APP_NAME, { timeOut: 10000 });
+            if (!auto) toastr.success(`${done}개 구간을 기억에 저장했습니다.`);
+            if (reviews && auto) logActivity('auto', `검수에서 원본과 다른 곳이 나온 요약 ${reviews}개에 "검토 필요"를 표시했어요`, 'warn');
+            else if (reviews) toastr.warning(`검수에서 원본과 다른 곳이 나온 요약 ${reviews}개에 "검토 필요"를 표시했어요. 기억장 → 타임라인에서 확인할 수 있어요.`, APP_NAME, { timeOut: 10000 });
             if (gaps) toastr.warning(`모델이 거부한 장면 ${gaps}곳은 빈칸으로 남겼어요. 기억장 → 타임라인의 "다시 요약"으로 다른 모델에 다시 맡길 수 있어요.`, APP_NAME, { timeOut: 12000 });
             const last = batches[done - 1];
             logActivity(auto ? 'auto' : 'compress', `#${batches[0].from}~#${last.to} · ${done}개 구간 기억함`);
@@ -4289,6 +4292,8 @@ async function runCompress({ all = false, auto = false } = {}) {
         if (String(err?.message) === 'aborted') {
             if (auto && compressYielded) {
                 logActivity('auto', `새 답변 생성이 시작돼서 자동 압축을 잠시 멈췄어요 (${done}개 구간 완료). 답변이 오면 이어서 해요`, 'warn');
+            } else if (!stillSameChat(chatId)) {
+                logActivity(auto ? 'auto' : 'compress', `채팅을 바꿔서 압축을 멈췄어요 (${done}개 구간 완료)`, 'warn');
             } else {
                 toastr.info(`중지했습니다. (${done}개 구간 완료)`);
                 logActivity(auto ? 'auto' : 'compress', `중지 (${done}개 구간 완료)`, 'warn');
@@ -4305,6 +4310,7 @@ async function runCompress({ all = false, auto = false } = {}) {
         busy = false;
         abortController = null;
         compressIsAuto = false;
+        runPendingTurn();
         setBusyUI(false);
         setProgress('');
         refreshInjection();
@@ -4431,6 +4437,14 @@ let turnStartedAt = 0;
 // Lets a new reply cut the answer check of the previous one short (see onGenerationStarted).
 let turnController = null;
 let pendingTurn = null;
+
+// Runs the answer check that had to wait for a summary job, if that reply is still there.
+function runPendingTurn() {
+    if (pendingTurn === null || turnBusy || busy) return;
+    const next = pendingTurn;
+    pendingTurn = null;
+    setTimeout(() => { if (!busy && ctx().chat[next]) afterTurn(next); }, 0);
+}
 const TURN_TIMEOUT_MS = 120000;
 const CHECK_SWIPE = 1002;
 const CHECK_CLEAR = 1003;
@@ -4482,6 +4496,11 @@ async function afterTurn(messageId, { recheck = false } = {}) {
         return;
     }
     if (!s.enabled || (!doCheck && !doState) || !hasChat()) return;
+    // One model job at a time: while a summary job runs, check this reply when it is done.
+    if (busy && !recheck) {
+        pendingTurn = messageId;
+        return;
+    }
     if (externalTestRunning()) return noteExternalTest();
     const memory = getMemory(false);
     if (!memory) return;
@@ -4597,7 +4616,8 @@ async function afterTurn(messageId, { recheck = false } = {}) {
                 if (issues.length) toastr.warning(`수정한 답변에도 기억과 다른 부분이 ${issues.length}개 있어요. ⚠ 표시를 눌러 확인하세요.`, APP_NAME);
                 else toastr.success('수정한 답변을 다시 점검했어요. 기억과 다른 부분이 없어요.', APP_NAME);
                 turnNotes.push('수정 후 다시 점검');
-            } else if (issues.length) toastr.warning(`기억과 다른 부분 ${issues.length}개를 찾았어요. 메시지 이름 옆 ⚠ 표시를 눌러 확인하세요.`, APP_NAME);
+            }
+            // A new warning is shown by the ⚠ next to the reply name (and the activity log), not a pop-up.
             const ooc = issues.filter(i => i.problem.startsWith('[캐해]')).length;
             turnNotes.push(issues.length
                 ? `#${messageId} 모순 ${issues.length - ooc}개${ooc ? ` · 캐해 어긋남 ${ooc}개` : ''}`
@@ -5653,7 +5673,7 @@ function maybeAutoCompress() {
     const attempt = () => {
         autoTimer = null;
         if (!stillSameChat(chatId) || busy) return;
-        if ((turnBusy || stIsGenerating()) && tries++ < 20) {
+        if ((turnBusy || stIsGenerating()) && tries++ < 50) {
             autoTimer = setTimeout(attempt, 3000);
             return;
         }
@@ -6180,11 +6200,11 @@ function syncAfter() {
     setTimeout(() => syncVectors(), 0);
 }
 
-function runStop() {
+function runStop({ quiet = false } = {}) {
     if (syncing) syncStop = true;
     if (abortController) {
         abortController.abort();
-        toastr.info('중지 요청을 보냈습니다.');
+        if (!quiet) toastr.info('중지 요청을 보냈습니다.');
     }
 }
 
@@ -6471,6 +6491,7 @@ function settingsHtml() {
           <input type="search" class="text_pole" id="lm_setsearch" placeholder="설정 찾기 (예: 모순, 임베딩, 미리보기)" aria-label="설정 찾기" autocomplete="off">
         </div>
         <p class="lm-hint lm-setsearch-empty" id="lm_setsearch_empty" hidden>찾는 설정이 없어요. 다른 말로 찾아보세요.</p>
+        <label class="lm-showall"><input type="checkbox" id="lm_showall"><span>모든 설정 보기</span><em id="lm_showall_count"></em></label>
         <div class="lm-panes">
 
         <section class="lm-pane active" data-lm-pane="summary" role="tabpanel" data-lm-pane-title="요약">
@@ -6482,6 +6503,8 @@ function settingsHtml() {
           ${checkRow('softenSensitive', '민감한 장면 순화 (기본 꺼짐)', '꺼져 있으면 모든 장면을 있는 그대로 요약해요. 켜면 야하거나 잔인한 장면을 짧고 덤덤하게 줄여 적어서 검열에 덜 걸리지만, 그만큼 덜 자세히 기억해요')}
           ${selectRow('language', '요약 언어', selectOptions(LANGUAGES, s.language), s.language, 'English가 토큰을 가장 적게 써요')}
           ${selectRow('detail', '상세도', selectOptions({ concise: '간결', standard: '보통', detailed: '상세' }, s.detail), s.detail, '상세할수록 오래 기억하지만 토큰이 늘어요')}
+          ${numberRow('keepRecent', '최근 원본 유지', 0, 5000, '이만큼의 최근 메시지는 요약하지 않고 그대로 둬요')}
+          ${group('QR 메시지', '빠른 답장으로 넣은 메시지')}
           ${selectRow('qrMessages', 'QR·슬래시 명령 메시지', selectOptions(QR_MODES, s.qrMessages === 'comment' ? 'aside' : s.qrMessages), s.qrMessages === 'comment' ? 'aside' : s.qrMessages, '빠른 답장(QR)으로 만든 분석(/comment)과 롤플을 멈추고 만든 번외편(퀴즈, 인터뷰, 만약에 시뮬레이션 같은 것)을 요약·회상·답변 점검에서 빼요. 장면을 넘기거나 이어 쓰게 하는 QR은 그대로 기억해요')}
           <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_qrsort">${icon('ledger')}<span>QR 메시지 분류</span></button><span class="lm-hint">이 버전 전에 들어온 QR 메시지를 번외편/이야기로 직접 골라요</span></div>
           ${group('상태창', '답변에 붙는 시간·날짜·장소·날씨 줄')}
@@ -6490,7 +6513,6 @@ function settingsHtml() {
           ${checkRow('statusInject', '마지막 상태창을 AI에게 알려주기', '요약으로 옛 답변이 숨겨져도 가장 최근 상태창을 리마인더에 넣어서 시간·날짜·장소가 끊기지 않게 해요')}
           ${checkRow('statusWhen', '작중 시간은 상태창 기준으로', '요약할 때 그 구간 상태창의 첫 시간과 끝 시간을 에피소드의 작중 시간으로 써요. 연표가 정확해져요')}
           <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_status">${icon('calendar')}<span>상태창 기록</span></button><span class="lm-hint">찾은 상태창을 확인하고, 지난 요약의 작중 시간을 채워요</span></div>
-          ${numberRow('keepRecent', '최근 원본 유지', 0, 5000, '이만큼의 최근 메시지는 요약하지 않고 그대로 둬요')}
           ${group('함께 챙길 것', '캐해·검수·복선')}
           ${checkRow('voiceEnabled', '캐해 보존', '캐릭터 카드로 핵심 성격과 말투를 정리해 고정하고, 요약할 때 실제 대사 샘플을 모아 AI에게 함께 보여줘요. 기억장 → 캐릭터 탭에서 고칠 수 있어요')}
           ${checkRow('previewBeforeSave', '저장 전에 미리보기', '직접 압축할 때마다 결과를 보고 고치거나 다시 요약해요. 자동 압축은 대화가 끊기지 않게 바로 저장해요')}
@@ -6664,6 +6686,49 @@ function settingsHtml() {
 
 // Typing in "설정 찾기" shows every matching setting from all tabs at once (labels and hints),
 // opening "고급 설정" folds that contain a match. Clicking a tab or clearing the box goes back.
+// Simple view: only the settings most people touch. Everything else (and the 로어북, 넣는 위치,
+// 프롬프트 tabs) appears with "모든 설정 보기", and the settings search always finds everything.
+const ESSENTIAL_SETTINGS = new Set(['language', 'detail', 'keepRecent', 'softenSensitive', 'voiceEnabled',
+    'autoCompress', 'autoCompressAt', 'checkContradictions', 'liveStateUpdate', 'yieldToReply',
+    'recallEnabled', 'vectorEnabled', 'embedSource', 'memoryBudget']);
+const ESSENTIAL_IDS = new Set(['lm_profile', 'lm_fallback', 'lm_btn_test']);
+const ADVANCED_PANES = new Set(['lore', 'inject', 'prompt']);
+
+function applySimpleView(root) {
+    const showAll = !!getSettings().uiShowAll;
+    const ITEMS = '.lm-field, .lm-inline-action, .lm-prompt-item, .lm-actions, .lm-style, .lm-preset-row, .lm-note';
+    let hidden = 0;
+    root.querySelectorAll('.lm-panes > .lm-pane').forEach(pane => {
+        const advPane = ADVANCED_PANES.has(pane.dataset.lmPane);
+        let group = null;
+        let groupKeep = false;
+        const closeGroup = () => { if (group) group.classList.toggle('lm-adv', !groupKeep); };
+        [...pane.children].forEach(child => {
+            if (child.classList.contains('lm-setgroup')) {
+                closeGroup();
+                group = child;
+                groupKeep = false;
+                return;
+            }
+            if (child.classList.contains('lm-pane-foot')) return;
+            const essential = !advPane && child.matches(ITEMS) && !child.matches('.lm-note') && (
+                [...child.querySelectorAll('[data-lm-setting]')].some(el => ESSENTIAL_SETTINGS.has(el.dataset.lmSetting))
+                || [...child.querySelectorAll('[id]')].some(el => ESSENTIAL_IDS.has(el.id)));
+            child.classList.toggle('lm-adv', !essential);
+            if (essential) groupKeep = true;
+            else if (child.matches(ITEMS) || child.matches('details.lm-more')) hidden += child.matches('details.lm-more') ? child.querySelectorAll('[data-lm-setting]').length : 1;
+        });
+        closeGroup();
+        root.querySelector(`.lm-tab[data-lm-tab="${pane.dataset.lmPane}"]`)?.classList.toggle('lm-adv', advPane);
+    });
+    root.classList.toggle('lm-simple', !showAll);
+    const count = root.querySelector('#lm_showall_count');
+    if (count) count.textContent = showAll ? '' : `숨긴 설정 ${hidden}개`;
+    // If the open tab is hidden in the simple view, go to the first tab.
+    const active = root.querySelector('.lm-tabs .lm-tab.active');
+    if (!showAll && active?.classList.contains('lm-adv')) root.querySelector('.lm-tabs .lm-tab:not(.lm-adv)')?.click();
+}
+
 function bindSettingsSearch(root) {
     const input = root.querySelector('#lm_setsearch');
     const empty = root.querySelector('#lm_setsearch_empty');
@@ -6733,6 +6798,15 @@ function bindSettings(root) {
         }
     });
     bindSettingsSearch(root);
+    const showAll = root.querySelector('#lm_showall');
+    if (showAll) {
+        showAll.checked = !!s.uiShowAll;
+        showAll.addEventListener('change', () => {
+            s.uiShowAll = showAll.checked;
+            saveSettingsDebounced();
+            applySimpleView(root);
+        });
+    }
     const fold = root.querySelector('#lm_fold');
     fold.open = !!s.uiSettingsOpen;
     fold.addEventListener('toggle', () => {
@@ -9702,7 +9776,14 @@ function addWandMenu() {
 // ---------------------------------------------------------------- chat events
 
 function onChatChanged() {
-    if (busy) runStop();
+    if (busy) runStop({ quiet: true });
+    // Work started for the previous chat must not keep running (or holding locks) in this one.
+    turnController?.abort();
+    pendingTurn = null;
+    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
+    statusCutoff = null;
+    compressYielded = false;
+    autoYields = 0;
     remindedFor = null;
     const c = ctx();
     if (hasChat() && !c.chatMetadata?.[META_KEY] && c.characterId !== undefined && c.characterId !== null) {
@@ -9778,6 +9859,7 @@ function mountPanel() {
         if (host && !document.getElementById('lm_settings')) {
             host.insertAdjacentHTML('beforeend', settingsHtml());
             bindSettings(document.getElementById('lm_settings'));
+            applySimpleView(document.getElementById('lm_settings'));
             setBusyUI(false);
             updateStatus();
         }
@@ -9787,6 +9869,27 @@ function mountPanel() {
 }
 
 let commandsRegistered = false;
+
+// An error in one handler must not break SillyTavern's own flow or the next event. It is
+// written to the console and, once per kind, to the activity log.
+const guardedLogged = new Set();
+function guarded(label, fn) {
+    const report = (err) => {
+        console.error(LOG_PREFIX, `${label} handler failed`, err);
+        if (guardedLogged.has(label)) return;
+        guardedLogged.add(label);
+        try { logActivity('error', `${label} 처리 중 오류: ${errorDetail(err)} (콘솔 F12에 자세히 남아요)`, 'err'); } catch { /* ignore */ }
+    };
+    return (...args) => {
+        try {
+            const out = fn(...args);
+            if (out && typeof out.catch === 'function') return out.catch(report);
+            return out;
+        } catch (err) {
+            report(err);
+        }
+    };
+}
 
 (function init() {
     getSettings();
@@ -9805,17 +9908,17 @@ let commandsRegistered = false;
         }
         onChatChanged();
     });
-    eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
-    eventSource.on(event_types.MESSAGE_DELETED, onMessageDeleted);
-    eventSource.on(event_types.MESSAGE_EDITED, onMessageEdited);
-    eventSource.on(event_types.MESSAGE_SWIPED, onMessageSwiped);
-    eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
-    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (id) => decorateMessage(Number(id)));
-    eventSource.on(event_types.USER_MESSAGE_RENDERED, (id) => decorateMessage(Number(id)));
-    eventSource.on(event_types.MORE_MESSAGES_LOADED, () => decorateAll());
+    eventSource.on(event_types.CHAT_CHANGED, guarded('채팅 전환', onChatChanged));
+    eventSource.on(event_types.MESSAGE_DELETED, guarded('메시지 삭제', onMessageDeleted));
+    eventSource.on(event_types.MESSAGE_EDITED, guarded('메시지 수정', onMessageEdited));
+    eventSource.on(event_types.MESSAGE_SWIPED, guarded('스와이프', onMessageSwiped));
+    eventSource.on(event_types.MESSAGE_RECEIVED, guarded('새 답변', onMessageReceived));
+    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, guarded('메시지 표시', (id) => decorateMessage(Number(id))));
+    eventSource.on(event_types.USER_MESSAGE_RENDERED, guarded('메시지 표시', (id) => decorateMessage(Number(id))));
+    eventSource.on(event_types.MORE_MESSAGES_LOADED, guarded('메시지 표시', () => decorateAll()));
     document.addEventListener('click', onDocumentClick, true);
     eventSource.on(event_types.MESSAGE_SENT, updateStatus);
-    if (event_types.GENERATION_STARTED) eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
+    if (event_types.GENERATION_STARTED) eventSource.on(event_types.GENERATION_STARTED, guarded('답변 생성 시작', onGenerationStarted));
     // Keeps the "n분 전" labels in the status panel fresh without touching anything else.
     setInterval(() => {
         if (document.getElementById('lm_fold')?.closest('.inline-drawer-content')?.offsetParent) renderLive();
