@@ -151,6 +151,10 @@ const defaultSettings = Object.freeze({
     liveStateUpdate: false,
     liveStateUndo: true,
     yieldToReply: true,
+    recallRawDialogue: true,
+    bannedWords: '',
+    bannedInChat: true,
+    bannedTellModel: false,
     recallMaxWaitMs: 5000,
     qrMessages: 'aside',
     statusMode: 'auto',
@@ -1709,8 +1713,9 @@ function castText(memory, { quotes = true } = {}) {
         if (m.growth.length) lines.push(`- Development in this story (gradual, keeps the core): ${m.growth.slice(brief ? -1 : tight ? -2 : -4).map(g => g.text).join('; ')}`);
         if (quotes && s.voiceQuotes > 0 && m.quotes.length) {
             const n = isPresent(m) || members.length <= 2 ? (tight ? Math.min(2, s.voiceQuotes) : s.voiceQuotes) : 1;
-            const picked = [...m.quotes.filter(q => q.pinned), ...m.quotes.filter(q => !q.pinned).reverse()].slice(0, n);
-            lines.push(`- Voice samples (their real earlier lines; match this voice, never repeat them): ${picked.map(q => `"${q.text}"`).join(' / ')}`);
+            const usable = m.quotes.filter(q => !hasBanned(q.text));
+            const picked = [...usable.filter(q => q.pinned), ...usable.filter(q => !q.pinned).reverse()].slice(0, n);
+            if (picked.length) lines.push(`- Voice samples (their real earlier lines; match this voice, never repeat them): ${picked.map(q => `"${q.text}"`).join(' / ')}`);
         }
         return lines.join('\n');
     }).join('\n\n');
@@ -2357,7 +2362,7 @@ function recallQuery(recentChat) {
     return lines.join('\n').slice(-3000);
 }
 
-async function hybridRecall(memory, query, { useDense = true, topK = null, budget = null } = {}) {
+async function hybridRecall(memory, query, { useDense = true, topK = null, budget = null, noRaw = false } = {}) {
     const s = getSettings();
     const maxItems = topK ?? s.recallTopK;
     const maxTokens = budget ?? s.recallTokenBudget;
@@ -2368,7 +2373,7 @@ async function hybridRecall(memory, query, { useDense = true, topK = null, budge
     const chatNow = ctx().chat || [];
     const visibleRaw = (x) => x.kind === 'raw' && x.from > memory.cursor
         && rangeIndices(x.from, x.to).every(i => chatNow[i] && !chatNow[i].is_system);
-    const searchable = corpus.filter(x => !visibleRaw(x));
+    const searchable = corpus.filter(x => !visibleRaw(x) && !(noRaw && x.kind === 'raw'));
     const byHash = new Map(searchable.map(x => [x.hash, x]));
     const lists = [];
     let dense = false;
@@ -2436,10 +2441,110 @@ function recallText(results) {
     });
     return [
         '<recalled_memories>',
-        'Moments from earlier in this story that may be relevant right now. They already happened; use them for continuity only where they fit, and do not mention this list.',
+        'Moments from earlier in this story that may be relevant right now. They already happened; use them for facts and continuity only where they fit, and do not mention this list. They are reference notes, not a style guide: write in the current voice of the conversation, and never copy their wording, phrasing or recurring expressions.',
         ...lines,
         '</recalled_memories>',
     ].join('\n');
+}
+
+// ---------------------------------------------------------------- avoid words
+// Long chats keep handing old wording back to the model: recalled original lines, voice samples
+// and the recent replies themselves all carry it, so a tic or a word the user banned keeps coming
+// back. Words on the user's list are taken out of everything this extension injects and, if
+// wanted, out of the chat history sent with the request (the saved chat is not touched).
+let bannedCache = { src: null, list: [], re: null };
+function bannedList() {
+    const src = String(getSettings().bannedWords || '');
+    if (bannedCache.src !== src) {
+        const list = [...new Set(src.split(/[\n,，、]+/).map(w => w.trim()).filter(w => w.length >= 1).slice(0, 200))]
+            .sort((a, b) => b.length - a.length);
+        const esc = (w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        bannedCache = { src, list, re: list.length ? new RegExp(list.map(esc).join('|'), 'gi') : null };
+    }
+    return bannedCache;
+}
+
+function hasBanned(text) {
+    const { re } = bannedList();
+    if (!re || !text) return false;
+    re.lastIndex = 0;
+    return re.test(String(text));
+}
+
+function scrubBanned(text) {
+    const { re } = bannedList();
+    if (!re || !text) return text;
+    re.lastIndex = 0;
+    return String(text).replace(re, '').replace(/[ \t]{2,}/g, ' ').replace(/ ([,.!?…])/g, '$1');
+}
+
+function bannedNote() {
+    const s = getSettings();
+    const { list } = bannedList();
+    if (!s.bannedTellModel || !list.length) return '';
+    return `[Style: never use these words or expressions; write the idea another way: ${list.slice(0, 40).join(', ')}]`;
+}
+
+// Finds wording the AI keeps repeating in its recent replies (phrases of 1-6 words that show up
+// in many replies), so the user can put them on the avoid list.
+function findRepeatedPhrases({ replies = 40, top = 24 } = {}) {
+    const c = ctx();
+    const msgs = [];
+    for (let i = c.chat.length - 1; i >= 0 && msgs.length < replies; i--) {
+        const m = c.chat[i];
+        if (!m || m.is_user || isQrMessage(m) || (m.is_system && !m.extra?.lm_hidden)) continue;
+        msgs.push(stripMessage(m.mes));
+    }
+    if (msgs.length < 5) return { scanned: msgs.length, phrases: [] };
+    const names = new Set([c.name1, c.name2, ...(getMemory(false)?.cast || []).map(x => x.name)].filter(Boolean).map(x => String(x).toLowerCase()));
+    const STOP = new Set(['그는', '그녀는', '그가', '그녀가', '그의', '그녀의', '그리고', '하지만', '그러나', '그래서', '있었다', '했다', '있는', '없는', '것이', '것을', '것은', '수', '더', '또', '이', '그', '저', 'the', 'a', 'an', 'and', 'to', 'of', 'in', 'he', 'she', 'his', 'her', 'was', 'is', 'it', 'that', 'you', 'i']);
+    const counts = new Map();
+    for (const text of msgs) {
+        const words = text.toLowerCase().replace(/[^\p{L}\p{N}\s'-]/gu, ' ').split(/\s+/).filter(Boolean);
+        const seen = new Set();
+        for (let n = 1; n <= 6; n++) {
+            for (let i = 0; i + n <= words.length; i++) {
+                const gram = words.slice(i, i + n);
+                if (gram.every(w => STOP.has(w) || names.has(w))) continue;
+                if (n === 1 && (gram[0].length < 2 || STOP.has(gram[0]) || names.has(gram[0]) || /^\d+$/.test(gram[0]))) continue;
+                seen.add(gram.join(' '));
+            }
+        }
+        for (const g of seen) counts.set(g, (counts.get(g) || 0) + 1);
+    }
+    const minShare = (g) => (g.includes(' ') ? 0.25 : 0.4);
+    let phrases = [...counts.entries()]
+        .filter(([g, n]) => n >= 3 && n / msgs.length >= minShare(g))
+        .map(([g, n]) => ({ text: g, replies: n, share: n / msgs.length }))
+        .sort((a, b) => b.replies - a.replies || b.text.length - a.text.length);
+    // Drop a short phrase when a longer one containing it is about as frequent.
+    phrases = phrases.filter(p => !phrases.some(q => q !== p && q.text.length > p.text.length && q.text.includes(p.text) && q.replies >= p.replies * 0.8));
+    return { scanned: msgs.length, phrases: phrases.slice(0, top) };
+}
+
+async function openRepeatFinder() {
+    const c = ctx();
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    const { scanned, phrases } = findRepeatedPhrases();
+    const current = new Set(bannedList().list.map(w => w.toLowerCase()));
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `<div class="lm-root lm-manager lm-repeat"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>자주 반복되는 표현</h3></div>
+  <p class="lm-hint lm-pane-intro">최근 AI 답변 ${scanned}개에서 여러 번 나온 표현이에요. 고른 것을 금지어에 넣으면 코끼리가 넣는 기억과 (켜 두면) AI에게 보내는 최근 대화에서 빠져요. 저장된 채팅은 그대로예요.</p>
+  ${phrases.length ? `<div class="lm-repeat-list">${phrases.map((p, i) => `
+    <label class="lm-repeat-row"><input type="checkbox" data-i="${i}" ${current.has(p.text) ? 'checked disabled' : ''}><span class="lm-repeat-text">${esc(p.text)}</span><span class="lm-repeat-n">답변 ${p.replies}개 · ${Math.round(p.share * 100)}%</span></label>`).join('')}</div>`
+        : `<div class="lm-empty">${scanned < 5 ? 'AI 답변이 5개 이상 쌓이면 찾을 수 있어요.' : '눈에 띄게 반복되는 표현이 없어요.'}</div>`}
+</div>`;
+    applyThemeMode(wrap.firstElementChild);
+    const result = await new c.Popup(wrap, c.POPUP_TYPE.CONFIRM, '', { okButton: '금지어에 넣기', cancelButton: '닫기', wide: true, allowVerticalScrolling: true, leftAlign: true }).show();
+    if (result !== c.POPUP_RESULT.AFFIRMATIVE) return;
+    const picked = [...wrap.querySelectorAll('.lm-repeat-row input:checked:not(:disabled)')].map(el => phrases[Number(el.dataset.i)]?.text).filter(Boolean);
+    if (!picked.length) return;
+    const s = getSettings();
+    s.bannedWords = [String(s.bannedWords || '').trim(), ...picked].filter(Boolean).join('\n');
+    c.saveSettingsDebounced();
+    syncSettingInputs();
+    refreshInjection();
+    toastr.success(`금지어에 ${picked.length}개를 넣었어요.`, APP_NAME);
 }
 
 // ---------------------------------------------------------------- injection
@@ -2454,10 +2559,10 @@ function refreshInjection() {
         setExtensionPrompt(PROMPT_KEY_RECALL, '', POSITIONS.in_chat, 0);
         return;
     }
-    const text = buildMemoryText(memory);
+    const text = scrubBanned(buildMemoryText(memory));
     const position = POSITIONS[s.injectPosition] ?? POSITIONS.in_prompt;
     setExtensionPrompt(PROMPT_KEY_MAIN, text, position, s.injectDepth, false, ROLES[s.injectRole] ?? ROLES.system);
-    const anchor = s.anchorEnabled && text ? buildAnchorText(memory) : '';
+    const anchor = s.anchorEnabled && text ? [scrubBanned(buildAnchorText(memory)), bannedNote()].filter(Boolean).join('\n') : bannedNote();
     setExtensionPrompt(PROMPT_KEY_ANCHOR, anchor, POSITIONS.in_chat, s.anchorDepth, false, ROLES.system);
 }
 
@@ -2540,7 +2645,7 @@ async function refreshRecall(recentChat) {
             } catch (err) {
                 console.warn(LOG_PREFIX, 'query expansion skipped', err);
             }
-            return { ...(await hybridRecall(memory, queries)), queries: queries.length };
+            return { ...(await hybridRecall(memory, queries, { noRaw: !s.recallRawDialogue })), queries: queries.length };
         })();
         let outcome;
         let late = false;
@@ -2550,7 +2655,7 @@ async function refreshRecall(recentChat) {
             if (String(err?.message) !== 'timeout') console.warn(LOG_PREFIX, 'recall failed', err);
             late = String(err?.message) === 'timeout';
             full.catch(() => {});
-            outcome = { ...(await hybridRecall(memory, [base], { useDense: false })), queries: 1 };
+            outcome = { ...(await hybridRecall(memory, [base], { useDense: false, noRaw: !s.recallRawDialogue })), queries: 1 };
         }
         const { results, dense, queries } = outcome;
         lastRecall = results;
@@ -2561,8 +2666,25 @@ async function refreshRecall(recentChat) {
             ? `${results.length}개 찾아 넣음${raw ? ` (원본 대사 ${raw})` : ''} · ${dense ? '의미+키워드' : '키워드'}${queries > 1 ? ` · 검색어 ${queries}개` : ''}`
             : '관련된 과거를 찾지 못했어요'} · ${secs}초${late ? ` · 시간 제한(${(s.recallMaxWaitMs / 1000).toFixed(0)}초)을 넘어서 키워드 검색만 썼어요` : ''}`, late ? 'warn' : 'ok');
     }
+    text = scrubBanned(text);
     setExtensionPrompt(PROMPT_KEY_RECALL, text, POSITIONS.in_chat, s.recallDepth, false, ROLES.system);
     return text;
+}
+
+// The request's copy of the chat (not the saved chat) loses the avoid-list words, so the model
+// does not keep picking them up from its own recent replies.
+function maskBannedInPrompt(chat, type) {
+    const s = getSettings();
+    if (!s.enabled || !s.bannedInChat || !bannedList().re || !Array.isArray(chat)) return;
+    const last = chat.length - 1;
+    let n = 0;
+    chat.forEach((m, i) => {
+        if (!m || typeof m.mes !== 'string') return;
+        if (type === 'continue' && i === last) return; // the text being continued must stay as it is
+        const out = scrubBanned(m.mes);
+        if (out !== m.mes) { m.mes = out; n++; }
+    });
+    if (n) logActivity('inject', `금지어를 최근 대화 ${n}개에서 빼고 보냈어요 (저장된 채팅은 그대로)`);
 }
 
 globalThis.longMemoryInterceptor = async function (chat, _contextSize, _abort, type) {
@@ -2572,6 +2694,7 @@ globalThis.longMemoryInterceptor = async function (chat, _contextSize, _abort, t
         statusCutoff = type === 'swipe' ? ctx().chat.length - 1 : null;
         try { refreshInjection(); } finally { statusCutoff = null; }
         const recalled = await refreshRecall(chat);
+        maskBannedInPrompt(chat, type);
         const s = getSettings();
         const memory = s.enabled ? getMemory(false) : null;
         if (memory) {
@@ -2991,7 +3114,7 @@ Rules:
     header: {
         label: '기억 주입 머리말',
         hint: '대화할 때 기억 앞에 붙는 설명. {{covered}}는 기억한 메시지 범위',
-        text: 'This is the authoritative record of the earlier part of this story ({{covered}}), compressed because the original messages are no longer shown. Treat everything here as established canon of this story: keep names, facts, relationships, injuries, promises and open threads consistent with it. Older events are condensed; the most recent messages continue directly after the last timeline entry. Characters only know secrets they are listed as knowing. This memory records what happened; it does not redefine who the characters are. Their personalities and ways of speaking come from the character description and the [Characters] notes: keep them consistent, write their dialogue in their own voice rather than the neutral tone of these notes, and show change only where the record shows growth, gradually and without losing core traits. Use it silently; do not repeat or summarize it in replies.',
+        text: 'This is the authoritative record of the earlier part of this story ({{covered}}), compressed because the original messages are no longer shown. Treat everything here as established canon of this story: keep names, facts, relationships, injuries, promises and open threads consistent with it. Older events are condensed; the most recent messages continue directly after the last timeline entry. Characters only know secrets they are listed as knowing. This memory records what happened; it does not redefine who the characters are, and it is not a model of style: write in the voice the current conversation uses and do not reuse its wording. Their personalities and ways of speaking come from the character description and the [Characters] notes: keep them consistent, write their dialogue in their own voice rather than the neutral tone of these notes, and show change only where the record shows growth, gradually and without losing core traits. Use it silently; do not repeat or summarize it in replies.',
     },
 };
 
@@ -6559,6 +6682,15 @@ function settingsHtml() {
           ${checkRow('recallEnabled', '회상 사용', '답변 직전에 지금 장면과 관련된 과거를 찾아 넣어요')}
           ${checkRow('queryExpansion', '돌려 말해도 찾기', '"그때 그 일" 같은 말을 구체적인 검색어로 바꿔요. 답변마다 짧은 호출이 1번 늘어요')}
           ${numberRow('recallMaxWaitMs', '답변 전 최대 대기', 1000, 60000, '답변을 생성하기 전 기억 검색에 쓰는 시간의 상한이에요. 넘으면 키워드 검색 결과만 넣고 바로 답변을 생성해요. 걸린 시간은 활동 기록에 남아요')}
+          ${group('옛 문체·금지어', '오래된 기록은 사실만 참고하고 말투는 따라 하지 않게')}
+          ${checkRow('recallRawDialogue', '옛 원본 대사도 회상에 넣기', '끄면 회상에 요약과 사건만 넣고 옛 대사 원문은 넣지 않아요. AI가 옛날 문체나 말버릇을 자꾸 따라 하면 꺼 보세요')}
+          <div class="lm-field lm-field-stack">
+            <div class="lm-field-text"><span class="lm-field-label">금지어·반복 표현</span><span class="lm-hint">한 줄에 하나(또는 쉼표로 구분). 코끼리가 넣는 기억·회상·대사 샘플에서 빼요</span></div>
+            <textarea class="text_pole lm-textarea" data-lm-setting="bannedWords" rows="3" placeholder="예: 숨을 들이켰다&#10;입꼬리를 올렸다"></textarea>
+          </div>
+          <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_repeat">${icon('search')}<span>반복 표현 찾기</span></button><span class="lm-hint">최근 AI 답변에서 자주 반복된 표현을 찾아 골라 넣어요</span></div>
+          ${checkRow('bannedInChat', '최근 대화에서도 빼고 보내기', 'AI에게 보내는 최근 대화에서도 금지어를 빼요. 저장된 채팅은 그대로예요. 이게 없으면 AI가 자기 최근 답변을 보고 같은 말을 또 써요')}
+          ${checkRow('bannedTellModel', 'AI에게 금지어 목록 알려주기', '목록을 "쓰지 마"라고 직접 알려줘요. 모델에 따라 오히려 그 단어를 떠올리게 할 수 있어서 기본은 꺼 둬요')}
           ${group('검색 방식', '키워드 검색은 늘 켜져 있어요')}
           ${checkRow('vectorEnabled', '의미 검색', '끄면 키워드 검색만 해요')}
           ${checkRow('autoIndex', '자동 색인', '압축하거나 기억이 바뀔 때마다 알아서 색인을 맞춰요. 끄면 "전체 색인" 버튼을 누를 때만 색인해요 (이미 만든 색인으로 검색은 계속돼요)')}
@@ -6690,8 +6822,9 @@ function settingsHtml() {
 // 프롬프트 tabs) appears with "모든 설정 보기", and the settings search always finds everything.
 const ESSENTIAL_SETTINGS = new Set(['language', 'detail', 'keepRecent', 'softenSensitive', 'voiceEnabled',
     'autoCompress', 'autoCompressAt', 'checkContradictions', 'liveStateUpdate', 'yieldToReply',
-    'recallEnabled', 'vectorEnabled', 'embedSource', 'memoryBudget']);
-const ESSENTIAL_IDS = new Set(['lm_profile', 'lm_fallback', 'lm_btn_test']);
+    'recallEnabled', 'vectorEnabled', 'embedSource', 'memoryBudget',
+    'recallRawDialogue', 'bannedWords', 'bannedInChat']);
+const ESSENTIAL_IDS = new Set(['lm_profile', 'lm_fallback', 'lm_btn_test', 'lm_btn_repeat']);
 const ADVANCED_PANES = new Set(['lore', 'inject', 'prompt']);
 
 function applySimpleView(root) {
@@ -6895,6 +7028,7 @@ function bindSettings(root) {
     root.querySelector('#lm_btn_test').addEventListener('click', () => testConnection());
     root.querySelector('#lm_btn_qrsort')?.addEventListener('click', () => openQrSorter());
     root.querySelector('#lm_btn_status')?.addEventListener('click', () => openStatusHistory());
+    root.querySelector('#lm_btn_repeat')?.addEventListener('click', () => openRepeatFinder());
     renderPromptEditors(root);
     let pickedStyle = s.promptStyle || 'default';
     renderStyleList(root, pickedStyle);

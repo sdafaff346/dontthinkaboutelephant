@@ -1939,3 +1939,10 @@
 .lm-root .lm-showall input { margin: 0; accent-color: var(--lm-accent); }
 .lm-root .lm-showall span { color: var(--lm-text); font-weight: 600; }
 .lm-root .lm-showall em { font-style: normal; font-size: 12px; }
+
+/* repeated phrase finder */
+.lm-repeat-list { display: flex; flex-direction: column; gap: 4px; }
+.lm-root .lm-repeat-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border: 1px solid var(--lm-line); border-radius: 10px; background: var(--lm-card); cursor: pointer; }
+.lm-root .lm-repeat-row input { margin: 0; flex: 0 0 auto; accent-color: var(--lm-accent); }
+.lm-repeat-text { flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 600; color: var(--lm-text); overflow-wrap: anywhere; }
+.lm-repeat-n { flex: 0 0 auto; font-size: 12px; color: var(--lm-muted); }
