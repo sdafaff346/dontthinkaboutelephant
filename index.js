@@ -151,6 +151,12 @@ const defaultSettings = Object.freeze({
     liveStateUpdate: false,
     liveStateUndo: true,
     yieldToReply: true,
+    stableBlock: true,
+    canonEnabled: true,
+    canonCount: 10,
+    canonEvery: 3,
+    memoryReasoning: 'min',
+    reasoningRefused: {},
     recallRawDialogue: true,
     bannedWords: '',
     bannedInChat: true,
@@ -392,6 +398,9 @@ function emptyMemory() {
         hooks: [],
         merged: [],
         statusBar: null,
+        rev: 0,
+        checkpoint: null,
+        canon: { facts: [], pickedAt: 0, nodesAtPick: 0 },
     };
 }
 
@@ -663,6 +672,7 @@ async function reconcileAfterDeletion() {
 }
 
 function onMessageEdited(id) {
+    runDeferredSync();
     const edited = ctx().chat[Number(id)];
     if (edited && heldChecks.get(edited)?.state === 'editing') finishFlaggedEdit(edited);
     const memory = getMemory(false);
@@ -1695,13 +1705,16 @@ function trimCast(memory, limit = null) {
     return true;
 }
 
-function castText(memory, { quotes = true } = {}) {
+function castText(memory, { quotes = true, stable = false } = {}) {
     const s = getSettings();
     const members = (memory.cast || []).filter(m => m.name && (m.core || m.speech || m.quotes.length || m.growth.length));
     if (!members.length) return '';
-    const present = new Set(presentNames(memory));
-    const isPresent = (m) => memberNames(m).some(n => present.has(normName(n)) || [...present].some(p => p.includes(normName(n)) || sameCharacterName(p, n)));
-    const ordered = [...members.filter(isPresent), ...members.filter(m => !isPresent(m))];
+    // The stable block must not change when someone walks into the scene, so it keeps the
+    // cast in its own order and treats nobody as "present" (present people get the full
+    // notes in the reminder near the newest message instead).
+    const present = new Set(stable ? [] : presentNames(memory));
+    const isPresent = (m) => !stable && memberNames(m).some(n => present.has(normName(n)) || [...present].some(p => p.includes(normName(n)) || sameCharacterName(p, n)));
+    const ordered = stable ? members : [...members.filter(isPresent), ...members.filter(m => !isPresent(m))];
     return ordered.map(m => {
         const lines = [`${m.name}`];
         const level = Number(memory.castCompact) || 0;
@@ -1793,6 +1806,276 @@ function buildMemoryText(memory) {
         sections.join('\n\n'),
         '</story_memory>',
     ].join('\n');
+}
+
+// ---------------------------------------------------------------- established facts (canon)
+// A short list of the facts the rest of the story cannot be understood without. Instead of
+// asking the model to rate every note (it calls everything important), it is asked to pick
+// exactly N facts from the whole record, and each fact names the records it rests on. A fact
+// whose records are gone (deleted, merged away) is dropped, so a wrong pick does not live on.
+function canonIndex(memory) {
+    const rows = [];
+    if (memory.saga?.text?.trim()) rows.push({ id: 'saga', text: `[saga] The story so far: ${memory.saga.text.trim().replace(/\s+/g, ' ').slice(0, 2500)}` });
+    for (const n of memory.timeline) {
+        const range = n.from >= 0 ? `#${n.from}-#${n.to}` : 'earlier chat';
+        rows.push({ id: n.id, text: `[${n.id}] (${range}${n.when ? `, ${n.when}` : ''}) ${n.title}: ${String(n.text || '').replace(/\s+/g, ' ').slice(0, 700)}` });
+    }
+    return rows;
+}
+
+function validCanon(memory) {
+    const ids = new Set(['saga', ...memory.timeline.map(n => n.id), ...memory.archive.map(a => a.id)]);
+    return (memory.canon?.facts || []).filter(f => f?.text && Array.isArray(f.cites) && f.cites.some(id => ids.has(id)));
+}
+
+function parseCanon(out, validIds, max) {
+    const body = extractTag(out, 'facts') ?? out;
+    const facts = [];
+    const seen = new Set();
+    for (const raw of String(body).split('\n')) {
+        const m = raw.match(/^\s*(?:[-*•]|\d+[.)])?\s*\[([^\]]+)\]\s*(.+?)\s*$/);
+        if (!m) continue;
+        const cites = m[1].split(/[,\s]+/).map(x => x.trim()).filter(x => validIds.has(x));
+        if (!cites.length) continue; // a fact that rests on nothing would be permanent again
+        let text = m[2].replace(/^[-:–—]\s*/, '').trim();
+        const words = text.split(/\s+/);
+        if (words.length > 45) text = `${words.slice(0, 45).join(' ')}…`;
+        const norm = text.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+        if (!norm || seen.has(norm)) continue;
+        seen.add(norm);
+        facts.push({ text, cites });
+        if (facts.length >= max) break;
+    }
+    return facts;
+}
+
+async function pickCanon(memory, { signal = null } = {}) {
+    const s = getSettings();
+    const rows = canonIndex(memory);
+    if (rows.length < 2) return false;
+    const n = Math.max(3, Math.min(20, Number(s.canonCount) || 10));
+    const system = `${baseArchivistRules()}
+
+Task: from the story record below, pick exactly ${n} facts that the rest of the story cannot be understood without. Good picks are permanent or load-bearing: deaths and births, vows and promises still binding, debts, betrayals, secrets and who knows them, true identities, permanent injuries or losses, relationships that changed for good, things won or lost for good. Do not pick scenery, moods, outfits, passing events or anything already undone. If fewer than ${n} such facts exist, pick the most important ones that do.
+Each fact is one plain sentence (at most 25 words) with concrete names, written as established truth. Cite the ids of the records it rests on.
+${languageRule()}
+Output only:
+<facts>
+- [record-id, record-id] fact
+</facts>`;
+    const user = `<story_record>\n${rows.map(r => r.text).join('\n')}\n</story_record>`;
+    const out = await callModel(system, user, { retries: 1, expectTag: 'facts', signal });
+    const facts = parseCanon(out, new Set(rows.map(r => r.id)), n);
+    if (!facts.length) throw new Error('핵심 사실을 해석하지 못했어요.');
+    memory.canon = { facts, pickedAt: Date.now(), nodesAtPick: memory.timeline.length + (memory.saga?.text ? 1 : 0) };
+    logActivity('compact', `핵심 사실 ${facts.length}개를 골랐어요`);
+    return true;
+}
+
+// Picks again every few new summaries, inside the summary job (one extra small call).
+async function maybePickCanon(memory, chatId) {
+    const s = getSettings();
+    if (!s.canonEnabled || !stillSameChat(chatId)) return;
+    const size = memory.timeline.length + (memory.saga?.text ? 1 : 0);
+    const since = size - (memory.canon?.nodesAtPick || 0);
+    const stale = (memory.canon?.facts || []).length !== validCanon(memory).length;
+    if (size < 3 || (since < Math.max(1, Number(s.canonEvery) || 3) && !stale && memory.canon?.facts?.length)) return;
+    try {
+        setProgress('핵심 사실 고르는 중');
+        await pickCanon(memory, { signal: abortController?.signal });
+    } catch (err) {
+        if (String(err?.message) === 'aborted') throw err;
+        logActivity('compact', `핵심 사실을 고르지 못했어요: ${errorDetail(err)}`, 'warn');
+    }
+}
+
+function canonPanelHtml(memory) {
+    if (!getSettings().canonEnabled) return '';
+    const byId = new Map([...memory.timeline, ...memory.archive].map(n => [n.id, n]));
+    const range = (id) => {
+        if (id === 'saga') return '지금까지의 이야기';
+        const n = byId.get(id);
+        return n ? (n.from >= 0 ? `#${n.from}~#${n.to}` : '이전 채팅') : '';
+    };
+    const valid = new Set(validCanon(memory));
+    const facts = memory.canon?.facts || [];
+    const rows = facts.map((f, i) => `
+      <div class="lm-canon-row ${valid.has(f) ? '' : 'lm-canon-gone'}">
+        <span class="lm-canon-text">${esc(f.text)}</span>
+        <span class="lm-canon-cite">${esc([...new Set(f.cites.map(range).filter(Boolean))].join(', ') || '근거 기억이 사라짐')}</span>
+        <button type="button" class="lm-canon-del lm-icon-btn" data-i="${i}" title="이 사실 빼기" aria-label="이 사실 빼기">${icon('trash')}</button>
+      </div>`).join('');
+    return `<div class="lm-canon">
+      <div class="lm-canon-head"><span class="lm-field-label">핵심 사실</span><span class="lm-hint">기억 맨 위에 들어가는, 이야기를 받치는 사실이에요. 근거 기억이 지워지면 함께 빠져요.</span>${tool_('lm_canon_pick', 'rotate', facts.length ? '다시 고르기' : '지금 고르기')}</div>
+      ${rows || '<div class="lm-empty">아직 고른 사실이 없어요. 요약이 몇 개 쌓이면 자동으로 골라요.</div>'}
+    </div>`;
+}
+
+function tool_(id, ic, label) {
+    return `<button type="button" class="lm-toolbtn" id="${id}">${icon(ic)}<span>${label}</span></button>`;
+}
+
+async function runCanonPick() {
+    if (busy) return toastr.warning('이미 작업 중입니다.');
+    const memory = getMemory(false);
+    if (!memory || canonIndex(memory).length < 2) return toastr.info('요약이 두 개 이상 쌓이면 고를 수 있어요.', APP_NAME);
+    const chatId = ctx().getCurrentChatId();
+    busy = true;
+    abortController = new AbortController();
+    setBusyUI(true);
+    setProgress('핵심 사실 고르는 중');
+    try {
+        pushHistory(memory, '핵심 사실 고르기');
+        await pickCanon(memory, { signal: abortController.signal });
+        if (!stillSameChat(chatId)) return;
+        await persistChat();
+        toastr.success(`핵심 사실 ${memory.canon.facts.length}개를 골랐어요.`, APP_NAME);
+    } catch (err) {
+        if (String(err?.message) === 'aborted') toastr.info('중지했습니다.');
+        else reportError('핵심 사실 고르기 실패', err);
+    } finally {
+        busy = false;
+        abortController = null;
+        setBusyUI(false);
+        setProgress('');
+        refreshInjection();
+        updateStatus();
+        runPendingTurn();
+    }
+}
+
+// ---------------------------------------------------------------- stable memory block
+// Providers cache the start of a prompt, and the memory block sits near the top, right after
+// the character card. If anything inside it changes, everything after it (the whole chat
+// history) has to be read again. So the block is split by how often things change:
+// - the stable block (frame, cast notes, established facts, story so far, timeline, the fact
+//   sheet as of the last checkpoint, foreshadowing) changes only when a summary or an edit
+//   changes the memory;
+// - the reminder near the newest message carries what changes between replies: the scene,
+//   fact-sheet updates since the checkpoint, voice samples of who is present.
+function stableInputsKey(memory) {
+    const s = getSettings();
+    const parts = [
+        memory.rev || 0,
+        JSON.stringify(memory.frame || {}),
+        (memory.cast || []).map(m => [m.name, m.core, m.speech, (m.growth || []).map(g => g.text).join('|')].join('~')).join('\n'),
+        memory.castCompact || 0,
+        memory.saga?.text || '',
+        memory.timeline.map(n => `${n.id}|${n.title}|${n.when || ''}|${n.from}|${n.to}|${hashString(n.text || '')}`).join('\n'),
+        JSON.stringify((memory.canon?.facts || []).map(f => f.text)),
+        JSON.stringify((memory.hooks || []).map(h => [h.id, h.status, h.text])),
+        s.voiceEnabled, s.hooksEnabled, s.canonEnabled, s.bannedWords, promptTemplate('header'),
+    ];
+    return hashString(parts.join('\u0001'));
+}
+
+const ledgerLine = (e) => `${e.cat}|${e.key}|${e.value}|${e.status}|${(e.knownBy || []).join(',')}|${e.due || ''}`;
+
+// Changes to the fact sheet since the checkpoint, as short lines for the reminder.
+function ledgerDiff(memory) {
+    const base = new Map((memory.checkpoint?.entries || []).map(e => [e.id, e]));
+    const out = [];
+    const seen = new Set();
+    for (const e of memory.ledger.entries) {
+        seen.add(e.id);
+        const old = base.get(e.id);
+        if (old && ledgerLine(old) === ledgerLine(e)) continue;
+        if (e.status === 'closed' && (!old || old.status !== 'closed')) out.push(`${e.key}: resolved`);
+        else out.push(`${e.key}: ${e.value}${e.knownBy?.length ? ` (known only by: ${e.knownBy.join(', ')})` : ''}`);
+    }
+    for (const [id, e] of base) if (!seen.has(id)) out.push(`${e.key}: no longer applies`);
+    return out;
+}
+
+// Takes a new checkpoint when the stable inputs changed, or when the fact sheet has drifted so
+// far from the last one that the reminder would get long (rebuilding once is cheaper then).
+function ensureCheckpoint(memory) {
+    const key = stableInputsKey(memory);
+    const cp = memory.checkpoint;
+    if (cp && cp.key === key && ledgerDiff(memory).length <= 12) return false;
+    memory.checkpoint = { key, at: Date.now(), entries: structuredClone(memory.ledger.entries) };
+    return true;
+}
+
+function canonText(memory) {
+    if (!getSettings().canonEnabled) return '';
+    const facts = validCanon(memory);
+    return facts.length ? `[Established facts the story rests on]\n${facts.map(f => `- ${f.text}`).join('\n')}` : '';
+}
+
+function buildStableMemoryText(memory) {
+    if (!memory) return '';
+    ensureCheckpoint(memory);
+    const sections = [];
+    const frame = frameText(memory.frame);
+    if (frame) sections.push(`[Story frame]\n${frame}`);
+    const cast = getSettings().voiceEnabled ? castText(memory, { quotes: false, stable: true }) : '';
+    if (cast) sections.push(`[Characters: personality and voice]\n${cast}`);
+    const canon = canonText(memory);
+    if (canon) sections.push(canon);
+    if (memory.saga.text.trim()) sections.push(`[The story so far]\n${memory.saga.text.trim()}`);
+    if (memory.timeline.length) sections.push(`[Timeline, oldest to newest]\n${timelineText(memory)}`);
+    const ledger = ledgerText({ scene: {}, entries: memory.checkpoint?.entries || [] });
+    if (ledger) sections.push(ledger);
+    const hooks = getSettings().hooksEnabled ? hooksMemoryText(memory) : '';
+    if (hooks) sections.push(hooks);
+    if (!sections.length) return '';
+    const covered = memory.cursor >= 0 ? `messages #0-#${memory.cursor}` : 'earlier messages';
+    return [
+        '<story_memory>',
+        cast || promptTemplate('header') !== PROMPT_DEFS.header.text
+            ? getPrompt('header', { covered })
+            : getPrompt('header', { covered }).replace(' and the [Characters] notes', ''),
+        'The current scene and anything that changed since this record was written are in the [Now] note near the latest messages; where they differ, [Now] is right.',
+        '',
+        sections.join('\n\n'),
+        '</story_memory>',
+    ].join('\n');
+}
+
+// The volatile part, placed near the newest messages.
+function buildNowText(memory) {
+    const s = getSettings();
+    const sc = memory.ledger.scene || {};
+    const lines = [];
+    const status = s.statusInject ? latestStatus(memory, statusCutoff) : null;
+    if (status) lines.push(`Latest status bar (message #${status.at}): ${statusOneLine(status)}. Carry the in-story time, date and place on from here; move them forward only as the story does.`);
+    const scene = [!status && sc.time && `Time: ${sc.time}`, !status && sc.place && `Place: ${sc.place}`, sc.present && `Present: ${sc.present}`, sc.mood && `Mood: ${sc.mood}`].filter(Boolean);
+    if (scene.length) lines.push(scene.join(' | '));
+    const diff = ledgerDiff(memory);
+    if (diff.length) lines.push(`Changed since the memory record: ${diff.join('; ')}`);
+    if (s.voiceEnabled) {
+        const present = new Set(presentNames(memory));
+        const here = (memory.cast || []).filter(m => present.has(normName(m.name)) || memory.cast.length <= 2);
+        const voiced = here.filter(m => m.speech).slice(0, 3);
+        if (voiced.length) lines.push(`Stay in character. ${voiced.map(m => `${m.name} speaks: ${m.speech.replace(/\s+/g, ' ').slice(0, 140)}`).join(' | ')}`);
+        if (s.voiceQuotes > 0) {
+            const samples = here.slice(0, 3).map(m => {
+                const usable = (m.quotes || []).filter(q => !hasBanned(q.text));
+                const picked = [...usable.filter(q => q.pinned), ...usable.filter(q => !q.pinned).reverse()].slice(0, Math.min(2, s.voiceQuotes));
+                return picked.length ? `${m.name}: ${picked.map(q => `"${q.text}"`).join(' / ')}` : '';
+            }).filter(Boolean);
+            if (samples.length) lines.push(`Voice samples (match the voice, never repeat them): ${samples.join(' | ')}`);
+        }
+    }
+    const threads = memory.ledger.entries.filter(e => e.cat === 'thread' && e.status !== 'closed').sort((a, b) => b.importance - a.importance).slice(0, 6).map(e => e.key);
+    if (threads.length) lines.push(`Open threads: ${threads.join('; ')}`);
+    if (!lines.length) return '';
+    return `[Now: stay consistent with <story_memory>]\n${lines.join('\n')}`;
+}
+
+// What goes into the prompt, in both layouts.
+function composeInjection(memory) {
+    const s = getSettings();
+    if (!memory) return { main: '', anchor: '' };
+    if (s.stableBlock && s.anchorEnabled) {
+        const main = scrubBanned(buildStableMemoryText(memory));
+        const anchor = [main || memory.ledger.entries.length ? scrubBanned(buildNowText(memory)) : '', bannedNote()].filter(Boolean).join('\n');
+        return { main, anchor };
+    }
+    const main = scrubBanned(buildMemoryText(memory));
+    const anchor = s.anchorEnabled && main ? [scrubBanned(buildAnchorText(memory)), bannedNote()].filter(Boolean).join('\n') : bannedNote();
+    return { main, anchor };
 }
 
 function buildAnchorText(memory) {
@@ -2559,10 +2842,9 @@ function refreshInjection() {
         setExtensionPrompt(PROMPT_KEY_RECALL, '', POSITIONS.in_chat, 0);
         return;
     }
-    const text = scrubBanned(buildMemoryText(memory));
+    const { main, anchor } = composeInjection(memory);
     const position = POSITIONS[s.injectPosition] ?? POSITIONS.in_prompt;
-    setExtensionPrompt(PROMPT_KEY_MAIN, text, position, s.injectDepth, false, ROLES[s.injectRole] ?? ROLES.system);
-    const anchor = s.anchorEnabled && text ? [scrubBanned(buildAnchorText(memory)), bannedNote()].filter(Boolean).join('\n') : bannedNote();
+    setExtensionPrompt(PROMPT_KEY_MAIN, main, position, s.injectDepth, false, ROLES[s.injectRole] ?? ROLES.system);
     setExtensionPrompt(PROMPT_KEY_ANCHOR, anchor, POSITIONS.in_chat, s.anchorDepth, false, ROLES.system);
 }
 
@@ -2777,6 +3059,35 @@ function findProfile(profileId) {
     return (ctx().extensionSettings.connectionManager?.profiles ?? []).find(p => p.id === profileId) || null;
 }
 
+// Memory calls are short readings of short text. A thinking model spends its reply budget
+// thinking about them and comes back empty or slow, so ask for the least thinking the source
+// accepts. Only sources where SillyTavern maps the value safely are asked: OpenRouter passes it
+// on as reasoning.effort ("none", then "low"), and Google AI Studio / Vertex AI turn ST's "min"
+// into the smallest thinking budget. If a model refuses, the next step (or nothing) is
+// remembered for that profile and model.
+const REASONING_LADDER = { openrouter: ['none', 'low'], makersuite: ['min'], vertexai: ['min'] };
+
+function reasoningKey(profileId) {
+    return `${profileId}\n${findProfile(profileId)?.model || ''}`;
+}
+
+function reasoningOverride(profileId) {
+    const s = getSettings();
+    if (!profileId || s.memoryReasoning === 'preset') return {};
+    const ladder = REASONING_LADDER[profileSource(findProfile(profileId))];
+    if (!ladder) return {};
+    const step = Number(s.reasoningRefused?.[reasoningKey(profileId)]) || 0;
+    return ladder[step] ? { reasoning_effort: ladder[step] } : {};
+}
+
+function refuseReasoning(profileId, effort) {
+    const s = getSettings();
+    const key = reasoningKey(profileId);
+    s.reasoningRefused = { ...(s.reasoningRefused || {}), [key]: (Number(s.reasoningRefused?.[key]) || 0) + 1 };
+    ctx().saveSettingsDebounced();
+    logActivity('model', `${profileName(profileId)}이(가) 추론 줄이기(${effort})를 받지 않아서 다음부터는 다르게 보내요`, 'warn');
+}
+
 function profileSource(profile) {
     try { return ctx().ConnectionManagerRequestService?.validateProfile?.(profile)?.source || ''; } catch { return ''; }
 }
@@ -2908,6 +3219,7 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
     let authStep = 0;
     let regionTries = null;
     let regionOverride = null;
+    let sentReasoning = {};
     // The answer check passes its own signal so a new reply can cut it short; summaries use the
     // signal of the running compress job.
     const sig = signal ?? abortController?.signal ?? null;
@@ -2922,7 +3234,7 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
                     messages,
                     s.maxOutputTokens,
                     { stream: false, signal: sig, extractData: true, includePreset: s.includePreset },
-                    { ...(repair?.payload ?? await profileBasePayload(profileId)), ...(regionOverride ? { vertexai_region: regionOverride } : {}) },
+                    { ...(repair?.payload ?? await profileBasePayload(profileId)), ...(regionOverride ? { vertexai_region: regionOverride } : {}), ...(sentReasoning = reasoningOverride(profileId)) },
                 );
                 raw = typeof result === 'string' ? result : (result?.content ?? '');
             } else {
@@ -2958,6 +3270,13 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
                     attempt--;
                     continue;
                 }
+            }
+            // A model that cannot lower its thinking answers 400: drop that request field and retry.
+            if (profileId && sentReasoning.reasoning_effort && /\b400\b|bad request|response not ok|reasoning|thinking/i.test(errorDetail(err))) {
+                refuseReasoning(profileId, sentReasoning.reasoning_effort);
+                sentReasoning = {};
+                attempt--;
+                continue;
             }
             // ST answers a Vertex service-account mix-up with a bare 400 ("Response not OK").
             const vertexBare = profileId && /response not ok|status 400/i.test(errorDetail(err)) && profileSource(findProfile(profileId)) === 'vertexai';
@@ -4409,6 +4728,10 @@ async function runCompress({ all = false, auto = false } = {}) {
             const last = batches[done - 1];
             logActivity(auto ? 'auto' : 'compress', `#${batches[0].from}~#${last.to} · ${done}개 구간 기억함`);
         }
+        if (done && stillSameChat(chatId)) {
+            await maybePickCanon(getMemory(true), chatId);
+            dirty = true;
+        }
         if (done) await maybeAutoBackup(done);
         if (done && stillSameChat(chatId)) syncAfter();
     } catch (err) {
@@ -5068,6 +5391,7 @@ function onDocumentClick(event) {
 }
 
 function onMessageReceived(id, type) {
+    runDeferredSync();
     // A new swipe starts from a copy of the previous swipe's extra, so that swipe's warning and
     // live-update tag came along. They belong to the other reply: drop them here.
     if (type === 'swipe') {
@@ -6375,6 +6699,7 @@ const ICONS = {
     alert: '<path d="M12 3.5 2.5 20h19z"/><path d="M12 10v4.5M12 17.2v.3"/>',
     star: '<path d="m12 3.5 2.6 5.3 5.9.9-4.3 4.1 1 5.8L12 16.9l-5.2 2.7 1-5.8-4.3-4.1 5.9-.9z"/>',
     graph: '<circle cx="6" cy="6.5" r="2.5"/><circle cx="18" cy="7.5" r="2.5"/><circle cx="12" cy="18" r="2.5"/><path d="M8.5 6.8l7 .5M7.2 8.8l3.6 6.9M16.8 9.8l-3.6 6"/>',
+    table: '<rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M3.5 9.5h17M3.5 14.5h17M9.5 9.5v10"/>',
     calendar: '<rect x="3.5" y="5" width="17" height="15.5" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4M7.5 14h2M11 14h2M14.5 14h2M7.5 17h2M11 17h2"/>',
     merge: '<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="12" r="2"/><path d="M6 7v10"/><path d="M6 7c0 4 3.5 5 10 5"/>',
     compare: '<rect x="3.5" y="4" width="7" height="16" rx="1.5"/><rect x="13.5" y="4" width="7" height="16" rx="1.5"/><path d="M6 9h2M6 12h2M16 9h2M16 12h2M16 15h2"/>',
@@ -6407,7 +6732,7 @@ const UNITS = {
     remindAt: '개', autoBackupEvery: '번', backupKeep: '개', expansionTimeoutMs: 'ms', memoryBudget: '토큰', protectRecent: '개', maxEpisodes: '개', chapterSize: '개',
     maxChapters: '개', sagaMaxWords: '단어', staleAfter: '메시지', archiveMax: '개', maxUndo: '회',
     voiceQuotes: '줄', voiceKeep: '줄', recallTopK: '개', recallTokenBudget: '토큰', recallScan: '개', vectorThreshold: '%', rawChunkMessages: '개',
-    rawChunkChars: '자', eventMax: '개', queryTimeoutMs: 'ms', recallMaxWaitMs: 'ms', loreTokenBudget: '토큰',
+    rawChunkChars: '자', eventMax: '개', queryTimeoutMs: 'ms', recallMaxWaitMs: 'ms', canonCount: '개', canonEvery: '개', loreTokenBudget: '토큰',
 };
 
 function numberRow(key, label, min, max, hint = '') {
@@ -6622,6 +6947,7 @@ function settingsHtml() {
           ${selectRow('', '요약 모델', profileOptions(s.profileId), s.profileId, 'Connection Manager에 저장한 프로필. 비우면 지금 쓰는 API를 써요', 'lm_profile')}
           <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_test">${icon('plug')}<span>연결 테스트</span></button><span class="lm-hint">요약 모델이 응답하는지 바로 확인해요</span></div>
           ${selectRow('', '검열되면 대신 쓸 모델', profileOptions(s.fallbackProfileId, '사용 안 함'), s.fallbackProfileId, '요약 모델이 거부하거나 막힐 때만 이 프로필로 다시 보내요. Gemini를 쓴다면 DeepSeek·GLM 같은 다른 회사 모델을 추천해요', 'lm_fallback')}
+          ${selectRow('memoryReasoning', '요약 모델의 생각(추론)', selectOptions({ min: '최소로 (권장)', preset: '프로필 프리셋 그대로' }, s.memoryReasoning), s.memoryReasoning, '요약 같은 짧은 작업에 생각을 길게 하면 느리고 빈 답이 나기 쉬워요. 요약 모델을 연결 프로필로 정했을 때 OpenRouter·Google AI Studio·Vertex AI에 "생각 최소"로 요청해요. 모델이 거부하면 알아서 빼고 보내요')}
           ${group('요약 방식', '무엇을 얼마나 자세히 남길지')}
           ${checkRow('softenSensitive', '민감한 장면 순화 (기본 꺼짐)', '꺼져 있으면 모든 장면을 있는 그대로 요약해요. 켜면 야하거나 잔인한 장면을 짧고 덤덤하게 줄여 적어서 검열에 덜 걸리지만, 그만큼 덜 자세히 기억해요')}
           ${selectRow('language', '요약 언어', selectOptions(LANGUAGES, s.language), s.language, 'English가 토큰을 가장 적게 써요')}
@@ -6736,6 +7062,10 @@ function settingsHtml() {
         <section class="lm-pane" data-lm-pane="tidy" role="tabpanel" data-lm-pane-title="기억 크기">
           ${group('기억 크기', 'AI에게 보내는 기억의 최대 크기')}
           ${numberRow('memoryBudget', '기억 크기 한도 (기억 예산)', 500, 2000000, '넘으면 덜 중요한 기억부터 줄이고 오래된 걸 합쳐요')}
+          ${group('핵심 사실', '이야기를 받치는 사실만 따로')}
+          ${checkRow('canonEnabled', '핵심 사실 고르기', '요약이 몇 개 쌓일 때마다 전체 기억에서 꼭 필요한 사실(죽음, 약속, 빚, 정체, 돌이킬 수 없는 변화)만 정해진 개수로 골라 기억 맨 위에 둬요. 고를 때 API를 한 번 써요. 기억장 → 기록부에서 보고 고칠 수 있어요')}
+          ${numberRow('canonCount', '핵심 사실 개수', 3, 20, '긴 이야기여도 8~12개면 충분해요')}
+          ${numberRow('canonEvery', '다시 고르는 간격', 1, 50, '새 요약이 이만큼 쌓이면 다시 골라요')}
           ${checkRow('autoCompact', '예산을 넘으면 자동 정리')}
           ${group('백업')}
           ${numberRow('autoBackupEvery', '자동 백업 간격', 0, 1000, '압축을 이만큼 할 때마다 백업해요. 0이면 끔')}
@@ -6757,6 +7087,7 @@ function settingsHtml() {
           ${selectRow('injectPreset', '주입 프리셋', selectOptions(Object.fromEntries(Object.entries(INJECT_PRESETS).map(([k, v]) => [k, v.label])), s.injectPreset), s.injectPreset, '')}
           <div class="lm-preset-row"><span class="lm-hint" id="lm_preset_desc">${esc(INJECT_PRESETS[s.injectPreset]?.desc || '')}</span><button type="button" class="lm-chipbtn" id="lm_apply_preset">${icon('check')}<span>적용</span></button></div>
           ${checkRow('anchorEnabled', '현재 상태 리마인더', '최근 대화 근처에 짧게 넣어 긴 채팅에서도 흐름과 말투를 놓치지 않게 해요')}
+          ${checkRow('stableBlock', '기억 블록 고정 (캐시 아끼기)', '답변마다 바뀌는 장면·실시간 갱신은 리마인더로 보내고, 큰 기억 블록은 요약이 바뀔 때만 바꿔요. 프롬프트 캐싱이 잘 맞아서 빠르고 싸져요. 리마인더가 꺼져 있으면 쓰지 않아요')}
           ${numberRow('voiceQuotes', '대사 샘플 (장면 속 인물당)', 0, 10, '캐릭터의 실제 대사를 몇 줄 보여줄지. 0이면 넣지 않아요')}
           ${advanced(`
             ${selectRow('injectPosition', '기억 넣을 위치', selectOptions({ in_prompt: '캐릭터 설정 뒤', before_prompt: '프롬프트 맨 앞', in_chat: '채팅 안 (깊이 지정)' }, s.injectPosition), s.injectPosition, '대부분 캐릭터 설정 뒤가 가장 안정적이에요')}
@@ -6823,7 +7154,7 @@ function settingsHtml() {
 const ESSENTIAL_SETTINGS = new Set(['language', 'detail', 'keepRecent', 'softenSensitive', 'voiceEnabled',
     'autoCompress', 'autoCompressAt', 'checkContradictions', 'liveStateUpdate', 'yieldToReply',
     'recallEnabled', 'vectorEnabled', 'embedSource', 'memoryBudget',
-    'recallRawDialogue', 'bannedWords', 'bannedInChat']);
+    'recallRawDialogue', 'bannedWords', 'bannedInChat', 'memoryReasoning', 'canonEnabled']);
 const ESSENTIAL_IDS = new Set(['lm_profile', 'lm_fallback', 'lm_btn_test', 'lm_btn_repeat']);
 const ADVANCED_PANES = new Set(['lore', 'inject', 'prompt']);
 
@@ -7442,8 +7773,7 @@ async function openPeek() {
     const c = ctx();
     const s = getSettings();
     const memory = getMemory(false);
-    const main = s.enabled && memory ? buildMemoryText(memory) : '';
-    const anchor = s.enabled && s.anchorEnabled && main ? buildAnchorText(memory) : '';
+    const { main, anchor } = s.enabled && memory ? composeInjection(memory) : { main: '', anchor: '' };
     let recall = '';
     let recallNote = '';
     if (s.enabled && s.recallEnabled && memory) {
@@ -8000,6 +8330,8 @@ function managerHtml(memory) {
   <section class="lm-pane" data-lm-pane="timeline" role="tabpanel">
     <div class="lm-wiki-tools">
       ${tool('lm_chron', 'calendar', '연표로 보기', '', '작중 시간 순서로 묶어서 보여줘요')}
+      ${tool('lm_tgraph', 'graph', '연표 그래프', '', '작중 시간을 가로축으로, 인물이나 장소를 줄로 나눠 사건을 점으로 찍어 보여줘요')}
+      ${tool('lm_ttable', 'table', '표로 보기', '', '장면이나 사건을 시간·장소·인물·내용 칸으로 나눠 표로 보여줘요. 복사하거나 파일로 저장할 수 있어요')}
       ${tool('lm_verify', 'shield', '최근 요약 검수', '', '최근 에피소드 3개를 원본과 대조해서 틀린 곳을 찾아요')}
     </div>
     <div class="lm-saga">
@@ -8025,6 +8357,7 @@ function managerHtml(memory) {
       <div class="lm-field lm-field-stack"><div class="lm-field-text"><span class="lm-field-label">함께 있는 인물</span></div><input class="text_pole" id="lm_s_present" value="${esc(sc.present)}"></div>
       <div class="lm-field lm-field-stack"><div class="lm-field-text"><span class="lm-field-label">분위기</span></div><input class="text_pole" id="lm_s_mood" value="${esc(sc.mood)}"></div>
     </div>
+    ${canonPanelHtml(memory)}
     ${bulkBar('ledger')}
     <div id="lm_entries" class="lm-list">${ledgerGroups(memory)}</div>
   </section>
@@ -8408,14 +8741,36 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
         }
         const menu = root.querySelector('.lm-menu');
         if (menu?.open && !event.target.closest('.lm-menu > summary')) menu.open = false;
-        const tool = event.target.closest('#lm_ko, #lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_relmap, #lm_statuslog, #lm_verify');
+        const tool = event.target.closest('#lm_ko, #lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_ttable, #lm_tgraph, #lm_relmap, #lm_statuslog, #lm_verify, #lm_canon_pick, .lm-canon-del');
         if (!tool) return;
+        if (tool.classList.contains('lm-canon-del')) {
+            const i = Number(tool.dataset.i);
+            const facts = memory.canon?.facts || [];
+            if (facts[i]) {
+                pushHistory(memory, '핵심 사실 지우기');
+                facts.splice(i, 1);
+                ctx().saveMetadataDebounced?.();
+                refreshInjection();
+                tool.closest('.lm-canon')?.replaceWith(Object.assign(document.createElement('div'), { innerHTML: canonPanelHtml(memory) }).firstElementChild || document.createElement('div'));
+            }
+            return;
+        }
         switch (tool.id) {
             case 'lm_chron':
                 await openChronicle(collectManager(root, memory), { onJump: (id) => closeThen(() => jumpToMessage(id)) });
                 break;
+            case 'lm_ttable':
+            case 'lm_tgraph':
+                await openTimelineTable(collectManager(root, memory), { onJump: (id) => closeThen(() => jumpToMessage(id)), view: tool.id === 'lm_tgraph' ? 'graph' : 'table' });
+                break;
             case 'lm_relmap':
                 await openRelationMap(collectManager(root, memory));
+                break;
+            case 'lm_canon_pick':
+                await saveThen(async () => {
+                    await runCanonPick();
+                    openManager({ tab: 'ledger' });
+                });
                 break;
             case 'lm_statuslog':
                 // Filling in-story times edits the timeline, so save and reopen around it.
@@ -8576,6 +8931,8 @@ async function saveManagerEditsImpl({ root, memory, chatId }) {
         edited.archive = edited.archive.filter(a => !removedIds.has(a.ownerId));
     }
     for (const key of ['frame', 'cast', 'saga', 'timeline', 'ledger', 'events', 'archive', 'wiki', 'hooks']) current[key] = edited[key];
+    // A hand edit should show up in the memory block itself, not as a "changed since" note.
+    current.rev = (current.rev || 0) + 1;
     if (removedIds.size) {
         restoreSources(current, removedIds, { show: root.querySelector('#lm_restore_mode')?.value === 'show' });
     }
@@ -9207,6 +9564,390 @@ async function openChronicle(memory = getMemory(false), { onJump = null } = {}) 
         root.querySelectorAll('.lm-chron-node').forEach(el => { el.hidden = !!q && !el.dataset.text.includes(q) && !el.textContent.toLowerCase().includes(q); });
         root.querySelectorAll('.lm-chron-day').forEach(day => { day.hidden = ![...day.querySelectorAll('.lm-chron-node')].some(el => !el.hidden); });
     });
+    await popup.show();
+    if (jumpTo !== null) await (onJump ? onJump(jumpTo) : jumpToMessage(jumpTo));
+}
+
+// ---------------------------------------------------------------- timeline table ("표로 보기")
+
+const TTABLE_COLS = {
+    scene: [
+        ['n', '순서'], ['when', '작중 시간'], ['place', '장소'], ['who', '인물'], ['title', '제목'], ['text', '내용'], ['imp', '중요도'], ['range', '메시지'],
+    ],
+    event: [
+        ['n', '순서'], ['when', '작중 시간'], ['place', '장소'], ['who', '인물'], ['text', '사건'], ['scene', '장면'], ['imp', '중요도'], ['range', '메시지'],
+    ],
+};
+
+function uniqueTop(list, max) {
+    const count = new Map();
+    for (const v of list) {
+        const k = String(v || '').trim();
+        if (k) count.set(k, (count.get(k) || 0) + 1);
+    }
+    return [...count.entries()].sort((a, b) => b[1] - a[1]).slice(0, max).map(([k]) => k);
+}
+
+// Rows for the table. Scene mode: one row per episode/chapter with places and people
+// gathered from its events. Event mode: one row per event, oldest first.
+function timelineTableRows(memory, mode = 'scene') {
+    const groups = chronicleGroups(memory);
+    const rows = [];
+    let n = 0;
+    let lastWhen = '';
+    for (const g of groups) {
+        for (const { node, events } of g.items) {
+            const all = (memory.events || []).filter(e => e.episodeId === node.id || (!e.episodeId && node.from >= 0 && e.from >= node.from && e.from <= node.to));
+            const when = String(node.when || '').trim() || '';
+            if (mode === 'event') {
+                const list = (all.length ? all : events).slice().sort((a, b) => (a.from - b.from));
+                for (const e of list) {
+                    const own = String(e.when || '').trim();
+                    const w = own || when || lastWhen;
+                    rows.push({
+                        n: ++n, when: w, carried: !own && !!w, place: e.place || '',
+                        who: (e.characters || []).join(', '), text: e.text, scene: node.title,
+                        imp: e.importance || 3, from: e.from ?? node.from, to: e.to ?? node.to, starred: false,
+                    });
+                    if (w) lastWhen = w;
+                }
+                continue;
+            }
+            rows.push({
+                n: ++n, when, carried: !when && !!g.when, place: uniqueTop(all.map(e => e.place), 2).join(', '),
+                who: uniqueTop(all.flatMap(e => e.characters || []), 5).join(', '), title: node.title, text: node.text,
+                imp: node.importance || 3, from: node.from, to: node.to, tier: node.tier, starred: !!node.starred,
+            });
+            if (when) lastWhen = when;
+        }
+    }
+    // Scenes without their own time inherit the group's time, shown dimmed.
+    if (mode === 'scene') {
+        let cur = '';
+        for (const r of rows) { if (r.when) cur = r.when; else if (cur) { r.when = cur; r.carried = true; } }
+    }
+    return rows;
+}
+
+function ttRange(r) {
+    return r.from === -1 ? '이전 채팅' : r.from < 0 ? '-' : r.from === r.to ? `#${r.from}` : `#${r.from}~#${r.to}`;
+}
+
+function timelineTableText(rows, mode, format) {
+    const cols = TTABLE_COLS[mode];
+    const val = (r, k) => k === 'range' ? ttRange(r) : k === 'imp' ? '★'.repeat(r.imp) : String(r[k] ?? '');
+    if (format === 'csv') {
+        const q = v => /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+        return '﻿' + [cols.map(c => c[1]), ...rows.map(r => cols.map(c => val(r, c[0])))].map(line => line.map(v => q(String(v))).join(',')).join('\n');
+    }
+    const cell = v => String(v).replace(/\|/g, '\\|').replace(/\s*\n+\s*/g, ' ');
+    return [
+        `| ${cols.map(c => c[1]).join(' | ')} |`,
+        `| ${cols.map(() => '---').join(' | ')} |`,
+        ...rows.map(r => `| ${cols.map(c => cell(val(r, c[0]))).join(' | ')} |`),
+    ].join('\n');
+}
+
+function timelineTableBody(rows, mode) {
+    const cols = TTABLE_COLS[mode];
+    if (!rows.length) return `<tr><td colspan="${cols.length}" class="lm-tt-none">${mode === 'event' ? '따로 기록된 사건이 없어요. 장면별로 보거나, 설정 → 요약에서 사건 기록을 켜 주세요.' : '아직 기억한 장면이 없어요.'}</td></tr>`;
+    const td = (r, k) => {
+        switch (k) {
+            case 'n': return `<td class="lm-tt-n">${r.n}</td>`;
+            case 'when': return `<td class="lm-tt-when${r.carried ? ' carried' : ''}">${r.when ? `<span data-tr>${esc(r.when)}</span>` : '<span class="lm-muted">-</span>'}</td>`;
+            case 'place': return `<td class="lm-tt-place">${r.place ? `<span data-tr>${esc(r.place)}</span>` : '<span class="lm-muted">-</span>'}</td>`;
+            case 'who': return `<td class="lm-tt-who">${r.who ? `<span data-tr>${esc(r.who)}</span>` : '<span class="lm-muted">-</span>'}</td>`;
+            case 'title': return `<td class="lm-tt-title"><b data-tr>${esc(r.title)}</b>${r.tier === 'chapter' ? '<span class="lm-chip lm-chip-chapter">챕터</span>' : ''}${r.starred ? '<span class="lm-chip lm-chip-star">★</span>' : ''}</td>`;
+            case 'scene': return `<td class="lm-tt-scene"><span data-tr>${esc(r.scene)}</span></td>`;
+            case 'text': return `<td class="lm-tt-text"><div class="lm-tt-clip" data-tr>${esc(r.text)}</div></td>`;
+            case 'imp': return `<td class="lm-tt-imp" title="중요도 ${r.imp}">${'★'.repeat(r.imp)}<span class="lm-tt-off">${'★'.repeat(5 - r.imp)}</span></td>`;
+            case 'range': return `<td class="lm-tt-range">${r.from >= 0 ? `<button type="button" class="lm-chron-jump" data-jump="${r.from}" title="이 장면으로 이동">${ttRange(r)}</button>` : `<span class="lm-muted">${ttRange(r)}</span>`}</td>`;
+            default: return '<td></td>';
+        }
+    };
+    return rows.map(r => `<tr class="imp-${r.imp}" data-text="${esc(Object.values(r).join(' ').toLowerCase())}">${cols.map(([k]) => td(r, k)).join('')}</tr>`).join('');
+}
+
+function timelineTableHead(mode, sort) {
+    const sortable = new Set(['n', 'when', 'place', 'imp']);
+    return `<tr>${TTABLE_COLS[mode].map(([k, label]) => sortable.has(k)
+        ? `<th class="lm-tt-${k}" aria-sort="${sort.key === k ? (sort.dir > 0 ? 'ascending' : 'descending') : 'none'}"><button type="button" class="lm-tt-sort" data-sort="${k}">${label}<span class="lm-tt-arrow">${sort.key === k ? (sort.dir > 0 ? '▲' : '▼') : ''}</span></button></th>`
+        : `<th class="lm-tt-${k}">${label}</th>`).join('')}</tr>`;
+}
+
+// ---------------------------------------------------------------- timeline graph ("연표 그래프")
+
+// Pulls a year (or year + month) out of a free-text in-story time, for the era band.
+function storyEra(when) {
+    const w = String(when || '');
+    const y = w.match(/(\d{1,4})\s*년/) || w.match(/\b(1\d{3}|20\d{2}|21\d{2})\b/) || w.match(/(?:year|yr\.?)\s*(\d{1,4})/i);
+    if (y) return `${y[1]}년`;
+    const d = w.match(/(\d+)\s*일\s*째/) || w.match(/\bday\s*(\d+)/i);
+    if (d) return `${d[1]}일째`;
+    return '';
+}
+
+// One column per in-story time (chronicle group), one row per character or place.
+// Events that share several lanes get a vertical connector so you can follow who was there.
+function timelineGraphData(memory, laneBy = 'who', maxLanes = 8) {
+    const groups = chronicleGroups(memory);
+    const slots = groups.map((g, i) => ({ i, when: g.when, era: storyEra(g.when) }));
+    let lastEra = '';
+    for (const sl of slots) { if (sl.era) lastEra = sl.era; else sl.era = lastEra; }
+    const scenes = [];
+    const events = [];
+    groups.forEach((g, i) => {
+        for (const { node } of g.items) {
+            scenes.push({ slot: i, node });
+            const own = (memory.events || []).filter(e => e.episodeId === node.id || (!e.episodeId && node.from >= 0 && e.from >= node.from && e.from <= node.to));
+            for (const e of own.slice().sort((a, b) => a.from - b.from)) events.push({ slot: i, e, scene: node.title });
+        }
+    });
+    const keysOf = (e) => laneBy === 'place' ? [String(e.place || '').trim()].filter(Boolean) : [...new Set((e.characters || []).map(x => String(x).trim()).filter(Boolean))];
+    const count = new Map();
+    for (const { e } of events) for (const k of keysOf(e)) count.set(k, (count.get(k) || 0) + 1);
+    const ranked = [...count.entries()].sort((a, b) => b[1] - a[1]).map(([k]) => k);
+    const lanes = ranked.slice(0, maxLanes);
+    const other = ranked.length > maxLanes || events.some(({ e }) => !keysOf(e).length);
+    if (other) lanes.push(laneBy === 'place' ? '그 밖의 곳' : '그 밖의 인물');
+    for (const ev of events) {
+        const ks = keysOf(ev.e);
+        const hit = ks.filter(k => lanes.includes(k)).map(k => lanes.indexOf(k));
+        ev.lanes = [...new Set(hit.length === ks.length && ks.length ? hit : [...hit, lanes.length - 1])].sort((a, b) => a - b);
+    }
+    return { slots, scenes, events, lanes };
+}
+
+// The era band already shows the year, so the column header drops it.
+function shortWhen(slot) {
+    const w = String(slot.when || '').trim();
+    if (!w) return '?';
+    const y = String(slot.era || '').match(/^(\d+)년$/);
+    const cut = y ? w.replace(new RegExp(`^\\s*${y[1]}\\s*년\\s*,?\\s*`), '').replace(new RegExp(`\\b${y[1]}\\b[,.\\s]*`), '').trim() : w;
+    return cut || w;
+}
+
+function timelineGraphSvg(data, { minImp = 1, q = '' } = {}) {
+    const { slots, scenes, events, lanes } = data;
+    const SW = 132, ERA = slots.some(s => s.era) ? 24 : 0, WH = 34, SCENE = 40, LH = 44, PAD = 8;
+    const width = Math.max(slots.length, 1) * SW;
+    const top = ERA + WH;
+    const laneY = (l) => top + SCENE + l * LH + LH / 2;
+    const height = top + SCENE + lanes.length * LH + PAD;
+    const out = [];
+    const clip = (str, px) => { const t = String(str || ''); const n = Math.max(2, Math.floor(px / 12)); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
+    const match = (text) => !q || String(text).toLowerCase().includes(q);
+    // lane stripes
+    lanes.forEach((_, l) => { if (l % 2 === 0) out.push(`<rect class="lm-tg-stripe" x="0" y="${top + SCENE + l * LH}" width="${width}" height="${LH}"/>`); });
+    // era band + slot headers + gridlines
+    let eraStart = 0;
+    slots.forEach((sl, i) => {
+        const x = i * SW;
+        const newEra = i === 0 || sl.era !== slots[i - 1].era;
+        out.push(`<line class="lm-tg-grid${newEra && i ? ' era' : ''}" x1="${x}" y1="${newEra ? 0 : ERA}" x2="${x}" y2="${height}"/>`);
+        out.push(`<text class="lm-tg-when${sl.when ? '' : ' none'}" x="${x + SW / 2}" y="${ERA + 21}" text-anchor="middle"><title>${esc(sl.when || '때를 알 수 없음')}</title>${esc(clip(shortWhen(sl), SW - 12))}</text>`);
+        const last = i === slots.length - 1 || slots[i + 1].era !== sl.era;
+        if (ERA && last) {
+            const x0 = eraStart * SW, w = (i + 1) * SW - x0;
+            if (sl.era) out.push(`<rect class="lm-tg-era" x="${x0 + 2}" y="3" width="${w - 4}" height="${ERA - 6}" rx="6"/><text class="lm-tg-era-t" x="${x0 + 10}" y="${ERA - 8}">${esc(clip(sl.era, w - 16))}</text>`);
+            eraStart = i + 1;
+        }
+    });
+    out.push(`<line class="lm-tg-base" x1="0" y1="${top}" x2="${width}" y2="${top}"/>`);
+    // scene bars
+    slots.forEach((sl, i) => {
+        const here = scenes.filter(s => s.slot === i);
+        const bw = (SW - 8) / Math.max(here.length, 1);
+        here.forEach((s, k) => {
+            const n = s.node, x = i * SW + 4 + k * bw;
+            const dim = (n.importance || 3) < minImp || !match(`${n.title} ${n.text}`);
+            out.push(`<g class="lm-tg-scene imp-${n.importance || 3}${n.starred ? ' starred' : ''}${dim ? ' dim' : ''}" data-tg="s${scenes.indexOf(s)}" tabindex="0" role="button" aria-label="${esc(`장면: ${n.title}`)}"><rect x="${x + 1}" y="${top + 7}" width="${Math.max(bw - 2, 4)}" height="${SCENE - 14}" rx="5"/>${bw > 26 ? `<text x="${x + 7}" y="${top + SCENE / 2 + 4}">${esc(clip(n.title, bw - 12))}</text>` : ''}</g>`);
+        });
+    });
+    // events: same x across every lane they touch
+    slots.forEach((sl, i) => {
+        const here = events.filter(ev => ev.slot === i);
+        here.forEach((ev, j) => {
+            const x = i * SW + (j + 1) * SW / (here.length + 1);
+            const imp = ev.e.importance || 3;
+            const dim = imp < minImp || !match(`${ev.e.text} ${ev.e.place || ''} ${(ev.e.characters || []).join(' ')} ${ev.scene}`);
+            const ys = ev.lanes.map(laneY);
+            const idx = events.indexOf(ev);
+            const r = 3 + imp;
+            out.push(`<g class="lm-tg-ev imp-${imp}${dim ? ' dim' : ''}" data-tg="e${idx}" tabindex="0" role="button" aria-label="${esc(`사건: ${ev.e.text}`)}">`
+                + (ys.length > 1 ? `<line class="lm-tg-link" x1="${x}" y1="${ys[0]}" x2="${x}" y2="${ys[ys.length - 1]}"/>` : '')
+                + ys.map(y => `<circle cx="${x}" cy="${y}" r="${r}"/>`).join('')
+                + `<circle class="lm-tg-hit" cx="${x}" cy="${ys[0]}" r="${r + 6}"/></g>`);
+        });
+    });
+    return `<svg class="lm-tg-svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img" aria-label="연표 그래프">${out.join('')}</svg>`;
+}
+
+function timelineGraphLabels(data) {
+    const { slots, lanes } = data;
+    const ERA = slots.some(s => s.era) ? 24 : 0;
+    return `<div class="lm-tg-label head" style="height:${ERA + 34}px"></div><div class="lm-tg-label scene" style="height:40px">장면</div>${lanes.map((l, i) => `<div class="lm-tg-label${i % 2 === 0 ? ' odd' : ''}" style="height:44px" title="${esc(l)}" data-tr>${esc(l)}</div>`).join('')}`;
+}
+
+function timelineGraphDetail(data, key) {
+    if (!key) return '<p class="lm-hint lm-tg-tip">점이나 장면 막대를 누르면 여기에 자세히 보여줘요. 점이 클수록 중요한 사건이고, 세로선은 같은 사건에 함께 있던 인물(장소)을 이어요.</p>';
+    if (key[0] === 's') {
+        const { node: n, slot } = data.scenes[Number(key.slice(1))] || {};
+        if (!n) return '';
+        return `<div class="lm-tg-card"><header><span class="lm-chip lm-chip-${n.tier}">${n.tier === 'chapter' ? '챕터' : '장면'}</span><b data-tr>${esc(n.title)}</b><span class="lm-tg-when-chip" data-tr>${esc(n.when || data.slots[slot]?.when || '')}</span><span class="lm-spacer"></span>${n.from >= 0 ? `<button type="button" class="lm-chron-jump" data-jump="${n.from}">#${n.from}~#${n.to}</button>` : ''}</header><p data-tr>${esc(n.text)}</p></div>`;
+    }
+    const ev = data.events[Number(key.slice(1))];
+    if (!ev) return '';
+    const e = ev.e;
+    return `<div class="lm-tg-card"><header><span class="lm-tt-imp">${'★'.repeat(e.importance || 3)}</span><span class="lm-tg-when-chip" data-tr>${esc(e.when || data.slots[ev.slot]?.when || '')}</span>${e.place ? `<span class="lm-chip" data-tr>${esc(e.place)}</span>` : ''}<span class="lm-spacer"></span>${e.from >= 0 ? `<button type="button" class="lm-chron-jump" data-jump="${e.from}">#${e.from}</button>` : ''}</header><p data-tr>${esc(e.text)}</p><div class="lm-hint">${(e.characters || []).length ? `<span data-tr>${esc(e.characters.join(', '))}</span> · ` : ''}장면 <span data-tr>${esc(ev.scene)}</span></div></div>`;
+}
+
+async function openTimelineTable(memory = getMemory(false), { onJump = null, view = 'table' } = {}) {
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    const c = ctx();
+    memory = memory || emptyMemory();
+    const hasEvents = (memory.events || []).length > 0;
+    const state = { view, mode: 'scene', lane: 'who', sort: { key: 'n', dir: 1 }, q: '', minImp: 1, pick: null };
+    const root = document.createElement('div');
+    root.innerHTML = `
+<div class="lm-root lm-tt">
+  <div class="lm-pop-head">
+    <h3>${icon('calendar')}타임라인</h3>
+    <div class="lm-tt-seg lm-tt-view" role="radiogroup" aria-label="보기 방식">
+      <button type="button" class="lm-tt-segbtn" data-view="graph" role="radio">${icon('graph')}연표 그래프</button>
+      <button type="button" class="lm-tt-segbtn" data-view="table" role="radio">${icon('table')}표</button>
+    </div>
+    ${memory.timeline.length && needsTranslation(memory) ? `<button type="button" class="lm-toolbtn" id="lm_chron_ko">${icon('wiki')}<span>한국어로 보기</span></button>` : ''}
+  </div>
+  <div class="lm-tt-bar">
+    <div class="lm-tt-seg lm-tt-for-graph" role="radiogroup" aria-label="줄 나누기">
+      <button type="button" class="lm-tt-segbtn on" data-lane="who" role="radio" aria-checked="true">인물별</button>
+      <button type="button" class="lm-tt-segbtn" data-lane="place" role="radio" aria-checked="false">장소별</button>
+    </div>
+    <div class="lm-tt-seg lm-tt-for-table" role="radiogroup" aria-label="보기 단위">
+      <button type="button" class="lm-tt-segbtn on" data-mode="scene" role="radio" aria-checked="true">장면별</button>
+      <button type="button" class="lm-tt-segbtn" data-mode="event" role="radio" aria-checked="false" ${hasEvents ? '' : 'disabled title="기록된 사건이 없어요"'}>사건별</button>
+    </div>
+    <label class="lm-tt-imp-filter">중요도 <select class="text_pole lm-quiet" id="lm_tt_imp"><option value="1">전부</option><option value="3">★3 이상</option><option value="4">★4 이상</option><option value="5">★5만</option></select></label>
+    <div class="lm-search">${icon('search')}<input class="text_pole lm-filter" id="lm_tt_filter" placeholder="인물·장소·내용으로 찾기" aria-label="표에서 찾기"></div>
+  </div>
+  <div class="lm-tt-for-graph">
+    <p class="lm-hint">왼쪽에서 오른쪽으로 작중 시간이 흘러요. 맨 위 띠는 연도(또는 n일째), 그 아래는 장면이에요. 찾기·중요도에 안 맞는 건 흐리게 보여요.</p>
+    <div class="lm-tg">${memory.timeline.length ? '<div class="lm-tg-labels"></div><div class="lm-tg-scroll"></div>' : '<div class="lm-empty">아직 기억한 장면이 없어요.</div>'}</div>
+    <div class="lm-tg-detail"></div>
+  </div>
+  <div class="lm-tt-for-table">
+  <p class="lm-hint"><span id="lm_tt_count"></span> 흐린 시간은 앞 장면에서 이어받은 거예요. 내용 칸을 누르면 펼쳐져요.</p>
+  <div class="lm-tt-wrap"><table class="lm-tt-table"><thead></thead><tbody></tbody></table></div>
+  </div>
+  <div class="lm-tt-actions lm-tt-for-table">
+    <button type="button" class="lm-toolbtn" id="lm_tt_copy">${icon('book')}<span>마크다운 표 복사</span></button>
+    <button type="button" class="lm-toolbtn" id="lm_tt_csv">${icon('download')}<span>CSV로 저장 (엑셀)</span></button>
+  </div>
+</div>`;
+    applyThemeMode(root.firstElementChild);
+    const thead = root.querySelector('thead');
+    const tbody = root.querySelector('tbody');
+    const current = () => {
+        let rows = timelineTableRows(memory, state.mode).filter(r => r.imp >= state.minImp);
+        if (state.q) rows = rows.filter(r => Object.values(r).join(' ').toLowerCase().includes(state.q));
+        const { key, dir } = state.sort;
+        if (key !== 'n') {
+            const v = r => key === 'imp' ? r.imp : String(r[key] || '');
+            rows = rows.slice().sort((a, b) => {
+                const x = v(a), y = v(b);
+                if (key !== 'imp' && (!x || !y)) return (!x) - (!y) || a.n - b.n;
+                return (typeof x === 'number' ? x - y : x.localeCompare(y, 'ko', { numeric: true })) * dir || a.n - b.n;
+            });
+        } else if (dir < 0) rows = rows.slice().reverse();
+        return rows;
+    };
+    let graph = null;
+    const renderGraph = () => {
+        const box = root.querySelector('.lm-tg-scroll');
+        if (!box) return;
+        graph = timelineGraphData(memory, state.lane);
+        const keep = box.scrollLeft;
+        box.innerHTML = timelineGraphSvg(graph, { minImp: state.minImp, q: state.q });
+        root.querySelector('.lm-tg-labels').innerHTML = timelineGraphLabels(graph);
+        box.scrollLeft = keep;
+        root.querySelector('.lm-tg-detail').innerHTML = timelineGraphDetail(graph, state.pick);
+        if (state.pick) box.querySelector(`[data-tg="${state.pick}"]`)?.classList.add('picked');
+    };
+    const applyView = () => {
+        root.querySelectorAll('[data-view]').forEach(b => { const on = b.dataset.view === state.view; b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on)); });
+        root.querySelectorAll('.lm-tt-for-graph').forEach(el => { el.hidden = state.view !== 'graph'; });
+        root.querySelectorAll('.lm-tt-for-table').forEach(el => { el.hidden = state.view !== 'table'; });
+        if (state.view === 'graph') renderGraph(); else render();
+    };
+    const render = () => {
+        if (state.view === 'graph') return renderGraph();
+        const rows = current();
+        thead.innerHTML = timelineTableHead(state.mode, state.sort);
+        tbody.innerHTML = timelineTableBody(rows, state.mode);
+        const total = timelineTableRows(memory, state.mode).length;
+        root.querySelector('#lm_tt_count').textContent = rows.length === total ? `${total}줄.` : `${total}줄 중 ${rows.length}줄.`;
+        const ko = root.querySelector('#lm_chron_ko');
+        if (ko && ko.dataset.state === 'ko') { ko.dataset.state = ''; ko.querySelector('span').textContent = '한국어로 보기'; }
+    };
+    applyView();
+    const popup = new c.Popup(root, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, large: true, allowVerticalScrolling: true, leftAlign: true });
+    let jumpTo = null;
+    root.addEventListener('keydown', (event) => {
+        if ((event.key === 'Enter' || event.key === ' ') && event.target.closest?.('[data-tg]')) { event.preventDefault(); event.target.dispatchEvent(new MouseEvent('click', { bubbles: true })); }
+    });
+    root.addEventListener('click', async (event) => {
+        const v = event.target.closest('[data-view]');
+        if (v) { state.view = v.dataset.view; applyView(); return; }
+        const lane = event.target.closest('[data-lane]');
+        if (lane) {
+            state.lane = lane.dataset.lane;
+            state.pick = state.pick?.startsWith('s') ? state.pick : null;
+            root.querySelectorAll('[data-lane]').forEach(b => { const on = b === lane; b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on)); });
+            renderGraph();
+            return;
+        }
+        const tg = event.target.closest('[data-tg]');
+        if (tg) {
+            state.pick = state.pick === tg.dataset.tg ? null : tg.dataset.tg;
+            root.querySelectorAll('.lm-tg-svg .picked').forEach(el => el.classList.remove('picked'));
+            if (state.pick) tg.classList.add('picked');
+            root.querySelector('.lm-tg-detail').innerHTML = timelineGraphDetail(graph, state.pick);
+            return;
+        }
+        const ko = event.target.closest('#lm_chron_ko');
+        if (ko) { toggleTranslation(root, ko); return; }
+        const jump = event.target.closest('[data-jump]');
+        if (jump) { jumpTo = Number(jump.dataset.jump); popup.completeAffirmative(); return; }
+        const mode = event.target.closest('[data-mode]');
+        if (mode && !mode.disabled) {
+            state.mode = mode.dataset.mode;
+            state.sort = { key: 'n', dir: 1 };
+            root.querySelectorAll('[data-mode]').forEach(b => { const on = b === mode; b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on)); });
+            render();
+            return;
+        }
+        const sort = event.target.closest('[data-sort]');
+        if (sort) {
+            const k = sort.dataset.sort;
+            state.sort = state.sort.key === k ? { key: k, dir: -state.sort.dir } : { key: k, dir: k === 'imp' ? -1 : 1 };
+            render();
+            return;
+        }
+        const clip = event.target.closest('.lm-tt-clip');
+        if (clip) { clip.classList.toggle('open'); return; }
+        if (event.target.closest('#lm_tt_copy')) {
+            const text = timelineTableText(current(), state.mode, 'md');
+            try { await navigator.clipboard.writeText(text); toastr.success('표를 복사했어요. 마크다운을 지원하는 곳에 붙여넣으세요.'); }
+            catch { downloadFile(`${fileSafe(c.getCurrentChatId())}-timeline.md`, text, 'text/markdown'); toastr.info('복사가 막혀서 파일로 저장했어요.'); }
+            return;
+        }
+        if (event.target.closest('#lm_tt_csv')) {
+            downloadFile(`${fileSafe(c.getCurrentChatId())}-timeline-${state.mode === 'event' ? 'events' : 'scenes'}.csv`, timelineTableText(current(), state.mode, 'csv'), 'text/csv;charset=utf-8');
+        }
+    });
+    root.querySelector('#lm_tt_filter').addEventListener('input', (e) => { state.q = e.target.value.trim().toLowerCase(); render(); });
+    root.querySelector('#lm_tt_imp').addEventListener('change', (e) => { state.minImp = Number(e.target.value) || 1; render(); });
     await popup.show();
     if (jumpTo !== null) await (onJump ? onJump(jumpTo) : jumpToMessage(jumpTo));
 }
@@ -9945,8 +10686,35 @@ function onChatChanged() {
     refreshInjection();
     updateStatus();
     setTimeout(decorateAll, 300);
-    if (getMemory(false)) syncAfter();
+    // Opening a chat (or reloading the page) makes no model or embedding call. Background
+    // indexing waits until something happens in this chat, so a chat opened by mistake is free.
+    deferredSyncChat = getMemory(false) ? c.getCurrentChatId() : null;
     setTimeout(offerHandoff, 600);
+    setTimeout(checkOtherMemoryExtensions, 1500);
+}
+
+let deferredSyncChat = null;
+function runDeferredSync() {
+    if (!deferredSyncChat || !stillSameChat(deferredSyncChat)) { deferredSyncChat = null; return; }
+    deferredSyncChat = null;
+    syncAfter();
+}
+
+// Two memory extensions both summarising and injecting would put the story in the prompt twice.
+let otherMemoryWarned = false;
+function checkOtherMemoryExtensions() {
+    if (otherMemoryWarned || !getSettings().enabled || !getMemory(false)) return;
+    const c = ctx();
+    const disabled = c.extensionSettings?.disabledExtensions || [];
+    // Settings outlive an extension, so "running" means its manifest is loaded and it is not disabled.
+    const loaded = (folder) => !!c.getExtensionManifest?.(folder) && !disabled.includes(folder);
+    const prompts = Object.keys(c.extensionPrompts || {});
+    const others = [];
+    if (loaded('third-party/cairn-memory') || prompts.some(k => /^cairn/i.test(k))) others.push('Cairn');
+    if ((loaded('third-party/SillyTavern-MessageSummarize') || prompts.some(k => /^qvink_memory/.test(k))) && (c.extensionSettings?.qvink_memory?.auto_summarize ?? true)) others.push('Qvink Memory');
+    if (!others.length) return;
+    otherMemoryWarned = true;
+    toastr.warning(`${others.join(', ')}도 켜져 있어요. 기억 확장 둘이 함께 요약하고 넣으면 같은 이야기가 프롬프트에 두 번 들어가고 API도 두 배로 써요. 하나만 켜 두세요.`, APP_NAME, { timeOut: 12000 });
 }
 
 function forgetCarriedSwipeData(id) {
@@ -10051,7 +10819,7 @@ function guarded(label, fn) {
     eventSource.on(event_types.USER_MESSAGE_RENDERED, guarded('메시지 표시', (id) => decorateMessage(Number(id))));
     eventSource.on(event_types.MORE_MESSAGES_LOADED, guarded('메시지 표시', () => decorateAll()));
     document.addEventListener('click', onDocumentClick, true);
-    eventSource.on(event_types.MESSAGE_SENT, updateStatus);
+    eventSource.on(event_types.MESSAGE_SENT, guarded('메시지 보냄', () => { updateStatus(); runDeferredSync(); }));
     if (event_types.GENERATION_STARTED) eventSource.on(event_types.GENERATION_STARTED, guarded('답변 생성 시작', onGenerationStarted));
     // Keeps the "n분 전" labels in the status panel fresh without touching anything else.
     setInterval(() => {

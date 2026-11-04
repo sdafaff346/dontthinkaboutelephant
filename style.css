@@ -1946,3 +1946,96 @@
 .lm-root .lm-repeat-row input { margin: 0; flex: 0 0 auto; accent-color: var(--lm-accent); }
 .lm-repeat-text { flex: 1 1 auto; min-width: 0; font-size: 14px; font-weight: 600; color: var(--lm-text); overflow-wrap: anywhere; }
 .lm-repeat-n { flex: 0 0 auto; font-size: 12px; color: var(--lm-muted); }
+
+/* established facts (canon) */
+.lm-canon { margin: 0 0 12px; padding: 10px 12px; border: 1px solid var(--lm-line); border-left: 3px solid var(--lm-accent); border-radius: 10px; background: var(--lm-card); display: flex; flex-direction: column; gap: 6px; }
+.lm-canon-head { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.lm-canon-head .lm-hint { flex: 1 1 200px; }
+.lm-canon-row { display: flex; align-items: flex-start; gap: 8px; padding: 6px 0; border-top: 1px solid var(--lm-line); }
+.lm-canon-text { flex: 1 1 auto; min-width: 0; font-size: 13.5px; color: var(--lm-text); overflow-wrap: anywhere; }
+.lm-canon-cite { flex: 0 0 auto; max-width: 40%; font-size: 11.5px; color: var(--lm-muted); text-align: right; overflow-wrap: anywhere; }
+.lm-canon-gone .lm-canon-text { text-decoration: line-through; color: var(--lm-muted); }
+
+/* timeline table */
+.lm-tt-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 10px 0 6px; }
+.lm-tt-bar .lm-search { flex: 1 1 220px; margin: 0; }
+.lm-tt-seg { display: inline-flex; padding: 2px; border-radius: 999px; background: var(--lm-sunken); }
+.lm-tt-segbtn { border: 0; padding: 5px 14px; border-radius: 999px; background: none; color: var(--lm-muted); font: 600 12.5px var(--lm-font); cursor: pointer; }
+.lm-tt-segbtn.on { background: var(--lm-card); color: var(--lm-accent-ink); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+.lm-tt-segbtn:disabled { opacity: .45; cursor: not-allowed; }
+.lm-tt-segbtn:focus-visible, .lm-tt-sort:focus-visible { outline: 2px solid var(--lm-accent); outline-offset: 1px; }
+.lm-tt-imp-filter { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; color: var(--lm-muted); }
+.lm-tt-imp-filter select { width: auto; margin: 0; }
+.lm-tt-wrap { overflow: auto; max-height: 62vh; border: 1px solid var(--lm-line); border-radius: var(--lm-r); background: var(--lm-card); }
+.lm-tt-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; line-height: 1.55; color: var(--lm-text); }
+.lm-tt-table th { position: sticky; top: 0; z-index: 1; padding: 0; background: var(--lm-sunken); border-bottom: 1px solid var(--lm-line-strong, var(--lm-line)); text-align: left; font-size: 12px; font-weight: 700; color: var(--lm-muted); white-space: nowrap; }
+.lm-tt-table th:not(:has(button)) { padding: 8px 10px; }
+.lm-tt-sort { display: flex; align-items: center; gap: 4px; width: 100%; padding: 8px 10px; border: 0; background: none; color: inherit; font: inherit; cursor: pointer; text-align: left; }
+.lm-tt-sort:hover { color: var(--lm-accent-ink); }
+.lm-tt-arrow { font-size: 9px; color: var(--lm-accent); }
+.lm-tt-table td { padding: 8px 10px; border-bottom: 1px solid var(--lm-line); vertical-align: top; }
+.lm-tt-table tbody tr:last-child td { border-bottom: 0; }
+.lm-tt-table tbody tr:hover td { background: color-mix(in srgb, var(--lm-accent-soft) 45%, transparent); }
+.lm-tt-table tr.imp-5 .lm-tt-n { box-shadow: inset 3px 0 0 var(--lm-accent); }
+.lm-tt-n { width: 1%; text-align: right; color: var(--lm-muted); font-variant-numeric: tabular-nums; }
+.lm-tt-when { min-width: 92px; font-weight: 600; color: var(--lm-accent-ink); word-break: keep-all; }
+.lm-tt-when.carried { opacity: .5; font-weight: 500; }
+.lm-tt-who { min-width: 80px; word-break: keep-all; }
+.lm-tt-title { min-width: 110px; }
+.lm-tt-title .lm-chip { margin-left: 4px; }
+.lm-tt-scene { min-width: 90px; color: var(--lm-muted); font-size: 12.5px; }
+.lm-tt-text { min-width: 240px; }
+.lm-tt-clip { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; cursor: pointer; white-space: pre-wrap; }
+.lm-tt-clip.open { display: block; -webkit-line-clamp: unset; }
+.lm-tt-imp { white-space: nowrap; color: var(--lm-accent); font-size: 11px; letter-spacing: -1px; }
+.lm-tt-off { color: var(--lm-line); }
+.lm-tt-range { white-space: nowrap; }
+.lm-tt-none { padding: 24px 12px !important; text-align: center; color: var(--lm-muted); }
+.lm-tt-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+@media (max-width: 640px) {
+  .lm-tt-table { font-size: 12.5px; }
+  .lm-tt-text { min-width: 200px; }
+}
+.lm-tt-place { min-width: 72px; word-break: keep-all; }
+.lm-tt-imp-filter select.text_pole { min-width: 96px; padding: 4px 8px; font-size: 12.5px; font-weight: 500; }
+
+/* timeline graph */
+.lm-tt .lm-pop-head { flex-wrap: wrap; gap: 8px 12px; }
+.lm-tt-view .lm-tt-segbtn { display: inline-flex; align-items: center; gap: 5px; }
+.lm-tt-view .lm-ic { width: 15px; height: 15px; }
+.lm-tt [hidden] { display: none !important; }
+.lm-tg { display: flex; border: 1px solid var(--lm-line); border-radius: var(--lm-r); background: var(--lm-card); overflow: hidden; }
+.lm-tg-labels { flex: 0 0 auto; width: 92px; border-right: 1px solid var(--lm-line); background: var(--lm-card); }
+.lm-tg-label { display: flex; align-items: center; padding: 0 10px; font-size: 12.5px; font-weight: 600; color: var(--lm-text); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; box-sizing: border-box; }
+.lm-tg-label.odd { background: color-mix(in srgb, var(--lm-sunken) 55%, transparent); }
+.lm-tg-label.scene { color: var(--lm-muted); font-size: 12px; border-top: 1px solid var(--lm-line); }
+.lm-tg-label.head { border: 0; }
+.lm-tg-scroll { flex: 1; min-width: 0; overflow-x: auto; overflow-y: hidden; }
+.lm-tg-svg { display: block; font-family: var(--lm-font); }
+.lm-tg-stripe { fill: color-mix(in srgb, var(--lm-sunken) 55%, transparent); }
+.lm-tg-grid { stroke: var(--lm-line); stroke-width: 1; stroke-dasharray: 2 4; }
+.lm-tg-grid.era { stroke: var(--lm-line-strong, var(--lm-muted)); stroke-dasharray: none; }
+.lm-tg-base { stroke: var(--lm-line); }
+.lm-tg-era { fill: var(--lm-accent-soft); }
+.lm-tg-era-t { fill: var(--lm-accent-ink); font-size: 12px; font-weight: 700; }
+.lm-tg-when { fill: var(--lm-accent-ink); font-size: 12px; font-weight: 600; }
+.lm-tg-when.none { fill: var(--lm-muted); font-weight: 400; }
+.lm-tg-scene { cursor: pointer; outline: none; }
+.lm-tg-scene rect { fill: color-mix(in srgb, var(--lm-tier-episode, var(--lm-accent)) 22%, var(--lm-card)); stroke: color-mix(in srgb, var(--lm-tier-episode, var(--lm-accent)) 55%, transparent); }
+.lm-tg-scene.starred rect, .lm-tg-scene.imp-5 rect { stroke: var(--lm-accent); stroke-width: 1.5; }
+.lm-tg-scene text { fill: var(--lm-text); font-size: 11.5px; pointer-events: none; }
+.lm-tg-ev { cursor: pointer; outline: none; }
+.lm-tg-ev circle { fill: var(--lm-card); stroke: var(--lm-accent); stroke-width: 2; transition: r .15s; }
+.lm-tg-ev.imp-4 circle, .lm-tg-ev.imp-5 circle { fill: var(--lm-accent); }
+.lm-tg-ev .lm-tg-hit { fill: transparent; stroke: none; }
+.lm-tg-link { stroke: var(--lm-accent); stroke-width: 2; opacity: .45; }
+.lm-tg-ev.dim, .lm-tg-scene.dim { opacity: .18; }
+.lm-tg-ev:hover circle:not(.lm-tg-hit), .lm-tg-ev:focus-visible circle:not(.lm-tg-hit), .lm-tg-ev.picked circle:not(.lm-tg-hit) { stroke-width: 3.5; filter: drop-shadow(0 0 3px var(--lm-accent)); }
+.lm-tg-ev.picked .lm-tg-link { opacity: 1; }
+.lm-tg-scene:hover rect, .lm-tg-scene:focus-visible rect, .lm-tg-scene.picked rect { stroke: var(--lm-accent); stroke-width: 2.5; }
+.lm-tg-detail { margin-top: 10px; min-height: 40px; }
+.lm-tg-card { padding: 10px 14px; border: 1px solid var(--lm-line); border-left: 3px solid var(--lm-accent); border-radius: var(--lm-r); background: var(--lm-card); }
+.lm-tg-card header { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
+.lm-tg-card p { margin: 0 0 4px; font-size: 13px; line-height: 1.65; white-space: pre-wrap; }
+.lm-tg-when-chip { font-size: 12px; font-weight: 700; color: var(--lm-accent-ink); }
+@media (max-width: 640px) { .lm-tg-labels { width: 70px; } .lm-tg-label { padding: 0 6px; font-size: 11.5px; } }
