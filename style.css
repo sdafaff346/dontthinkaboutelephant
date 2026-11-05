@@ -1179,7 +1179,7 @@
 
 .lm-search { position: relative; margin: 0 0 10px; }
 .lm-search > .lm-ic { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: var(--lm-muted); pointer-events: none; }
-.lm-root .lm-search .lm-filter { width: 100%; margin: 0; padding-left: 34px; }
+.lm-root .lm-search .lm-filter { width: 100%; margin: 0; padding-left: 34px !important; }
 
 /* results, archive, backups */
 

@@ -540,6 +540,9 @@ function tagMessages(indices, ownerId) {
         if (!msg) continue;
         msg.extra = msg.extra || {};
         msg.extra.lm_owner = ownerId;
+        // Fingerprint of the summarized text, so a change made by another extension (which may
+        // only announce MESSAGE_UPDATED, not MESSAGE_EDITED) can still be told apart from a redraw.
+        msg.extra.lm_sig = hashString(String(msg.mes ?? ''));
     }
 }
 
@@ -671,6 +674,29 @@ async function reconcileAfterDeletion() {
     if (removed || staled) syncAfter();
 }
 
+// Other extensions (for example a reply rewriter or translator) change a message and announce it
+// with MESSAGE_UPDATED. SillyTavern also sends it for redraws that change nothing, so only act
+// when the text really differs: refresh the ⚠ badge, and mark a summarized message for re-summary.
+function onMessageUpdated(id) {
+    const n = Number(id);
+    const msg = ctx().chat[n];
+    if (!msg) return;
+    decorateMessage(n);
+    const owner = msg.extra?.lm_owner;
+    if (!owner) return;
+    const sig = hashString(String(msg.mes ?? ''));
+    if (!msg.extra.lm_sig) { msg.extra.lm_sig = sig; return; }
+    if (msg.extra.lm_sig === sig) return;
+    msg.extra.lm_sig = sig;
+    const memory = getMemory(false);
+    const node = memory?.timeline.find(x => x.id === owner);
+    if (!node || node.stale) return;
+    node.stale = true;
+    ctx().saveMetadataDebounced?.();
+    updateStatus();
+    logActivity('forget', `#${n} 요약된 메시지가 다른 확장에서 바뀌어서 그 기억에 다시 요약 표시를 했어요`, 'warn');
+}
+
 function onMessageEdited(id) {
     runDeferredSync();
     const edited = ctx().chat[Number(id)];
@@ -680,6 +706,7 @@ function onMessageEdited(id) {
     const owner = ctx().chat[Number(id)]?.extra?.lm_owner;
     if (!owner) return;
     const node = memory.timeline.find(n => n.id === owner);
+    if (edited?.extra) edited.extra.lm_sig = hashString(String(edited.mes ?? ''));
     if (!node || node.stale) return;
     node.stale = true;
     ctx().saveMetadataDebounced?.();
@@ -10813,6 +10840,7 @@ function guarded(label, fn) {
     eventSource.on(event_types.CHAT_CHANGED, guarded('채팅 전환', onChatChanged));
     eventSource.on(event_types.MESSAGE_DELETED, guarded('메시지 삭제', onMessageDeleted));
     eventSource.on(event_types.MESSAGE_EDITED, guarded('메시지 수정', onMessageEdited));
+    if (event_types.MESSAGE_UPDATED) eventSource.on(event_types.MESSAGE_UPDATED, guarded('메시지 갱신', onMessageUpdated));
     eventSource.on(event_types.MESSAGE_SWIPED, guarded('스와이프', onMessageSwiped));
     eventSource.on(event_types.MESSAGE_RECEIVED, guarded('새 답변', onMessageReceived));
     eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, guarded('메시지 표시', (id) => decorateMessage(Number(id))));
