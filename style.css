@@ -2039,3 +2039,200 @@
 .lm-tg-card p { margin: 0 0 4px; font-size: 13px; line-height: 1.65; white-space: pre-wrap; }
 .lm-tg-when-chip { font-size: 12px; font-weight: 700; color: var(--lm-accent-ink); }
 @media (max-width: 640px) { .lm-tg-labels { width: 70px; } .lm-tg-label { padding: 0 6px; font-size: 11.5px; } }
+
+/* settings bundles */
+.lm-bundle-bar { display: flex; align-items: center; gap: 10px; margin: 10px 0 4px; padding: 9px 12px; border: 1px solid var(--lm-line); border-radius: var(--lm-r); background: var(--lm-card); }
+.lm-bundle-bar.on { border-color: color-mix(in srgb, var(--lm-accent) 55%, var(--lm-line)); background: color-mix(in srgb, var(--lm-accent-soft) 55%, var(--lm-card)); }
+.lm-bundle-ic { flex: 0 0 auto; display: flex; color: var(--lm-muted); }
+.lm-bundle-bar.on .lm-bundle-ic { color: var(--lm-accent-ink); }
+.lm-bundle-text { flex: 1 1 auto; min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; }
+.lm-bundle-label { font-size: 12px; color: var(--lm-muted); }
+.lm-bundle-name { font-size: 14px; color: var(--lm-text); }
+.lm-bundle-bar.on .lm-bundle-name { color: var(--lm-accent-ink); }
+.lm-bundle-where { flex-basis: 100%; font-size: 11.5px; color: var(--lm-muted); line-height: 1.4; }
+.lm-bundle-bar .lm-btn { flex: 0 0 auto; margin: 0; white-space: nowrap; }
+.lm-bundle-bind { display: grid; gap: 8px; margin: 12px 0; padding: 12px; border-radius: var(--lm-r); background: var(--lm-sunken); }
+.lm-bundle-bind label { display: grid; grid-template-columns: 84px 1fr; align-items: center; gap: 10px; font-size: 13px; font-weight: 600; color: var(--lm-text); }
+.lm-bundle-bind select { margin: 0; }
+.lm-bundle-bind .lm-hint { margin: 0; }
+.lm-bundle-list { display: grid; gap: 6px; }
+.lm-bundle-row { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border: 1px solid var(--lm-line); border-radius: var(--lm-r); background: var(--lm-card); }
+.lm-bundle-row.active { border-color: var(--lm-accent); }
+.lm-bundle-info { flex: 1 1 auto; min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 2px 8px; }
+.lm-bundle-info b { font-size: 14px; color: var(--lm-text); }
+.lm-bundle-info small { flex-basis: 100%; font-size: 11.5px; color: var(--lm-muted); }
+.lm-bundle-btns { display: flex; gap: 4px; flex: 0 0 auto; }
+.lm-bundle-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.lm-bundle-actions .lm-btn { margin: 0; }
+@media (max-width: 520px) {
+  .lm-bundle-row { flex-wrap: wrap; }
+  .lm-bundle-btns { width: 100%; justify-content: flex-end; }
+  .lm-bundle-bind label { grid-template-columns: 1fr; gap: 4px; }
+}
+.lm-toolbtn.lm-danger:hover, .lm-toolbtn.lm-danger:focus-visible { color: var(--lm-warn-color); border-color: var(--lm-warn-color); }
+
+/* ======================================================================
+ * v1.9.52 UI refresh: easier to read in the narrow extension drawer,
+ * quieter surfaces, one bronze/gold accent. Overrides only; no markup moves.
+ * ====================================================================== */
+
+.lm-root {
+    --lm-muted: #66626E;
+    --lm-line: #E4DFD4;
+    --lm-r-lg: 18px;
+    --lm-r: 13px;
+    line-height: 1.6;
+}
+.lm-root[data-lm-mode="night"] {
+    --lm-bg: #18171C;
+    --lm-card: #212027;
+    --lm-field: #1B1A20;
+    --lm-sunken: #141317;
+    --lm-hover: #2A2931;
+    --lm-line: #33313B;
+    --lm-line-strong: #45424F;
+    --lm-text: #EEEAE3;
+    --lm-muted: #AEA9B7;
+}
+
+/* Lay the panel out by its own width, not the window's: the drawer is narrow on desktop too. */
+#lm_settings .inline-drawer-content,
+.lm-manager,
+.lm-root.lm-tt,
+.lm-root.lm-bundles { container: lm / inline-size; }
+
+/* ---------- settings rows ---------- */
+
+.lm-root .lm-field { gap: 12px; padding: 13px 0; }
+.lm-root .lm-field-text { gap: 3px; }
+.lm-root .lm-pane .lm-field-label,
+.lm-root .lm-field-label { font-size: 14px; font-weight: 650; letter-spacing: -0.015em; }
+.lm-root .lm-hint,
+.lm-root .lm-pane .lm-field .lm-hint { font-size: 12.5px; line-height: 1.6; }
+.lm-root .lm-field-toggle { align-items: flex-start; }
+.lm-root .lm-field-toggle .lm-switch { margin-top: 2px; }
+.lm-root .lm-select { text-overflow: ellipsis; }
+
+@container lm (max-width: 520px) {
+    /* Label and explanation on top, the control below at full width: no more clipped choices. */
+    .lm-root .lm-field:not(.lm-field-toggle):not(.lm-field-stack) { flex-direction: column; align-items: stretch; gap: 8px; }
+    .lm-root .lm-field:not(.lm-field-toggle) > .lm-select,
+    .lm-root .lm-field:not(.lm-field-toggle) > select.text_pole { flex: 0 0 auto; width: 100%; max-width: 100%; }
+    .lm-root .lm-field:not(.lm-field-toggle) > .lm-num-wrap { align-self: flex-start; }
+    .lm-root .lm-field:not(.lm-field-toggle) > .lm-btn,
+    .lm-root .lm-field:not(.lm-field-toggle) > .menu_button { align-self: flex-start; }
+    .lm-root .lm-setgroup { margin-top: 22px; }
+}
+
+.lm-root .lm-setgroup { padding: 2px 0 6px 11px; border-left-width: 3px; border-radius: 0; }
+.lm-root .lm-setgroup-title { font-size: 15px; letter-spacing: -0.02em; }
+.lm-root .lm-setgroup-hint { font-size: 12.5px; }
+
+/* ---------- head, status card ---------- */
+
+.lm-root .lm-head-name { font-size: 18px; letter-spacing: -0.03em; }
+.lm-root .lm-head-sub { font-size: 13px; }
+
+.lm-root .lm-status { padding: 16px; border-color: transparent; box-shadow: var(--lm-shadow), inset 0 0 0 1px var(--lm-line); }
+.lm-root .lm-spine { height: 12px; gap: 3px; }
+.lm-root .lm-legend { gap: 6px 16px; font-size: 12.5px; color: var(--lm-text); }
+.lm-root .lm-legend-item { color: var(--lm-muted); }
+.lm-root .lm-swatch { width: 9px; height: 9px; }
+.lm-root .lm-meter-row { font-size: 12.5px; }
+.lm-root .lm-meter { height: 6px; }
+
+/* "지금까지의 이야기 36 · 타임라인 114 ..." as tidy name/number pairs */
+.lm-root .lm-breakdown {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+    gap: 4px 12px;
+    margin: 8px 0 4px;
+    font-size: 12px;
+}
+.lm-root .lm-breakdown > span:not(.lm-warn) {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 3px 0;
+    border-bottom: 1px dashed var(--lm-line);
+}
+.lm-root .lm-breakdown > .lm-warn { grid-column: 1 / -1; }
+.lm-root .lm-facts { gap: 4px 16px; font-size: 12.5px; }
+
+/* ---------- buttons ---------- */
+
+.lm-root .lm-actions .lm-btn { min-height: 44px; border-radius: 12px; font-size: 14px; font-weight: 650; }
+.lm-root .lm-quick { gap: 8px; margin-top: 10px; }
+.lm-root .lm-quickbtn { min-height: 58px; border-radius: 12px; font-size: 12.5px; font-weight: 600; background: var(--lm-card); box-shadow: inset 0 0 0 1px var(--lm-line); }
+.lm-root .lm-quickbtn:hover { background: var(--lm-hover); }
+.lm-root .lm-quickbtn .lm-ic { width: 19px; height: 19px; }
+
+/* ---------- live status ---------- */
+
+.lm-root .lm-live-wrap { border-color: transparent; box-shadow: inset 0 0 0 1px var(--lm-line); }
+.lm-root .lm-live-title { font-size: 13px; letter-spacing: 0; color: var(--lm-text); }
+.lm-root .lm-live-row { grid-template-columns: 8px 68px minmax(0, 1fr) auto; align-items: start; gap: 10px; padding: 10px 14px; font-size: 13px; line-height: 1.55; }
+.lm-root .lm-live-row > .lm-dot { margin-top: 7px; }
+.lm-root .lm-live-sub { margin-top: 2px; font-size: 12px; line-height: 1.55; opacity: 0.9; }
+@container lm (max-width: 360px) {
+    .lm-root .lm-live-row { grid-template-columns: 8px minmax(0, 1fr) auto; }
+}
+
+/* ---------- settings bundle bar ---------- */
+
+.lm-root .lm-bundle-bar { padding: 11px 12px 11px 14px; border-color: transparent; box-shadow: inset 0 0 0 1px var(--lm-line); }
+.lm-root .lm-bundle-bar.on { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--lm-accent) 55%, var(--lm-line)); }
+.lm-root .lm-bundle-name { font-size: 14.5px; }
+.lm-root .lm-bundle-where { font-size: 12px; }
+
+/* ---------- tabs ---------- */
+
+.lm-root .lm-tabs-line .lm-tab { font-size: 13.5px; }
+.lm-root .lm-tabs-line .lm-tab.active { font-weight: 700; }
+
+/* ---------- 기억장 cards ---------- */
+
+.lm-root .lm-node-body { gap: 10px; padding: 14px 16px; border-color: transparent; box-shadow: inset 0 0 0 1px var(--lm-line); }
+.lm-root .lm-node.lm-focus .lm-node-body { box-shadow: inset 0 0 0 1.5px var(--lm-accent), var(--lm-ring); }
+.lm-root .lm-title.lm-quiet { font-size: 16px; font-weight: 700; letter-spacing: -0.02em; padding-left: 6px; }
+.lm-root textarea.lm-quiet { font-size: 14px; line-height: 1.7; }
+/* Long summaries no longer hide behind a fixed four-line box, short ones don't leave a gap. */
+.lm-root .lm-node textarea.lm-text,
+.lm-root .lm-entry textarea,
+.lm-root .lm-event textarea,
+.lm-root #lm_saga { field-sizing: content; min-height: 2.8lh; max-height: 45vh; }
+.lm-root .lm-quiet-row { gap: 10px; }
+.lm-root .lm-quiet-k { min-width: 56px; padding-left: 6px; font-size: 12px; color: var(--lm-muted); }
+.lm-root .lm-quiet-row .text_pole.lm-quiet { color: var(--lm-text); font-size: 13px; }
+.lm-root .lm-range { font-size: 12px; }
+.lm-root .lm-imp span { width: 24px; padding: 3px 0; font-size: 12px; }
+
+/* ---------- popups: our footer buttons ---------- */
+
+.popup:has(.lm-root) .popup-controls { gap: 8px; padding-top: 10px; }
+.popup:has(.lm-root) .popup-controls .menu_button {
+    min-width: 76px;
+    min-height: 38px;
+    padding: 7px 18px;
+    border-radius: 11px;
+    font-weight: 600;
+    font-size: 14px;
+}
+.popup:has(.lm-root) .popup-controls .popup-button-ok { filter: none; }
+
+@media (prefers-reduced-motion: reduce) {
+    .lm-root *, .lm-root *::before, .lm-root *::after { transition: none !important; animation: none !important; }
+}
+.lm-root .lm-breakdown em { font-style: normal; color: var(--lm-muted); }
+.lm-root .lm-breakdown b { font-weight: 600; color: var(--lm-text); font-variant-numeric: tabular-nums; }
+.lm-root .lm-tab { white-space: nowrap; }
+@container lm (max-width: 360px) {
+    .lm-root .lm-live-row > :nth-child(2) { grid-column: 2; grid-row: 1; }
+    .lm-root .lm-live-row > :nth-child(3) { grid-column: 2 / -1; grid-row: 2; margin-top: -6px; }
+    .lm-root .lm-live-row > :nth-child(4) { grid-column: 3; grid-row: 1; }
+}
+/* All seven settings tabs in view in the narrow drawer instead of a hidden sideways scroll. */
+@container lm (max-width: 520px) {
+    #lm_settings .lm-tabs:not(.lm-tabs-line) { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; overflow: visible; }
+    #lm_settings .lm-tabs:not(.lm-tabs-line) .lm-tab { justify-content: center; min-width: 0; }
+}

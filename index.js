@@ -190,6 +190,11 @@ const defaultSettings = Object.freeze({
     wikiMaxPages: 40,
     wikiBatch: 6,
     qnaTopK: 10,
+    // 설정 묶음: named sets of settings, attached to a chat or a character.
+    bundles: {},
+    bundleByChar: {},
+    activeBundle: '',
+    bundleBase: null,
 });
 
 // ---------------------------------------------------------------- settings
@@ -4521,7 +4526,33 @@ function pushHistory(memory, label) {
     const max = getSettings().maxUndo;
     if (max <= 0) return;
     memory.history.push({ label, at: Date.now(), snap: snapshot(memory) });
+    // Inside a job the steps are folded into one entry at the end, so don't trim yet:
+    // trimming here could throw away the snapshot from before the job.
+    if (undoGroupDepth) return;
     while (memory.history.length > max) memory.history.shift();
+}
+
+// One button press = one undo. A full compress saves a snapshot per batch, and the
+// clean-up and key-fact steps that follow add more; without grouping, 되돌리기 only undid
+// the last of those (often the clean-up), so the hidden originals didn't come back.
+let undoGroupDepth = 0;
+
+function beginUndoGroup(memory) {
+    undoGroupDepth++;
+    return { memory, len: memory?.history?.length ?? 0 };
+}
+
+function endUndoGroup(memory, mark, label) {
+    undoGroupDepth = Math.max(0, undoGroupDepth - 1);
+    const h = memory?.history;
+    if (!h) return;
+    if (memory === mark.memory && h.length > mark.len) {
+        const first = h[mark.len];
+        h.splice(mark.len, h.length - mark.len, { ...first, label: label || first.label });
+    }
+    if (undoGroupDepth) return;
+    const max = getSettings().maxUndo;
+    while (h.length > Math.max(max, 0)) h.shift();
 }
 
 // When a model blocks a batch, the trigger is usually one scene. Halving the batch
@@ -4670,6 +4701,7 @@ async function runCompress({ all = false, auto = false } = {}) {
     let reviews = 0;
     let dirty = false;
     let lastSave = Date.now();
+    const undoMark = beginUndoGroup(getMemory(true));
     try {
         await maybeSeedCast(chatId);
         for (const batch of batches) {
@@ -4776,6 +4808,9 @@ async function runCompress({ all = false, auto = false } = {}) {
             reportError('압축 실패', err);
         }
     } finally {
+        const lastBatch = batches[Math.max(done, 1) - 1];
+        endUndoGroup(stillSameChat(chatId) ? getMemory(false) : null, undoMark,
+            done > 1 ? `압축 #${batches[0].from}-#${lastBatch.to} (${done}개 구간)` : done ? `압축 #${batches[0].from}-#${lastBatch.to}` : '');
         if (dirty && stillSameChat(chatId)) {
             try { await persistChat(); } catch (err) { console.warn(LOG_PREFIX, 'final save failed', err); }
         }
@@ -6497,7 +6532,16 @@ function pruneLedger(memory) {
 
 let lastCompactRefused = [];
 
-async function compactInternal(chatId, { force }) {
+async function compactInternal(chatId, opts) {
+    const mark = beginUndoGroup(getMemory(true));
+    try {
+        return await compactInternalImpl(chatId, opts);
+    } finally {
+        endUndoGroup(stillSameChat(chatId) ? getMemory(false) : null, mark, '기억 정리');
+    }
+}
+
+async function compactInternalImpl(chatId, { force }) {
     const s = getSettings();
     let didAnything = false;
     const failed = new Set();
@@ -6620,14 +6664,19 @@ async function runUndo() {
     if (!last) return toastr.info('되돌릴 작업이 없습니다.');
     const previous = JSON.parse(last.snap);
     const prevHidden = new Set(rangesToList(previous.hiddenRanges));
-    const toUnhide = rangesToList(memory.hiddenRanges).filter(i => !prevHidden.has(i));
+    // Hidden by us now = the recorded ranges plus any message still carrying our flag
+    // (the ranges can drift from the flags after deletions or older versions).
+    const nowHidden = new Set(rangesToList(memory.hiddenRanges));
+    ctx().chat.forEach((m, i) => { if (m?.is_system && m.extra?.lm_hidden) nowHidden.add(i); });
+    const toUnhide = [...nowHidden].filter(i => !prevHidden.has(i));
     setHidden(toUnhide, false);
+    for (const i of toUnhide) { const m = ctx().chat[i]; if (m?.extra) delete m.extra.lm_hidden; }
     for (const key of Object.keys(previous)) memory[key] = previous[key];
     retagFromRanges(memory);
     await persistChat();
     refreshInjection();
     updateStatus();
-    toastr.success(`되돌림: ${last.label}`);
+    toastr.success(toUnhide.length ? `되돌림: ${last.label} · 숨겼던 원본 ${toUnhide.length}개를 다시 보이게 했어요` : `되돌림: ${last.label}`);
     syncAfter();
 }
 
@@ -6939,6 +6988,12 @@ function settingsHtml() {
         <button type="button" class="lm-quickbtn" id="lm_btn_ask">${icon('ask')}<span>묻기</span></button>
         <button type="button" class="lm-quickbtn" id="lm_btn_compact" title="덜 중요한 기억부터 줄이고 오래된 것을 합쳐요">${icon('sparkle')}<span>정리</span></button>
         <button type="button" class="lm-quickbtn" id="lm_btn_undo">${icon('undo')}<span>되돌리기</span></button>
+      </div>
+
+      <div class="lm-bundle-bar" id="lm_bundle_bar">
+        <span class="lm-bundle-ic">${icon('layers')}</span>
+        <div class="lm-bundle-text"><span class="lm-bundle-label">설정 묶음</span><b class="lm-bundle-name">기본 설정</b><small class="lm-bundle-where"></small></div>
+        <button type="button" class="menu_button lm-btn" id="lm_bundle_open">묶음 관리</button>
       </div>
 
       <div class="lm-live-wrap">
@@ -7266,6 +7321,286 @@ function bindSettingsSearch(root) {
     }));
 }
 
+// ---------------------------------------------------------------- 설정 묶음 (settings bundles)
+// A bundle is a named copy of the settings. A chat or a character (group) can point at one;
+// opening that chat swaps the bundle in, and leaving it swaps the plain settings ("기본 설정")
+// back. While a bundle is in use, edits made in the settings panel belong to that bundle.
+
+const BUNDLE_META_KEY = 'long_memory_bundle';
+// Not per-bot: the master switch, UI state, learned model quirks, the user's saved prompt styles,
+// and the embedding setup (switching models per chat would make every index rebuild).
+const BUNDLE_SKIP = new Set(['enabled', 'uiSettingsOpen', 'uiShowAll', 'reasoningRefused', 'softenMigrated', 'userStyles',
+    'embedSource', 'embedModel', 'embedApiUrl', 'bundles', 'bundleByChar', 'activeBundle', 'bundleBase']);
+
+function bundleKeys() {
+    return Object.keys(defaultSettings).filter(k => !BUNDLE_SKIP.has(k));
+}
+
+function pickBundle(s) {
+    const out = {};
+    for (const k of bundleKeys()) if (Object.hasOwn(s, k)) out[k] = structuredClone(s[k]);
+    return out;
+}
+
+// Only keys we know, with the same type as the default, so an old or hand-edited file can't break settings.
+function cleanBundleValues(values) {
+    const out = {};
+    if (!values || typeof values !== 'object') return out;
+    for (const k of bundleKeys()) {
+        if (!Object.hasOwn(values, k)) continue;
+        const d = defaultSettings[k];
+        const v = values[k];
+        const ok = Array.isArray(d) ? Array.isArray(v) : (d !== null && typeof d === 'object') ? (v && typeof v === 'object' && !Array.isArray(v)) : typeof v === typeof d;
+        if (ok) out[k] = structuredClone(v);
+    }
+    return out;
+}
+
+function charBundleKey(c = ctx()) {
+    if (c.groupId) return `group:${c.groupId}`;
+    const ch = c.characterId !== undefined && c.characterId !== null ? c.characters?.[c.characterId] : null;
+    return ch?.avatar ? `char:${ch.avatar}` : null;
+}
+
+function charBundleLabel(c = ctx()) {
+    if (c.groupId) return '이 그룹';
+    return '이 캐릭터';
+}
+
+function resolveBundle() {
+    const s = getSettings();
+    const c = ctx();
+    if (!hasChat()) return { name: s.activeBundle || '', source: 'keep' };
+    const chatName = c.chatMetadata?.[BUNDLE_META_KEY];
+    if (chatName && s.bundles[chatName]) return { name: chatName, source: 'chat' };
+    const key = charBundleKey(c);
+    const charName = key ? s.bundleByChar[key] : '';
+    if (charName && s.bundles[charName]) return { name: charName, source: 'char' };
+    return { name: '', source: '' };
+}
+
+// Put the right settings in place for the open chat. Returns true when something changed.
+function applyBundleForChat({ announce = true } = {}) {
+    const s = getSettings();
+    const { name: target, source } = resolveBundle();
+    if (source === 'keep') return false;
+    const current = s.activeBundle || '';
+    // Keep what was edited while the current settings were in use.
+    if (current && s.bundles[current]) s.bundles[current].values = pickBundle(s);
+    else if (!current && target) s.bundleBase = pickBundle(s);
+    if (target === current) { renderBundleBar(); return false; }
+    if (target) {
+        if (!current && !s.bundleBase) s.bundleBase = pickBundle(s);
+        // Start from the base so keys this bundle doesn't have don't leak over from the previous bundle.
+        Object.assign(s, cleanBundleValues(s.bundleBase), cleanBundleValues(s.bundles[target].values));
+    } else if (s.bundleBase) {
+        Object.assign(s, cleanBundleValues(s.bundleBase));
+        s.bundleBase = null;
+    }
+    s.activeBundle = target;
+    ctx().saveSettingsDebounced();
+    refreshSettingsInputs();
+    renderBundleBar();
+    if (announce) {
+        if (target) toastr.info(`설정 묶음 "${target}"을(를) 적용했어요 (${source === 'chat' ? '이 채팅' : charBundleLabel()}에 붙어 있음).`, APP_NAME, { timeOut: 3500 });
+        else toastr.info('기본 설정으로 돌아왔어요.', APP_NAME, { timeOut: 2500 });
+    }
+    logActivity('model', target ? `설정 묶음 적용: ${target}` : '설정 묶음 해제: 기본 설정');
+    return true;
+}
+
+function afterBundleChange() {
+    applyBundleForChat({ announce: false });
+    refreshInjection();
+    updateStatus();
+}
+
+// Re-read every control in the settings panel after the values were swapped underneath it.
+function refreshSettingsInputs() {
+    const root = document.getElementById('lm_settings');
+    if (!root) return;
+    const s = getSettings();
+    root.querySelectorAll('[data-lm-setting]').forEach(el => {
+        const key = el.dataset.lmSetting;
+        if (el.type === 'checkbox') el.checked = !!s[key];
+        else el.value = s[key] ?? '';
+    });
+    const profile = root.querySelector('#lm_profile');
+    if (profile) profile.innerHTML = profileOptions(s.profileId);
+    const fallback = root.querySelector('#lm_fallback');
+    if (fallback) fallback.innerHTML = profileOptions(s.fallbackProfileId, '사용 안 함');
+    const desc = root.querySelector('#lm_preset_desc');
+    if (desc) desc.textContent = INJECT_PRESETS[s.injectPreset]?.desc || '';
+    try { renderPromptEditors(root); renderStyleList(root, s.promptStyle || 'default'); renderLoreList(); } catch (err) { console.warn(LOG_PREFIX, 'settings refresh', err); }
+}
+
+function renderBundleBar() {
+    const bar = document.getElementById('lm_bundle_bar');
+    if (!bar) return;
+    const s = getSettings();
+    const { name, source } = resolveBundle();
+    const shown = source === 'keep' ? (s.activeBundle || '') : name;
+    const where = source === 'chat' ? '이 채팅' : source === 'char' ? charBundleLabel() : '';
+    bar.querySelector('.lm-bundle-name').textContent = shown || '기본 설정';
+    bar.querySelector('.lm-bundle-where').textContent = shown ? `${where}에 붙음 · 바꾼 설정은 이 묶음에 저장` : (Object.keys(s.bundles).length ? '이 채팅엔 붙은 묶음이 없어요' : '봇마다 설정이 다르면 묶음으로 저장해 두세요');
+    bar.classList.toggle('on', !!shown);
+}
+
+function bundleUseCount(s, name) {
+    return Object.values(s.bundleByChar).filter(v => v === name).length;
+}
+
+function bundleListHtml() {
+    const s = getSettings();
+    const c = ctx();
+    const names = Object.keys(s.bundles).sort((a, b) => a.localeCompare(b, 'ko'));
+    const { name: active } = resolveBundle();
+    const chatName = hasChat() ? (c.chatMetadata?.[BUNDLE_META_KEY] || '') : '';
+    const key = charBundleKey(c);
+    const charName = key ? (s.bundleByChar[key] || '') : '';
+    const opts = (sel, empty) => `<option value="">${esc(empty)}</option>${names.map(n => `<option value="${esc(n)}" ${n === sel ? 'selected' : ''}>${esc(n)}</option>`).join('')}`;
+    return `
+  <div class="lm-bundle-bind">
+    <label><span>이 채팅</span><select class="text_pole" id="lm_bundle_chat" ${hasChat() ? '' : 'disabled'}>${opts(chatName, `없음 (${charBundleLabel(c)} 설정 따름)`)}</select></label>
+    <label><span>${charBundleLabel(c)}</span><select class="text_pole" id="lm_bundle_char" ${key ? '' : 'disabled'}>${opts(charName, '없음 (기본 설정)')}</select></label>
+    <p class="lm-hint">채팅에 붙인 묶음이 캐릭터에 붙인 것보다 먼저예요. 둘 다 없으면 기본 설정을 써요.</p>
+  </div>
+  <div class="lm-bundle-list">
+    ${names.length ? names.map(n => {
+        const used = bundleUseCount(s, n);
+        const saved = s.bundles[n].savedAt ? new Date(s.bundles[n].savedAt).toLocaleDateString() : '';
+        return `<div class="lm-bundle-row${n === active ? ' active' : ''}" data-bundle="${esc(n)}">
+          <div class="lm-bundle-info"><b>${esc(n)}</b>${n === active ? '<span class="lm-chip lm-chip-star">지금 사용 중</span>' : ''}<small>${used ? `캐릭터·그룹 ${used}곳에 붙음` : '캐릭터에 안 붙음'}${saved ? ` · ${saved} 저장` : ''}</small></div>
+          <div class="lm-bundle-btns">
+            <button type="button" class="lm-toolbtn" data-bundle-act="overwrite" title="지금 설정으로 이 묶음을 덮어써요">${icon('save')}<span>덮어쓰기</span></button>
+            <button type="button" class="lm-toolbtn" data-bundle-act="rename" title="이름 바꾸기">${icon('userpen')}</button>
+            <button type="button" class="lm-toolbtn" data-bundle-act="export" title="파일로 내보내기">${icon('download')}</button>
+            <button type="button" class="lm-toolbtn lm-danger" data-bundle-act="delete" title="지우기">${icon('trash')}</button>
+          </div>
+        </div>`;
+    }).join('') : '<div class="lm-empty">아직 저장한 묶음이 없어요. 시뮬봇에 맞게 설정을 바꾼 뒤 "지금 설정을 새 묶음으로"를 눌러 보세요.</div>'}
+  </div>
+  <div class="lm-bundle-actions">
+    <button type="button" class="menu_button lm-btn lm-btn-primary" data-bundle-act="new">${icon('save')}<span>지금 설정을 새 묶음으로</span></button>
+    <button type="button" class="menu_button lm-btn" data-bundle-act="import">${icon('import')}<span>파일에서 가져오기</span></button>
+  </div>`;
+}
+
+async function askBundleName(title, initial = '') {
+    const s = getSettings();
+    const raw = await ctx().Popup.show.input(title, '묶음 이름 (예: 시뮬봇, 1인봇)', initial);
+    const name = String(raw ?? '').trim().slice(0, 40);
+    if (!name) return null;
+    if (name !== initial && s.bundles[name] && !await ctx().Popup.show.confirm('같은 이름이 있어요', `"${name}" 묶음을 덮어쓸까요?`)) return null;
+    return name;
+}
+
+async function openBundles() {
+    const c = ctx();
+    const root = document.createElement('div');
+    root.innerHTML = `<div class="lm-root lm-bundles">
+  <div class="lm-pop-head"><h3>${icon('layers')}설정 묶음</h3></div>
+  <p class="lm-hint">시뮬봇, 1인봇처럼 봇마다 다른 설정을 이름 붙여 저장하고, 채팅이나 캐릭터에 붙여 두면 그 채팅을 열 때 알아서 바뀌어요. 묶음이 적용된 동안 설정 패널에서 바꾼 값은 그 묶음에 저장되고, 기본 설정은 그대로예요.</p>
+  <div class="lm-bundle-body"></div>
+  <p class="lm-hint">묶음에 안 들어가는 것: 기억 켜기/끄기 스위치, 임베딩 설정(모든 채팅 공통), 저장해 둔 지시문 방식 목록.</p>
+</div>`;
+    applyThemeMode(root.firstElementChild);
+    const body = root.querySelector('.lm-bundle-body');
+    const render = () => { body.innerHTML = bundleListHtml(); };
+    render();
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = '.json,application/json';
+    fileInput.addEventListener('change', async () => {
+        const file = fileInput.files?.[0];
+        fileInput.value = '';
+        if (!file) return;
+        try {
+            const data = JSON.parse(await file.text());
+            if (data?.type !== 'elephant-settings-bundle') throw new Error('코끼리 설정 묶음 파일이 아니에요.');
+            const values = cleanBundleValues(data.values);
+            if (!Object.keys(values).length) throw new Error('들어 있는 설정이 없어요.');
+            const name = await askBundleName('가져온 묶음 이름', String(data.name || '가져온 묶음').slice(0, 40));
+            if (!name) return;
+            getSettings().bundles[name] = { values, savedAt: Date.now() };
+            c.saveSettingsDebounced();
+            toastr.success(`"${name}" 묶음을 가져왔어요. 이 채팅이나 캐릭터에 붙이면 적용돼요.`, APP_NAME);
+            render();
+        } catch (err) {
+            toastr.error(`가져오지 못했어요: ${err.message}`, APP_NAME);
+        }
+    });
+    root.addEventListener('change', async (event) => {
+        const s = getSettings();
+        if (event.target.id === 'lm_bundle_chat') {
+            const v = event.target.value;
+            if (v) c.chatMetadata[BUNDLE_META_KEY] = v; else delete c.chatMetadata[BUNDLE_META_KEY];
+            await c.saveMetadata();
+        } else if (event.target.id === 'lm_bundle_char') {
+            const key = charBundleKey(c);
+            if (!key) return;
+            if (event.target.value) s.bundleByChar[key] = event.target.value; else delete s.bundleByChar[key];
+            c.saveSettingsDebounced();
+        } else return;
+        afterBundleChange();
+        const { name } = resolveBundle();
+        toastr.success(name ? `이제 이 채팅은 "${name}" 설정을 써요.` : '이 채팅은 기본 설정을 써요.', APP_NAME, { timeOut: 2500 });
+        render();
+    });
+    root.addEventListener('click', async (event) => {
+        const btn = event.target.closest('[data-bundle-act]');
+        if (!btn) return;
+        const s = getSettings();
+        const act = btn.dataset.bundleAct;
+        const name = btn.closest('[data-bundle]')?.dataset.bundle;
+        if (act === 'new') {
+            const n = await askBundleName('지금 설정을 새 묶음으로');
+            if (!n) return;
+            s.bundles[n] = { values: pickBundle(s), savedAt: Date.now() };
+            c.saveSettingsDebounced();
+            toastr.success(`"${n}" 묶음을 저장했어요. 위에서 이 채팅이나 캐릭터에 붙여 주세요.`, APP_NAME);
+        } else if (act === 'import') {
+            fileInput.click();
+            return;
+        } else if (act === 'overwrite' && name) {
+            if (!await c.Popup.show.confirm('덮어쓰기', `"${name}" 묶음을 지금 설정 패널의 값으로 바꿀까요?`)) return;
+            s.bundles[name] = { values: pickBundle(s), savedAt: Date.now() };
+            c.saveSettingsDebounced();
+            toastr.success(`"${name}"에 저장했어요.`, APP_NAME);
+        } else if (act === 'rename' && name) {
+            const n = await askBundleName('이름 바꾸기', name);
+            if (!n || n === name) return;
+            s.bundles[n] = s.bundles[name];
+            delete s.bundles[name];
+            for (const [k, v] of Object.entries(s.bundleByChar)) if (v === name) s.bundleByChar[k] = n;
+            if (c.chatMetadata?.[BUNDLE_META_KEY] === name) { c.chatMetadata[BUNDLE_META_KEY] = n; await c.saveMetadata(); }
+            if (s.activeBundle === name) s.activeBundle = n;
+            c.saveSettingsDebounced();
+            renderBundleBar();
+            toastr.info('다른 채팅에 붙어 있던 이름은 그 채팅을 열 때 못 찾으면 기본 설정을 써요. 그 채팅에서 다시 붙여 주세요.', APP_NAME, { timeOut: 6000 });
+        } else if (act === 'export' && name) {
+            downloadFile(`elephant-settings-${fileSafe(name)}.json`, JSON.stringify({ type: 'elephant-settings-bundle', version: 1, name, values: s.bundles[name].values }, null, 2));
+            return;
+        } else if (act === 'delete' && name) {
+            if (!await c.Popup.show.confirm('묶음 지우기', `"${name}" 묶음을 지울까요? 이 묶음을 쓰던 채팅은 기본 설정으로 돌아가요.`)) return;
+            if (s.activeBundle === name) {
+                // Leaving it: go back to the plain settings first.
+                if (s.bundleBase) Object.assign(s, cleanBundleValues(s.bundleBase));
+                s.bundleBase = null;
+                s.activeBundle = '';
+                refreshSettingsInputs();
+            }
+            delete s.bundles[name];
+            for (const [k, v] of Object.entries(s.bundleByChar)) if (v === name) delete s.bundleByChar[k];
+            if (c.chatMetadata?.[BUNDLE_META_KEY] === name) { delete c.chatMetadata[BUNDLE_META_KEY]; await c.saveMetadata(); }
+            c.saveSettingsDebounced();
+            afterBundleChange();
+        } else return;
+        render();
+    });
+    await new c.Popup(root, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, allowVerticalScrolling: true, leftAlign: true }).show();
+}
+
 function bindSettings(root) {
     const s = getSettings();
     const { saveSettingsDebounced } = ctx();
@@ -7350,6 +7685,8 @@ function bindSettings(root) {
     root.querySelector('#lm_btn_compact').addEventListener('click', () => runCompact());
     root.querySelector('#lm_btn_manager').addEventListener('click', () => openManager());
     root.querySelector('#lm_btn_undo').addEventListener('click', () => runUndo());
+    root.querySelector('#lm_bundle_open')?.addEventListener('click', () => openBundles());
+    renderBundleBar();
     root.querySelector('#lm_btn_stop').addEventListener('click', () => runStop());
     root.querySelector('#lm_btn_reindex').addEventListener('click', () => syncVectors({ notify: true, full: true }));
     root.querySelector('#lm_btn_ask').addEventListener('click', () => openAsk());
@@ -7888,7 +8225,7 @@ function updateStatus() {
       ${memory && tokens ? (() => {
         const b = memoryBreakdown(memory);
         const parts = [['지금까지의 이야기', b.saga], ['타임라인', b.timeline], ['기록부', b.ledger], ['캐릭터', b.cast], ['복선', b.hooks]].filter(([, v]) => v > 0);
-        return `<div class="lm-breakdown">${parts.map(([k, v]) => `<span>${k} ${v.toLocaleString()}</span>`).join('')}${over ? '<span class="lm-warn">정리를 누르면 예산에 맞춰 줄여요</span>' : ''}</div>`;
+        return `<div class="lm-breakdown">${parts.map(([k, v]) => `<span><em>${k}</em><b>${v.toLocaleString()}</b></span>`).join('')}${over ? '<span class="lm-warn">정리를 누르면 예산에 맞춰 줄여요</span>' : ''}</div>`;
       })() : ''}
       <div class="lm-facts">
         <span>사건 ${(memory?.events?.length ?? 0).toLocaleString()}개</span>
@@ -10687,6 +11024,8 @@ function onChatChanged() {
     compressYielded = false;
     autoYields = 0;
     remindedFor = null;
+    // Settings first: everything below (injection, status) should see this chat's bundle.
+    try { applyBundleForChat(); } catch (err) { console.warn(LOG_PREFIX, 'settings bundle', err); }
     const c = ctx();
     if (hasChat() && !c.chatMetadata?.[META_KEY] && c.characterId !== undefined && c.characterId !== null) {
         const ext = c.characters?.[c.characterId]?.data?.extensions || {};
