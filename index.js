@@ -1144,6 +1144,7 @@ async function openQrSorter() {
     const wrap = document.createElement('div');
     wrap.innerHTML = `<div class="lm-root lm-manager lm-qrsort"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>QR 메시지 분류</h3></div>
   <p class="lm-hint lm-pane-intro">QR이나 슬래시 명령으로 들어온 메시지예요. 롤플을 멈추고 만든 번외편(퀴즈, 만약에 시뮬레이션, 인터뷰 같은 것)은 <b>번외편</b>, 이야기를 이어 가는 것은 <b>이야기</b>로 두세요. 번외편은 요약·회상·답변 점검에서 빠져요. 이미 요약에 들어간 번외편은 그 기억에 '다시 요약' 표시가 붙어요.</p>
+  ${(() => { const n = storyQrGaps().length; return n ? `<p class="lm-hint lm-qrsort-gap">${icon('alert')} 이미 요약한 구간 안에 <b>이야기</b>인데 기억에 안 들어간 메시지가 ${n}개 있어요. 저장하면 그 자리에 에피소드로 끼워 넣을지 물어봐요.</p>` : ''; })()}
   <div class="lm-qrsort-list">${rows.map(r => `
     <div class="lm-qrsort-row" data-i="${r.i}">
       <div class="lm-qrsort-text"><b>#${r.i} ${esc(r.m.name || '')}</b>${r.known ? '' : '<em>추정</em>'}<span>${esc(stripMessage(r.m.mes).replace(/\s+/g, ' ').slice(0, 120))}</span></div>
@@ -1171,6 +1172,115 @@ async function openQrSorter() {
     await persistChat();
     updateStatus();
     toastr.success(`번외편 ${asides}개를 기억에서 뺐어요.${stale ? ` 이미 요약된 기억 ${stale}개에 '다시 요약' 표시를 했어요.` : ''}`, APP_NAME);
+    // Story messages left behind inside ranges that were already compressed: offer to fold them in.
+    const left = storyQrGaps();
+    if (left.length) await runAbsorbStoryQrs(left);
+}
+
+// Messages marked 이야기 that sit inside an already-compressed range but never made it into
+// memory: they were skipped as a QR side-story when that range was compressed, so they are
+// neither summarized nor hidden, and compress (which only moves forward) will never reach them.
+function storyQrGaps(memory = getMemory(false)) {
+    if (!memory || !hasChat()) return [];
+    const cursor = Number.isFinite(memory.cursor) ? memory.cursor : -1;
+    const out = [];
+    ctx().chat.forEach((m, i) => {
+        if (i > cursor || !m || m.extra?.lm_qr !== 'story') return;
+        if (m.is_system || m.extra?.lm_hidden) return;
+        if (!isSummarizable(m) || !String(m.mes ?? '').trim()) return;
+        out.push(i);
+    });
+    return out;
+}
+
+// Runs of nearby indices (only hidden / side-story messages between them) become one batch each.
+function groupStoryGaps(indices) {
+    const { chat } = ctx();
+    const groups = [];
+    for (const i of [...indices].sort((a, b) => a - b)) {
+        const g = groups[groups.length - 1];
+        const between = g ? chat.slice(g[g.length - 1] + 1, i) : [];
+        if (g && between.every(m => m?.is_system || m?.extra?.lm_hidden || m?.extra?.lm_qr === 'aside')) g.push(i);
+        else groups.push([i]);
+    }
+    return groups;
+}
+
+// Summarize each run into its own small episode, slot it into the timeline where it happened,
+// and hide the originals. Ledger and foreshadowing updates are skipped on purpose: they describe
+// a past moment and would overwrite what is true now.
+async function runAbsorbStoryQrs(indices = storyQrGaps(), { ask = true } = {}) {
+    if (busy) return toastr.warning('이미 작업 중입니다.');
+    const memory = getMemory(false);
+    if (!memory || !indices.length) return toastr.info('요약 구간 안에 빠져 있는 이야기 메시지가 없어요.', APP_NAME);
+    const s = getSettings();
+    const groups = groupStoryGaps(indices);
+    if (ask) {
+        const ok = await ctx().Popup.show.confirm('이야기로 바꾼 메시지 넣기',
+            `이미 요약한 구간 안에 이야기로 바꾼 메시지가 ${indices.length}개 있어요 (#${indices.slice(0, 6).join(', #')}${indices.length > 6 ? ' …' : ''}). 압축이 지나간 자리라 그냥 두면 요약되지 않고 AI에게 원문 그대로 계속 보내져요.<br><br>지금 ${groups.length}번 요약해서 그 자리에 에피소드로 끼워 넣고, 원본은 AI에게서 숨길까요? 주변 기억은 그대로 둬요.`);
+        if (!ok) { toastr.info('나중에 설정 → 요약 → QR 메시지 분류에서 저장하면 다시 물어봐요.', APP_NAME); return; }
+    }
+    const chatId = ctx().getCurrentChatId();
+    const { chat } = ctx();
+    busy = true;
+    abortController = new AbortController();
+    setBusyUI(true);
+    const mark = beginUndoGroup(memory);
+    let added = 0;
+    try {
+        for (const group of groups) {
+            if (abortController.signal.aborted || !stillSameChat(chatId)) break;
+            const lines = group.map(i => messageLine(chat[i], i));
+            if (estTokens(lines.join('\n')) > s.batchTokens * 1.5) {
+                toastr.warning(`#${group[0]}~#${group[group.length - 1]}은 한 번에 요약하기엔 길어서 건너뛰었어요. 설정의 "한 구간 최대 토큰"을 늘려 주세요.`, APP_NAME);
+                continue;
+            }
+            const batch = { from: group[0], to: group[group.length - 1], lines, indices: group };
+            setProgress(`이야기로 바꾼 메시지 요약 중 ${added + 1}/${groups.length} (#${batch.from}~#${batch.to})`);
+            const { node, events } = await summarizeBatch(memory, batch);
+            if (!stillSameChat(chatId)) break;
+            markStarredNode(node, batch);
+            pushHistory(memory, `이야기로 바꾼 메시지 넣기 #${batch.from}-#${batch.to}`);
+            const episodeId = newId();
+            addEvents(memory, events, batch, episodeId);
+            const fresh = {
+                id: episodeId, tier: 'episode', from: batch.from, to: batch.to,
+                title: node.title, when: node.when || '', text: node.text,
+                importance: node.importance, keywords: node.keywords,
+                pinned: false, condensed: 0, includeHidden: false,
+                stale: !!node.stale, starred: !!node.starred, review: node.review || null, verified: !!node.verified,
+                msgCount: group.length,
+            };
+            // In story order: before the first memory that starts after it.
+            const at = memory.timeline.findIndex(n => n.from > batch.from);
+            if (at < 0) memory.timeline.push(fresh); else memory.timeline.splice(at, 0, fresh);
+            tagMessages(group, episodeId);
+            const toHide = group.filter(i => !chat[i]?.is_system);
+            setHidden(toHide, true);
+            for (const i of toHide) {
+                memory.hiddenRanges = addRange(memory.hiddenRanges, i, i);
+                chat[i].extra.lm_hidden = true;
+            }
+            added++;
+        }
+        if (added && stillSameChat(chatId)) {
+            await persistChat();
+            toastr.success(`이야기로 바꾼 메시지를 에피소드 ${added}개로 넣고 원본을 숨겼어요. 되돌리기 한 번으로 풀 수 있어요.`, APP_NAME);
+            syncAfter();
+        }
+    } catch (err) {
+        if (String(err?.message) === 'aborted') toastr.info('중지했습니다.');
+        else reportError('이야기로 바꾼 메시지 넣기 실패', err);
+    } finally {
+        endUndoGroup(stillSameChat(chatId) ? getMemory(false) : null, mark, added ? `이야기로 바꾼 메시지 넣기 (${added}개)` : '');
+        busy = false;
+        abortController = null;
+        setBusyUI(false);
+        setProgress('');
+        refreshInjection();
+        updateStatus();
+        runPendingTurn();
+    }
 }
 
 // Fills the in-story time of existing summaries from the status bars of the messages they cover.
