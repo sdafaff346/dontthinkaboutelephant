@@ -5952,7 +5952,7 @@ async function askMemory(question) {
     const memLang = memoryLanguage(memory);
     if (memLang && !sameLanguage(memLang, scriptOf(question))) {
         try {
-            const [translated] = await translateTexts([question], memLang);
+            const [translated] = await translateTexts([question], memLang, { signal: abortController?.signal });
             if (translated && translated !== question) queries.push(translated);
         } catch (err) {
             console.warn(LOG_PREFIX, 'question translation skipped', err);
@@ -8517,17 +8517,17 @@ function alreadyIn(text, targetLang) {
     return sameLanguage(script, targetLang);
 }
 
-async function translateOne(text, targetLang) {
+async function translateOne(text, targetLang, signal = null) {
     const system = `You are a translator. Translate the user's text into natural ${targetLang}. Keep proper nouns (names, places, titles) and any #numbers unchanged. Keep line breaks. Do not summarize, add, or omit anything. Reply with only the translation, without quotes or notes.`;
-    const raw = await callModel(system, text, { retries: 1 });
+    const raw = await callModel(system, text, { retries: 1, signal });
     const out = String(raw || '').trim().replace(/^```[a-z]*\s*|\s*```$/g, '').trim();
     return out && !looksRefused(out) ? out : null;
 }
 
-async function translateBatch(items, targetLang) {
+async function translateBatch(items, targetLang, signal = null) {
     const input = Object.fromEntries(items.map((t, i) => [String(i + 1), t]));
     const system = `You are a translator. The user sends a JSON object of numbered texts. Translate every value into natural ${targetLang}. Keep proper nouns (names, places, titles) and any #numbers unchanged. Do not summarize, merge, add, or omit anything. Reply with ONLY a JSON object with exactly the same keys, each mapped to its translation.`;
-    const raw = await callModel(system, JSON.stringify(input), { retries: 1 });
+    const raw = await callModel(system, JSON.stringify(input), { retries: 1, signal });
     let parsed = parseJsonLenient(raw);
     if (Array.isArray(parsed) && parsed.length === 1 && parsed[0] && typeof parsed[0] === 'object' && !Array.isArray(parsed[0])) parsed = parsed[0];
     const out = new Array(items.length).fill(null);
@@ -8551,7 +8551,9 @@ async function translateBatch(items, targetLang) {
     return out;
 }
 
-async function translateTexts(texts, targetLang, { onProgress = null } = {}) {
+async function translateTexts(texts, targetLang, { onProgress = null, cacheOnly = false, signal = null } = {}) {
+    // Its own signal: stopping a compress job must not cut a reading translation short.
+    signal = signal || new AbortController().signal;
     const out = new Array(texts.length);
     const todo = new Map(); // source text -> indices
     texts.forEach((t, i) => {
@@ -8563,6 +8565,8 @@ async function translateTexts(texts, targetLang, { onProgress = null } = {}) {
         if (!todo.has(key)) todo.set(key, []);
         todo.get(key).push(i);
     });
+    // Only answer from the cache: lets a view open instantly when everything was translated before.
+    if (cacheOnly) return todo.size ? null : out;
     const sources = [...todo.keys()];
     const s = getSettings();
     // Korean output takes more tokens than English input; keep each request well under the limit.
@@ -8585,7 +8589,7 @@ async function translateTexts(texts, targetLang, { onProgress = null } = {}) {
         const group = jobs[j];
         let res = new Array(group.length).fill(null);
         try {
-            res = group.length === 1 ? [await translateOne(group[0], targetLang)] : await translateBatch(group, targetLang);
+            res = group.length === 1 ? [await translateOne(group[0], targetLang, signal)] : await translateBatch(group, targetLang, signal);
         } catch (err) {
             if (String(err?.message) === 'aborted') throw err;
             console.warn(LOG_PREFIX, 'translate request failed', err);
@@ -8593,7 +8597,7 @@ async function translateTexts(texts, targetLang, { onProgress = null } = {}) {
         // Anything the batch dropped gets one more try on its own.
         for (let k = 0; k < group.length; k++) {
             if (!res[k] && group.length > 1) {
-                try { res[k] = await translateOne(group[k], targetLang); } catch (err) { console.warn(LOG_PREFIX, 'translate retry failed', err); }
+                try { res[k] = await translateOne(group[k], targetLang, signal); } catch (err) { console.warn(LOG_PREFIX, 'translate retry failed', err); }
             }
             if (res[k]) {
                 done.set(group[k], res[k]);
@@ -8615,49 +8619,35 @@ function koSection(title, body) {
     return body ? `<section class="lm-ko-sec"><h4>${esc(title)}</h4>${body}</section>` : '';
 }
 
-async function openKoreanView(memory) {
-    if (translateBusy) return;
-    if (!hasContent(memory) && !(memory.wiki?.pages?.length) && !(memory.cast?.length)) {
-        return toastr.info('아직 한국어로 볼 기억이 없어요.');
-    }
-    translateBusy = true;
-    const c = ctx();
-    const loading = document.createElement('div');
-    loading.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>한국어로 보기</h3></div><p class="lm-hint lm-pane-intro">기억을 한국어로 옮기는 중이에요… (저장된 기억은 그대로예요)</p><div id="lm_ko_body"><div class="lm-empty">잠시만요…</div></div></div>`;
-    applyThemeMode(loading.firstElementChild);
-    const popup = new c.Popup(loading, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, large: true, allowVerticalScrolling: true, leftAlign: true });
-    const showing = popup.show();
-    try {
-        // Gather every translatable string in order, translate in one batch, then render.
-        const jobs = [];
-        const push = (t) => { jobs.push(String(t ?? '')); return jobs.length - 1; };
-        const saga = memory.saga.text.trim() ? push(memory.saga.text.trim()) : -1;
-        const nodes = memory.timeline.map(n => ({ tier: n.tier, from: n.from, to: n.to, when: n.when ? push(n.when) : -1, title: push(n.title), text: push(n.text) }));
-        const hooks = (memory.hooks || []).filter(h => h.status !== 'resolved').map(h => push(h.text));
-        const cast = (memory.cast || []).filter(m => m.name && (m.core || m.speech || m.growth.length)).map(m => ({
-            name: m.name,
-            core: m.core ? push(m.core) : -1,
-            speech: m.speech ? push(m.speech) : -1,
-            growth: m.growth.map(g => push(g.text)),
-        }));
-        const entries = memory.ledger.entries.filter(e => e.status !== 'closed').map(e => ({
-            cat: CATEGORIES[e.cat] || e.cat, key: e.key, value: push(e.value),
-        }));
-        const wiki = (memory.wiki?.pages || []).map(pg => ({
-            type: WIKI_TYPES[pg.type] || pg.type, title: pg.title,
-            summary: pg.summary ? push(pg.summary) : -1,
-            details: pg.details ? push(pg.details) : -1,
-            status: pg.status ? push(pg.status) : -1,
-        }));
-        const intro = loading.querySelector('.lm-pane-intro');
-        const tr = await translateTexts(jobs, 'Korean', { onProgress: (i, n) => { if (n > 1) intro.textContent = `기억을 한국어로 옮기는 중이에요… (${i}/${n}) 저장된 기억은 그대로예요`; } });
+// Collect every translatable string of the memory in order, and a renderer for the result.
+function koreanViewParts(memory) {
+    const jobs = [];
+    const push = (t) => { jobs.push(String(t ?? '')); return jobs.length - 1; };
+    const saga = memory.saga.text.trim() ? push(memory.saga.text.trim()) : -1;
+    const nodes = memory.timeline.map(n => ({ tier: n.tier, from: n.from, to: n.to, when: n.when ? push(n.when) : -1, title: push(n.title), text: push(n.text) }));
+    const hooks = (memory.hooks || []).filter(h => h.status !== 'resolved').map(h => push(h.text));
+    const cast = (memory.cast || []).filter(m => m.name && (m.core || m.speech || m.growth.length)).map(m => ({
+        name: m.name,
+        core: m.core ? push(m.core) : -1,
+        speech: m.speech ? push(m.speech) : -1,
+        growth: m.growth.map(g => push(g.text)),
+    }));
+    const entries = memory.ledger.entries.filter(e => e.status !== 'closed').map(e => ({
+        cat: CATEGORIES[e.cat] || e.cat, key: e.key, value: push(e.value),
+    }));
+    const wiki = (memory.wiki?.pages || []).map(pg => ({
+        type: WIKI_TYPES[pg.type] || pg.type, title: pg.title,
+        summary: pg.summary ? push(pg.summary) : -1,
+        details: pg.details ? push(pg.details) : -1,
+        status: pg.status ? push(pg.status) : -1,
+    }));
+    const render = (tr) => {
         const g = (i) => (i >= 0 ? esc(tr[i]) : '');
-        const body = loading.querySelector('#lm_ko_body');
         const timelineHtml = nodes.map(n => `<article class="lm-ko-node"><header><span class="lm-chip lm-chip-${n.tier === 'chapter' ? 'chapter' : 'episode'}">${n.tier === 'chapter' ? '챕터' : '에피소드'}</span><b>${g(n.title)}</b><span class="lm-range">${n.from === -1 ? '이전 채팅' : n.from < 0 ? '원본 삭제됨' : `#${n.from}~#${n.to}`}${n.when >= 0 ? ` · ${g(n.when)}` : ''}</span></header><p>${g(n.text).replace(/\n/g, '<br>')}</p></article>`).join('');
         const castHtml = cast.map(m => `<article class="lm-ko-node"><b>${esc(m.name)}</b>${m.core >= 0 ? `<p>${g(m.core).replace(/\n/g, '<br>')}</p>` : ''}${m.speech >= 0 ? `<p class="lm-hint">말투: ${g(m.speech)}</p>` : ''}${m.growth.length ? `<p class="lm-hint">변화: ${m.growth.map(g).join(' / ')}</p>` : ''}</article>`).join('');
         const ledgerHtml = entries.length ? `<ul class="lm-ko-list">${entries.map(e => `<li><span class="lm-chip">${esc(e.cat)}</span> <b>${esc(e.key)}</b>: ${g(e.value)}</li>`).join('')}</ul>` : '';
         const wikiHtml = wiki.map(pg => `<article class="lm-ko-node"><header><span class="lm-chip lm-chip-wiki-${Object.keys(WIKI_TYPES).find(k => WIKI_TYPES[k] === pg.type) || 'term'}">${esc(pg.type)}</span><b>${esc(pg.title)}</b></header>${pg.summary >= 0 ? `<p>${g(pg.summary)}</p>` : ''}${pg.status >= 0 ? `<p class="lm-hint">현재: ${g(pg.status)}</p>` : ''}${pg.details >= 0 ? `<p>${g(pg.details).replace(/\n/g, '<br>')}</p>` : ''}</article>`).join('');
-        body.innerHTML = [
+        return [
             saga >= 0 ? koSection('지금까지의 이야기', `<p>${g(saga).replace(/\n/g, '<br>')}</p>`) : '',
             koSection('등장인물', castHtml),
             koSection('타임라인', timelineHtml),
@@ -8665,17 +8655,60 @@ async function openKoreanView(memory) {
             koSection('안 풀린 복선', hooks.length ? `<ul class="lm-ko-list">${hooks.map(i => `<li>${g(i)}</li>`).join('')}</ul>` : ''),
             koSection('위키', wikiHtml),
         ].filter(Boolean).join('') || '<div class="lm-empty">한국어로 옮길 내용이 없어요.</div>';
-        intro.textContent = tr.failed
-            ? `${tr.failed}개는 번역하지 못해서 원문으로 보여줘요. 다시 열면 그 부분만 다시 번역해요. 저장된 기억은 원래 언어 그대로예요.`
-            : '저장된 기억은 원래 언어 그대로예요. 이 화면은 읽기용 번역이에요.';
-    } catch (err) {
-        reportError('한국어 번역 실패', err);
-        const body = loading.querySelector('#lm_ko_body');
-        if (body) body.innerHTML = `<div class="lm-empty">${esc(errorHint(errorDetail(err)) || errorDetail(err))}</div>`;
-    } finally {
-        translateBusy = false;
+    };
+    return { jobs, render };
+}
+
+function showKoreanView(html, failed = 0) {
+    const c = ctx();
+    const wrap = document.createElement('div');
+    wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>한국어로 보기</h3></div><p class="lm-hint lm-pane-intro">${failed
+        ? `${failed}개는 번역하지 못해서 원문으로 보여줘요. 다시 열면 그 부분만 다시 번역해요. 저장된 기억은 원래 언어 그대로예요.`
+        : '저장된 기억은 원래 언어 그대로예요. 이 화면은 읽기용 번역이에요.'}</p><div id="lm_ko_body">${html}</div></div>`;
+    applyThemeMode(wrap.firstElementChild);
+    return new c.Popup(wrap, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, large: true, allowVerticalScrolling: true, leftAlign: true }).show();
+}
+
+// The translation runs in the background, not behind a window: a popup in SillyTavern blocks the
+// chat, so waiting inside one meant no chatting until every summary was translated. Now the
+// window opens only once the text is ready (instantly when it was translated before).
+let koJob = null;
+
+async function openKoreanView(memory) {
+    if (!hasContent(memory) && !(memory.wiki?.pages?.length) && !(memory.cast?.length)) {
+        return toastr.info('아직 한국어로 볼 기억이 없어요.');
     }
-    await showing;
+    if (koJob) {
+        return toastr.info(`한국어로 옮기는 중이에요${koJob.total > 1 ? ` (${koJob.step}/${koJob.total})` : ''}. 끝나면 알려줄게요. 그동안 채팅해도 돼요.`, APP_NAME);
+    }
+    const parts = koreanViewParts(memory);
+    const ready = await translateTexts(parts.jobs, 'Korean', { cacheOnly: true });
+    if (ready) return showKoreanView(parts.render(ready));
+    const chatId = ctx().getCurrentChatId();
+    koJob = { step: 0, total: 0, chatId };
+    translateBusy = true;
+    toastr.info('기억을 한국어로 옮기기 시작했어요. 창을 닫고 채팅해도 돼요. 다 되면 알려줄게요.', APP_NAME, { timeOut: 5000 });
+    logActivity('model', '한국어로 보기: 번역 시작');
+    (async () => {
+        try {
+            const tr = await translateTexts(parts.jobs, 'Korean', { onProgress: (i, n) => { koJob.step = i; koJob.total = n; } });
+            const html = parts.render(tr);
+            const failed = tr.failed || 0;
+            logActivity('model', `한국어로 보기: 번역 끝${failed ? ` (${failed}개 실패)` : ''}`);
+            if (ctx().getCurrentChatId() !== chatId) return;
+            toastr.success(`한국어 번역이 끝났어요${failed ? ` (${failed}개는 원문)` : ''}. 여기를 누르면 열려요.`, APP_NAME, {
+                timeOut: 20000,
+                extendedTimeOut: 10000,
+                onclick: () => showKoreanView(html, failed),
+            });
+        } catch (err) {
+            if (String(err?.message) === 'aborted') toastr.info('한국어 번역을 멈췄어요. 다시 누르면 남은 부분만 이어서 번역해요.', APP_NAME);
+            else reportError('한국어 번역 실패', err);
+        } finally {
+            koJob = null;
+            translateBusy = false;
+        }
+    })();
 }
 
 function managerHtml(memory) {
@@ -9870,10 +9903,15 @@ async function toggleTranslation(root, btn) {
         return;
     }
     btn.disabled = true;
-    label.textContent = '번역하는 중…';
+    label.textContent = '번역하는 중… 닫아도 계속돼요';
     try {
         const src = els.map(el => el.dataset.orig ?? el.textContent);
-        const out = await translateTexts(src, 'Korean');
+        const out = await translateTexts(src, 'Korean', { onProgress: (i, n) => { if (n > 1) label.textContent = `번역하는 중 ${i}/${n}… 닫아도 계속돼요`; } });
+        // Closed before it finished: the result is cached, so reopening shows it at once.
+        if (!root.isConnected) {
+            toastr.success('번역이 끝났어요. 다시 열고 "한국어로 보기"를 누르면 바로 보여요.', APP_NAME, { timeOut: 6000 });
+            return;
+        }
         els.forEach((el, i) => {
             if (el.dataset.orig === undefined) el.dataset.orig = el.textContent;
             el.textContent = out[i];
