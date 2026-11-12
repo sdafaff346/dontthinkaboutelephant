@@ -505,7 +505,13 @@ function addRange(ranges, from, to) {
 
 function rangesToList(ranges) {
     const out = [];
-    for (const [a, b] of ranges || []) for (let i = a; i <= b; i++) out.push(i);
+    // Normally [from, to] pairs; tolerate {from, to} objects from hand-edited or imported memories.
+    for (const r of Array.isArray(ranges) ? ranges : []) {
+        const a = Array.isArray(r) ? r[0] : r?.from;
+        const b = Array.isArray(r) ? r[1] : r?.to;
+        if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+        for (let i = a; i <= b; i++) out.push(i);
+    }
     return out;
 }
 
@@ -671,12 +677,97 @@ async function reconcileAfterDeletion() {
     for (const list of owned.values()) maxOwned = Math.max(maxOwned, list[list.length - 1]);
     memory.cursor = maxOwned >= 0 ? maxOwned : Math.min(memory.cursor, chat.length - 1, removed ? -1 : memory.cursor);
     memory.hiddenRanges = listToRanges(hidden);
+    const rewound = rewindIfTailHidden(memory);
     await ctx().saveMetadata();
     // Background bookkeeping: the activity log and the timeline badges say it, no pop-up.
     if (removed || staled) logActivity('forget', `지운 메시지의 기억 ${removed}개를 지움 · 일부가 지워진 기억 ${staled}개에 다시 요약 표시`, staled ? 'warn' : 'ok');
     refreshInjection();
     updateStatus();
-    if (removed || staled) syncAfter();
+    if (removed || staled || rewound) syncAfter();
+}
+
+// Deleting replies until the chat ends inside an already-summarized part leaves the last message
+// hidden: the AI then gets no recent lines at all, and the memory still describes the deleted
+// scenes, so continuing from there goes wrong. Rewind: the episode that holds the last message goes
+// to the 보관함, its messages come back, and compress picks them up again later together with the
+// new replies. A merged chapter or the story-so-far is too big to undo that way, so then only the
+// last few messages are shown again.
+function rewindIfTailHidden(memory) {
+    const { chat } = ctx();
+    const last = chat.length - 1;
+    const tail = chat[last];
+    if (last < 0 || !tail?.is_system || !tail.extra?.lm_hidden) return false;
+    const s = getSettings();
+    const ownerId = tail.extra.lm_owner;
+    const node = memory.timeline.find(n => n.id === ownerId);
+    let shown = [];
+    let note = '';
+    if (node && node.tier === 'episode') {
+        pushHistory(memory, `되감기: ${node.title}`);
+        archiveNode(memory, node, 'timeline');
+        memory.timeline = memory.timeline.filter(n => n !== node);
+        memory.events = memory.events.filter(e => e.episodeId !== node.id);
+        shown = chat.map((m, i) => (m?.extra?.lm_owner === node.id ? i : -1)).filter(i => i >= 0);
+        for (const i of shown) delete chat[i].extra.lm_owner;
+        const before = memory.timeline.filter(n => n.from >= 0).reduce((mx, n) => Math.max(mx, n.to), -1);
+        memory.cursor = Math.max(before, memory.saga.coversTo ?? -1);
+        note = `마지막 요약 "${node.title}"(#${node.from}~#${node.to})을 보관함으로 옮기고`;
+    } else {
+        // Chapter or story-so-far: keep the summary, show the newest messages again so the AI has context.
+        const n = Math.max(4, Math.min(s.keepRecent || 10, 20));
+        for (let i = last; i >= 0 && shown.length < n; i--) if (chat[i]?.is_system && chat[i].extra?.lm_hidden) shown.push(i);
+        if (node) node.stale = true;
+        memory.cursor = Math.min(memory.cursor, last);
+        note = '요약은 그대로 두고';
+    }
+    if (!shown.length) return false;
+    setHidden(shown, false);
+    for (const i of shown) delete chat[i].extra.lm_hidden;
+    const showSet = new Set(shown);
+    memory.hiddenRanges = listToRanges(rangesToList(memory.hiddenRanges).filter(i => !showSet.has(i)));
+    memory.checkpoint = null;
+    memory.rev = (memory.rev || 0) + 1;
+    logActivity('forget', `대화 끝이 요약된 부분 안으로 들어가서 ${note} 원본 ${shown.length}개를 다시 보이게 했어요`, 'warn');
+    toastr.info(`지운 메시지 때문에 대화 끝이 이미 요약한 부분 안으로 들어갔어요. ${note} 숨겼던 원본 ${shown.length}개를 다시 보이게 했어요. 여기서 이어 채팅하면 돼요. 기록부·복선에는 지운 장면 내용이 남아 있을 수 있으니 기억장에서 확인하세요.`, APP_NAME, { timeOut: 12000 });
+    return true;
+}
+
+// Show every message the extension hid, in this chat. The memory stays; only the hiding goes.
+async function runUnhideAll() {
+    if (busy) return toastr.warning('작업 중입니다.');
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    const c = ctx();
+    const memory = getMemory(false);
+    const idx = [];
+    c.chat.forEach((m, i) => { if (m?.is_system && m.extra?.lm_hidden) idx.push(i); });
+    if (memory) for (const i of rangesToList(memory.hiddenRanges)) if (c.chat[i]?.is_system && !idx.includes(i)) idx.push(i);
+    if (!idx.length) return toastr.info('코끼리가 숨긴 메시지가 없어요.', APP_NAME);
+    const s = getSettings();
+    const body = document.createElement('div');
+    body.innerHTML = `<div class="lm-root"><h3>숨긴 원본 모두 보이기</h3>
+<p>이 채팅에서 코끼리가 요약하면서 숨긴 메시지 <b>${idx.length.toLocaleString()}개</b>를 모두 다시 보이게 해요. 요약한 기억은 그대로 남아요.</p>
+<p class="lm-hint">긴 채팅은 다음 답변부터 원본이 한꺼번에 AI에게 가서 토큰이 크게 늘어요. 직접 숨긴 메시지(코끼리가 숨긴 게 아닌 것)는 건드리지 않아요.</p>
+<label class="checkbox_label"><input type="checkbox" id="lm_unhide_stop" ${s.hideSummarized ? '' : 'checked'}><span>앞으로 요약할 때도 숨기지 않기 (설정 → 요약의 '요약한 원본은 AI에게서 숨기기' 끄기)</span></label></div>`;
+    applyThemeMode(body.firstElementChild);
+    const ok = await new c.Popup(body, c.POPUP_TYPE.CONFIRM, '', { okButton: '모두 보이기', cancelButton: '취소', leftAlign: true }).show();
+    if (ok !== c.POPUP_RESULT.AFFIRMATIVE) return;
+    const stop = body.querySelector('#lm_unhide_stop')?.checked;
+    setHidden(idx, false);
+    for (const i of idx) if (c.chat[i]?.extra) delete c.chat[i].extra.lm_hidden;
+    if (memory) {
+        memory.hiddenRanges = [];
+        memory.rev = (memory.rev || 0) + 1;
+    }
+    if (stop && s.hideSummarized) {
+        s.hideSummarized = false;
+        c.saveSettingsDebounced();
+        syncSettingInputs();
+    }
+    await persistChat();
+    refreshInjection();
+    updateStatus();
+    logActivity('forget', `숨긴 원본 ${idx.length}개를 모두 다시 보이게 했어요${stop ? ' (앞으로도 숨기지 않음)' : ''}`);
+    toastr.success(`숨긴 원본 ${idx.length}개를 다시 보이게 했어요.${stop ? ' 앞으로 요약할 때도 숨기지 않아요.' : ''}`, APP_NAME);
 }
 
 // Other extensions (for example a reply rewriter or translator) change a message and announce it
@@ -7401,6 +7492,7 @@ function settingsHtml() {
           ${selectRow('language', '요약 언어', selectOptions(LANGUAGES, s.language), s.language, 'English가 토큰을 가장 적게 써요')}
           ${selectRow('detail', '상세도', selectOptions({ concise: '간결', standard: '보통', detailed: '상세' }, s.detail), s.detail, '상세할수록 오래 기억하지만 토큰이 늘어요')}
           ${numberRow('keepRecent', '최근 원본 유지', 0, 5000, '이만큼의 최근 메시지는 요약하지 않고 그대로 둬요')}
+          <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_unhide">${icon('undo')}<span>숨긴 원본 모두 보이기</span></button><span class="lm-hint">이 채팅에서 코끼리가 숨긴 메시지를 한 번에 다시 보이게 해요. 기억은 그대로예요</span></div>
           ${group('QR 메시지', '빠른 답장으로 넣은 메시지')}
           ${selectRow('qrMessages', 'QR·슬래시 명령 메시지', selectOptions(QR_MODES, s.qrMessages === 'comment' ? 'aside' : s.qrMessages), s.qrMessages === 'comment' ? 'aside' : s.qrMessages, '빠른 답장(QR)으로 만든 분석(/comment)과 롤플을 멈추고 만든 번외편(퀴즈, 인터뷰, 만약에 시뮬레이션 같은 것)을 요약·회상·답변 점검에서 빼요. 장면을 넘기거나 이어 쓰게 하는 QR은 그대로 기억해요')}
           <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_qrsort">${icon('ledger')}<span>QR 메시지 분류</span></button><span class="lm-hint">이 버전 전에 들어온 QR 메시지를 번외편/이야기로 직접 골라요</span></div>
@@ -7603,7 +7695,7 @@ const ESSENTIAL_SETTINGS = new Set(['language', 'detail', 'keepRecent', 'softenS
     'autoCompress', 'autoCompressAt', 'checkContradictions', 'liveStateUpdate', 'yieldToReply',
     'recallEnabled', 'vectorEnabled', 'embedSource', 'memoryBudget',
     'recallRawDialogue', 'bannedWords', 'bannedInChat', 'memoryReasoning', 'canonEnabled']);
-const ESSENTIAL_IDS = new Set(['lm_profile', 'lm_fallback', 'lm_btn_test', 'lm_btn_repeat']);
+const ESSENTIAL_IDS = new Set(['lm_btn_unhide', 'lm_profile', 'lm_fallback', 'lm_btn_test', 'lm_btn_repeat']);
 const ADVANCED_PANES = new Set(['lore', 'inject', 'prompt']);
 
 function applySimpleView(root) {
@@ -8051,6 +8143,7 @@ function bindSettings(root) {
     root.querySelector('#lm_btn_compact').addEventListener('click', () => runCompact());
     root.querySelector('#lm_btn_manager').addEventListener('click', () => openManager());
     root.querySelector('#lm_btn_undo').addEventListener('click', () => runUndo());
+    root.querySelector('#lm_btn_unhide')?.addEventListener('click', () => runUnhideAll());
     root.querySelector('#lm_bundle_open')?.addEventListener('click', () => openBundles());
     renderBundleBar();
     root.querySelector('#lm_btn_stop').addEventListener('click', () => runStop());
@@ -9262,6 +9355,7 @@ function managerHtml(memory) {
           ${tool('lm_handoff_load', 'receive', '이전 채팅 기억 이어받기', '', '저장해 둔 이전 채팅의 기억을 이 채팅으로 가져와요')}
           ${tool('lm_merge', 'merge', '다른 채팅 기억 합치기', '', '다른 채팅이나 파일의 기억을 지금 기억에 더해요')}
           <hr>
+          ${tool('lm_unhide_all', 'undo', '숨긴 원본 모두 보이기', '', '코끼리가 요약하면서 숨긴 메시지를 이 채팅에서 모두 다시 보이게 해요. 기억은 그대로예요')}
           ${tool('lm_reset', 'reset', '초기화 (골라서)', 'lm-toolbtn-danger', '요약·위키·기록부처럼 지울 것만 골라 초기화해요')}
         </div>
       </details>
@@ -9772,7 +9866,7 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
             await openKoreanView(collectManager(root, memory), koPick.dataset.koScope);
             return;
         }
-        const tool = event.target.closest('#lm_ko, #lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_wiki_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_ttable, #lm_tgraph, #lm_relmap, #lm_statuslog, #lm_verify, #lm_canon_pick, .lm-canon-del');
+        const tool = event.target.closest('#lm_ko, #lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_unhide_all, #lm_wiki_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_ttable, #lm_tgraph, #lm_relmap, #lm_statuslog, #lm_verify, #lm_canon_pick, .lm-canon-del');
         if (!tool) return;
         if (tool.classList.contains('lm-canon-del')) {
             const i = Number(tool.dataset.i);
@@ -9856,6 +9950,9 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
                 break;
             case 'lm_reset':
                 await closeThen(runReset);
+                break;
+            case 'lm_unhide_all':
+                await closeThen(runUnhideAll);
                 break;
             case 'lm_wiki_reset':
                 await closeThen(() => runReset({ only: ['wiki'] }));
@@ -11506,6 +11603,14 @@ function registerCommands() {
             return '';
         },
         helpString: '<div>코끼리를 생각하지마: 덜 중요한 기억부터 압축하고 오래된 기억을 챕터·줄거리로 합칩니다.</div>',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lm-unhide',
+        callback: async () => {
+            await runUnhideAll();
+            return '';
+        },
+        helpString: '<div>코끼리를 생각하지마: 요약하면서 숨긴 원본 메시지를 이 채팅에서 모두 다시 보이게 합니다. 기억은 그대로예요.</div>',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lm-undo',
