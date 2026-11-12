@@ -6790,41 +6790,122 @@ async function runUndo() {
     syncAfter();
 }
 
-async function runReset() {
+// What can be wiped, one category at a time. Summaries pull their events and key facts with them:
+// those point at episodes, and summarizing again would otherwise add the same events twice.
+const RESET_PARTS = [
+    { id: 'summaries', label: '요약', desc: '지금까지의 이야기와 타임라인. 다시 압축하면 처음부터 요약해요', count: m => m.timeline.length + (m.saga.text.trim() ? 1 : 0) },
+    { id: 'events', label: '사건', count: m => m.events.length },
+    { id: 'canon', label: '핵심 사실', count: m => m.canon?.facts?.length || 0 },
+    { id: 'ledger', label: '기록부', desc: '물건·관계·상태 같은 현재 상태와 지금 장면', count: m => m.ledger.entries.length + (Object.values(m.ledger.scene || {}).some(Boolean) ? 1 : 0) },
+    { id: 'hooks', label: '복선', count: m => (m.hooks || []).length },
+    { id: 'cast', label: '캐릭터 노트', desc: '성격·말투 메모와 모아 둔 대사', count: m => (m.cast || []).length },
+    { id: 'wiki', label: '위키', count: m => m.wiki?.pages?.length || 0 },
+    { id: 'qna', label: '질문 기록', count: m => (m.qna || []).length },
+    { id: 'archive', label: '보관함', desc: '지운 요약·기록을 모아 둔 곳. 되돌리기로 살릴 수 없어요', count: m => m.archive.length },
+    { id: 'frame', label: '작품 설정', count: m => Object.values(m.frame || {}).some(v => typeof v === 'string' ? v.trim() : false) ? 1 : 0 },
+];
+
+function resetPartsHtml(memory, only) {
+    // Nothing ticked unless a tab asked for its own part: wiping should always be a choice.
+    const pre = new Set(only || []);
+    return RESET_PARTS.map(p => {
+        const n = p.count(memory);
+        return `<label class="lm-reset-part${n ? '' : ' empty'}">
+          <input type="checkbox" value="${p.id}" ${n && pre.has(p.id) ? 'checked' : ''} ${n ? '' : 'disabled'}>
+          <span class="lm-reset-name">${esc(p.label)}</span><span class="lm-reset-count">${n ? `${n.toLocaleString()}` : '비어 있음'}</span>
+          ${p.desc ? `<small>${esc(p.desc)}</small>` : ''}
+        </label>`;
+    }).join('');
+}
+
+function applyReset(memory, parts, { keepHidden = true } = {}) {
+    const c = ctx();
+    const has = (id) => parts.includes(id);
+    if (has('summaries')) {
+        if (keepHidden) {
+            for (const msg of c.chat) if (msg?.extra) delete msg.extra.lm_owner;
+        } else {
+            setHidden(rangesToList(memory.hiddenRanges), false);
+            clearTags();
+            memory.hiddenRanges = [];
+        }
+        memory.timeline = [];
+        memory.saga = { text: '', coversTo: -1 };
+        memory.cursor = -1;
+        memory.checkpoint = null;
+        memory.merged = [];
+        // Old undo steps point at summaries that are gone.
+        memory.history = [];
+    }
+    if (has('events')) memory.events = [];
+    if (has('canon')) memory.canon = { facts: [], pickedAt: 0, nodesAtPick: 0 };
+    if (has('ledger')) memory.ledger = { scene: { time: '', place: '', present: '', mood: '' }, entries: [] };
+    if (has('hooks')) memory.hooks = [];
+    if (has('cast')) { memory.cast = []; memory.castSeeded = false; }
+    if (has('wiki')) memory.wiki = { updatedAt: 0, pages: [] };
+    if (has('qna')) memory.qna = [];
+    if (has('archive')) memory.archive = [];
+    if (has('frame')) memory.frame = emptyFrame();
+    memory.rev = (memory.rev || 0) + 1;
+}
+
+async function runReset({ only = null } = {}) {
     if (busy) return toastr.warning('작업 중입니다.');
     const memory = getMemory(false);
     if (!memory) return toastr.info('기억이 없습니다.');
     const c = ctx();
     const hiddenCount = rangesToList(memory.hiddenRanges).length;
-    const SHOW = c.POPUP_RESULT.AFFIRMATIVE;
-    const KEEP = 2;
     const body = document.createElement('div');
-    body.innerHTML = `<h3>기억 초기화</h3><p>이 채팅의 모든 요약을 지워요. 작품/캐릭터 설정은 유지돼요.</p>${hiddenCount ? `<p>요약하면서 숨긴 원본 메시지 ${hiddenCount.toLocaleString()}개를 어떻게 할까요?</p><p class="lm-hint"><b>숨긴 채로 두기</b>를 고르면 다시 압축할 때 그 메시지들을 그대로 요약하고, 그동안 AI에게는 보이지 않아요(다시 압축하기 전까지 AI는 지난 내용을 몰라요). <b>다시 보이기</b>를 고르면 긴 채팅은 다음 답변부터 원본이 한꺼번에 AI에게 가요.</p>` : ''}`;
-    const result = await new c.Popup(body, c.POPUP_TYPE.CONFIRM, '', {
-        okButton: hiddenCount ? '초기화 · 원본 다시 보이기' : '초기화',
-        cancelButton: '취소',
-        customButtons: hiddenCount ? [{ text: '초기화 · 숨긴 채로 두기', result: KEEP, classes: ['menu_button'] }] : null,
-        leftAlign: true,
-    }).show();
-    if (result !== SHOW && result !== KEEP) return;
-    const keepHidden = result === KEEP;
-    if (keepHidden) {
-        // Only forget which memory owned each message; they stay hidden and marked as ours.
-        for (const msg of c.chat) if (msg?.extra) delete msg.extra.lm_owner;
-    } else {
-        setHidden(rangesToList(memory.hiddenRanges), false);
-        clearTags();
-    }
-    const frame = memory.frame;
-    const fresh = emptyMemory();
-    fresh.frame = frame;
-    if (keepHidden) fresh.hiddenRanges = memory.hiddenRanges;
-    c.chatMetadata[META_KEY] = fresh;
-    await purgeVectors();
+    body.innerHTML = `<div class="lm-root lm-reset">
+  <h3>${only?.length === 1 ? `${esc(RESET_PARTS.find(p => p.id === only[0])?.label || '')} 초기화` : '기억 초기화'}</h3>
+  <p class="lm-hint">지울 것만 고르세요. 고르지 않은 건 그대로 남아요.</p>
+  <div class="lm-reset-parts">${resetPartsHtml(memory, only)}</div>
+  <div class="lm-reset-quick"><button type="button" class="lm-link-btn" data-pick="all">작품 설정 빼고 전부</button><button type="button" class="lm-link-btn" data-pick="none">모두 해제</button></div>
+  <div class="lm-reset-hidden" hidden>
+    <p><b>요약하면서 숨긴 원본 메시지 ${hiddenCount.toLocaleString()}개</b>는 어떻게 할까요?</p>
+    <label class="lm-mode"><input type="radio" name="lm_reset_hidden" value="keep" checked><span class="lm-mode-name">숨긴 채로 두기</span><span class="lm-mode-desc">다시 압축할 때 그대로 요약해요. 그동안 AI는 지난 내용을 몰라요</span></label>
+    <label class="lm-mode"><input type="radio" name="lm_reset_hidden" value="show"><span class="lm-mode-name">다시 보이기</span><span class="lm-mode-desc">긴 채팅은 다음 답변부터 원본이 한꺼번에 AI에게 가요</span></label>
+  </div>
+  <p class="lm-hint lm-reset-note"></p>
+</div>`;
+    applyThemeMode(body.firstElementChild);
+    const boxes = () => [...body.querySelectorAll('.lm-reset-parts input[type=checkbox]')];
+    const sync = (changed) => {
+        const on = (id) => boxes().find(b => b.value === id);
+        // Events and key facts point at summaries: they go together.
+        if (changed?.value === 'summaries' && changed.checked) ['events', 'canon'].forEach(id => { const b = on(id); if (b && !b.disabled) b.checked = true; });
+        const picked = boxes().filter(b => b.checked).map(b => b.value);
+        body.querySelector('.lm-reset-hidden').hidden = !(picked.includes('summaries') && hiddenCount);
+        const notes = [];
+        if (picked.includes('summaries')) notes.push('요약을 지우면 되돌리기 기록도 비워져요. 혹시 모르니 백업이 있는지 먼저 확인하세요.');
+        else if (picked.length) notes.push('되돌리기 한 번으로 살릴 수 있어요' + (picked.includes('archive') ? ' (보관함은 빼고요)' : '') + '.');
+        if (picked.includes('summaries') && !picked.includes('events') && on('events') && !on('events').disabled) notes.push('사건을 남기면 다시 압축할 때 같은 사건이 한 번 더 쌓여요.');
+        body.querySelector('.lm-reset-note').textContent = notes.join(' ');
+    };
+    body.addEventListener('change', (e) => { if (e.target.matches('input[type=checkbox]')) sync(e.target); });
+    body.addEventListener('click', (e) => {
+        const b = e.target.closest('[data-pick]');
+        if (!b) return;
+        boxes().forEach(x => { if (!x.disabled) x.checked = b.dataset.pick === 'all' && x.value !== 'frame'; });
+        sync();
+    });
+    sync();
+    const ok = await new c.Popup(body, c.POPUP_TYPE.CONFIRM, '', { okButton: '고른 것 지우기', cancelButton: '취소', leftAlign: true }).show();
+    if (ok !== c.POPUP_RESULT.AFFIRMATIVE) return;
+    const parts = boxes().filter(b => b.checked).map(b => b.value);
+    if (!parts.length) return toastr.info('고른 게 없어서 아무것도 지우지 않았어요.');
+    const keepHidden = body.querySelector('input[name=lm_reset_hidden]:checked')?.value !== 'show';
+    const labels = parts.map(id => RESET_PARTS.find(p => p.id === id)?.label).filter(Boolean);
+    if (!parts.includes('summaries')) pushHistory(memory, `초기화: ${labels.join(', ')}`);
+    applyReset(memory, parts, { keepHidden });
+    if (parts.includes('summaries')) await purgeVectors();
     await persistChat();
     refreshInjection();
     updateStatus();
-    toastr.success(keepHidden ? '초기화했어요. 숨긴 원본은 그대로 두었어요. 압축(전체 압축)을 누르면 처음부터 다시 요약해요.' : '초기화했습니다.');
+    syncAfter();
+    toastr.success(parts.includes('summaries') && keepHidden && hiddenCount
+        ? `${labels.join(', ')}을(를) 지웠어요. 숨긴 원본은 그대로 두었어요. 전체 압축을 누르면 처음부터 다시 요약해요.`
+        : `${labels.join(', ')}을(를) 지웠어요.`, APP_NAME);
 }
 
 function syncAfter() {
@@ -8659,47 +8740,116 @@ function koreanViewParts(memory) {
     return { jobs, render };
 }
 
-function showKoreanView(html, failed = 0) {
+// Finished translations are kept per chat in the browser (not in the chat file, which would grow
+// with every copy), newest first, so a past translation opens instantly with the time it was made.
+const KO_SAVED_MAX = 5;
+const koSavedKey = (chatId) => `lm_ko_saved:${chatId}`;
+
+async function loadKoSaved(chatId = ctx().getCurrentChatId()) {
+    try { return (await store()?.getItem(koSavedKey(chatId))) || []; } catch { return []; }
+}
+
+async function saveKoVersion(chatId, version) {
+    const st = store();
+    if (!st) return [];
+    let list = await loadKoSaved(chatId);
+    list = [version, ...list.filter(v => v.sig !== version.sig)].slice(0, KO_SAVED_MAX);
+    try { await st.setItem(koSavedKey(chatId), list); } catch (err) { console.warn(LOG_PREFIX, 'save translation', err); }
+    return list;
+}
+
+async function deleteKoVersion(chatId, at) {
+    const list = (await loadKoSaved(chatId)).filter(v => v.at !== at);
+    try { await store()?.setItem(koSavedKey(chatId), list); } catch { /* ignore */ }
+    return list;
+}
+
+function koStamp(at) {
+    const d = new Date(at);
+    return `${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+// The read-only Korean window. With saved versions it gets a picker: which translation, made when,
+// and whether the memory changed since.
+function showKoreanView(html, failed = 0, { versions = [], currentSig = '', chatId = ctx().getCurrentChatId(), onRetranslate = null, pickAt = null } = {}) {
     const c = ctx();
     const wrap = document.createElement('div');
-    wrap.innerHTML = `<div class="lm-root lm-manager"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>한국어로 보기</h3></div><p class="lm-hint lm-pane-intro">${failed
-        ? `${failed}개는 번역하지 못해서 원문으로 보여줘요. 다시 열면 그 부분만 다시 번역해요. 저장된 기억은 원래 언어 그대로예요.`
-        : '저장된 기억은 원래 언어 그대로예요. 이 화면은 읽기용 번역이에요.'}</p><div id="lm_ko_body">${html}</div></div>`;
+    wrap.innerHTML = `<div class="lm-root lm-manager lm-ko-view"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>한국어로 보기</h3></div>
+  <div class="lm-ko-bar"></div>
+  <p class="lm-hint lm-pane-intro"></p>
+  <div id="lm_ko_body"></div></div>`;
     applyThemeMode(wrap.firstElementChild);
+    const bar = wrap.querySelector('.lm-ko-bar');
+    const intro = wrap.querySelector('.lm-pane-intro');
+    const body = wrap.querySelector('#lm_ko_body');
+    let list = versions;
+    const show = (v) => {
+        body.innerHTML = v ? v.html : html;
+        const f = v ? v.failed : failed;
+        const stale = v && currentSig && v.sig !== currentSig;
+        intro.textContent = [
+            v ? `${koStamp(v.at)}에 저장한 번역본이에요.` : '',
+            stale ? '그 뒤로 기억이 바뀌어서 새 요약은 빠져 있을 수 있어요.' : (v && currentSig ? '지금 기억과 같아요.' : ''),
+            f ? `${f}개는 번역하지 못해서 원문으로 보여줘요.` : '',
+            '저장된 기억은 원래 언어 그대로예요. 이 화면은 읽기용 번역이에요.',
+        ].filter(Boolean).join(' ');
+        bar.querySelector('select')?.querySelectorAll('option').forEach(o => { o.selected = Number(o.value) === v?.at; });
+        bar.querySelector('#lm_ko_del')?.toggleAttribute('hidden', !v);
+    };
+    const renderBar = () => {
+        bar.innerHTML = `${list.length ? `<label class="lm-ko-pick"><span>저장된 번역본</span><select class="text_pole lm-quiet" id="lm_ko_ver">${list.map(v => `<option value="${v.at}">${koStamp(v.at)}${currentSig && v.sig === currentSig ? ' · 최신' : ''}</option>`).join('')}</select></label>` : ''}
+          <span class="lm-spacer"></span>
+          ${onRetranslate ? `<button type="button" class="lm-toolbtn" id="lm_ko_new">${icon('sparkle')}<span>지금 기억으로 새로 번역</span></button>` : ''}
+          ${list.length ? `<button type="button" class="lm-toolbtn lm-danger" id="lm_ko_del" title="이 번역본 지우기">${icon('trash')}</button>` : ''}`;
+    };
+    renderBar();
+    show(pickAt ? list.find(v => v.at === pickAt) : (list.find(v => v.sig === currentSig && v.html === html) || null));
+    bar.addEventListener('change', (e) => {
+        if (e.target.id !== 'lm_ko_ver') return;
+        show(list.find(v => v.at === Number(e.target.value)));
+    });
+    bar.addEventListener('click', async (e) => {
+        if (e.target.closest('#lm_ko_new')) {
+            e.target.closest('#lm_ko_new').disabled = true;
+            onRetranslate?.();
+            toastr.info('새로 번역하기 시작했어요. 창을 닫고 채팅해도 돼요. 다 되면 알려줄게요.', APP_NAME, { timeOut: 5000 });
+            return;
+        }
+        if (e.target.closest('#lm_ko_del')) {
+            const at = Number(bar.querySelector('#lm_ko_ver')?.value);
+            if (!at || !await c.Popup.show.confirm('번역본 지우기', `${koStamp(at)}에 저장한 번역본을 지울까요? 기억은 그대로예요.`)) return;
+            list = await deleteKoVersion(chatId, at);
+            renderBar();
+            show(list[0] || null);
+            if (!list.length) body.innerHTML = '<div class="lm-empty">저장된 번역본이 없어요. "지금 기억으로 새로 번역"을 눌러 주세요.</div>';
+        }
+    });
     return new c.Popup(wrap, c.POPUP_TYPE.TEXT, '', { okButton: '닫기', wide: true, large: true, allowVerticalScrolling: true, leftAlign: true }).show();
 }
 
 // The translation runs in the background, not behind a window: a popup in SillyTavern blocks the
 // chat, so waiting inside one meant no chatting until every summary was translated. Now the
-// window opens only once the text is ready (instantly when it was translated before).
+// window opens only once the text is ready (instantly when it was translated or saved before).
 let koJob = null;
 
-async function openKoreanView(memory) {
-    if (!hasContent(memory) && !(memory.wiki?.pages?.length) && !(memory.cast?.length)) {
-        return toastr.info('아직 한국어로 볼 기억이 없어요.');
-    }
-    if (koJob) {
-        return toastr.info(`한국어로 옮기는 중이에요${koJob.total > 1 ? ` (${koJob.step}/${koJob.total})` : ''}. 끝나면 알려줄게요. 그동안 채팅해도 돼요.`, APP_NAME);
-    }
-    const parts = koreanViewParts(memory);
-    const ready = await translateTexts(parts.jobs, 'Korean', { cacheOnly: true });
-    if (ready) return showKoreanView(parts.render(ready));
-    const chatId = ctx().getCurrentChatId();
+function startKoreanJob(parts, chatId, sig) {
+    if (koJob) return;
     koJob = { step: 0, total: 0, chatId };
     translateBusy = true;
-    toastr.info('기억을 한국어로 옮기기 시작했어요. 창을 닫고 채팅해도 돼요. 다 되면 알려줄게요.', APP_NAME, { timeOut: 5000 });
     logActivity('model', '한국어로 보기: 번역 시작');
     (async () => {
         try {
             const tr = await translateTexts(parts.jobs, 'Korean', { onProgress: (i, n) => { koJob.step = i; koJob.total = n; } });
             const html = parts.render(tr);
             const failed = tr.failed || 0;
-            logActivity('model', `한국어로 보기: 번역 끝${failed ? ` (${failed}개 실패)` : ''}`);
+            const at = Date.now();
+            const versions = await saveKoVersion(chatId, { at, sig, html, failed });
+            logActivity('model', `한국어로 보기: 번역 끝${failed ? ` (${failed}개 실패)` : ''}, ${koStamp(at)}에 저장`);
             if (ctx().getCurrentChatId() !== chatId) return;
-            toastr.success(`한국어 번역이 끝났어요${failed ? ` (${failed}개는 원문)` : ''}. 여기를 누르면 열려요.`, APP_NAME, {
+            toastr.success(`한국어 번역이 끝나서 저장했어요${failed ? ` (${failed}개는 원문)` : ''}. 여기를 누르면 열려요.`, APP_NAME, {
                 timeOut: 20000,
                 extendedTimeOut: 10000,
-                onclick: () => showKoreanView(html, failed),
+                onclick: () => showKoreanView(html, failed, { versions, currentSig: sig, chatId, pickAt: at, onRetranslate: () => retranslateKorean() }),
             });
         } catch (err) {
             if (String(err?.message) === 'aborted') toastr.info('한국어 번역을 멈췄어요. 다시 누르면 남은 부분만 이어서 번역해요.', APP_NAME);
@@ -8709,6 +8859,46 @@ async function openKoreanView(memory) {
             translateBusy = false;
         }
     })();
+}
+
+// "Translate again": forget the cached copies of this memory's texts so changed wording is redone.
+function retranslateKorean() {
+    const memory = getMemory(false);
+    if (!memory) return;
+    const parts = koreanViewParts(memory);
+    for (const t of parts.jobs) TRANSLATE_CACHE.delete(`Korean\u0000${t}`);
+    startKoreanJob(parts, ctx().getCurrentChatId(), hashString(parts.jobs.join('\u0001')));
+}
+
+async function openKoreanView(memory) {
+    if (!hasContent(memory) && !(memory.wiki?.pages?.length) && !(memory.cast?.length)) {
+        return toastr.info('아직 한국어로 볼 기억이 없어요.');
+    }
+    if (koJob) {
+        return toastr.info(`한국어로 옮기는 중이에요${koJob.total > 1 ? ` (${koJob.step}/${koJob.total})` : ''}. 끝나면 알려줄게요. 그동안 채팅해도 돼요.`, APP_NAME);
+    }
+    const chatId = ctx().getCurrentChatId();
+    const parts = koreanViewParts(memory);
+    const sig = hashString(parts.jobs.join('\u0001'));
+    let versions = await loadKoSaved(chatId);
+    const retranslate = () => retranslateKorean();
+    // Everything already translated this session: show it now, and keep a dated copy.
+    const ready = await translateTexts(parts.jobs, 'Korean', { cacheOnly: true });
+    if (ready) {
+        const html = parts.render(ready);
+        let pickAt = versions.find(v => v.sig === sig)?.at || null;
+        if (!pickAt) { pickAt = Date.now(); versions = await saveKoVersion(chatId, { at: pickAt, sig, html, failed: ready.failed || 0 }); }
+        return showKoreanView(html, 0, { versions, currentSig: sig, chatId, pickAt, onRetranslate: retranslate });
+    }
+    // A saved translation exists: open it right away (newest matching one first). Only start a new
+    // translation when the memory changed and the user asks, or nothing was saved yet.
+    if (versions.length) {
+        const match = versions.find(v => v.sig === sig);
+        if (!match) toastr.info('저장된 번역본을 먼저 보여줄게요. 그 뒤로 기억이 바뀌었으면 "지금 기억으로 새로 번역"을 누르세요.', APP_NAME, { timeOut: 6000 });
+        return showKoreanView('', 0, { versions, currentSig: sig, chatId, pickAt: (match || versions[0]).at, onRetranslate: () => startKoreanJob(parts, chatId, sig) });
+    }
+    toastr.info('기억을 한국어로 옮기기 시작했어요. 창을 닫고 채팅해도 돼요. 다 되면 알려줄게요.', APP_NAME, { timeOut: 5000 });
+    startKoreanJob(parts, chatId, sig);
 }
 
 function managerHtml(memory) {
@@ -8746,7 +8936,7 @@ function managerHtml(memory) {
           ${tool('lm_handoff_load', 'receive', '이전 채팅 기억 이어받기', '', '저장해 둔 이전 채팅의 기억을 이 채팅으로 가져와요')}
           ${tool('lm_merge', 'merge', '다른 채팅 기억 합치기', '', '다른 채팅이나 파일의 기억을 지금 기억에 더해요')}
           <hr>
-          ${tool('lm_reset', 'reset', '이 채팅 기억 초기화', 'lm-toolbtn-danger')}
+          ${tool('lm_reset', 'reset', '초기화 (골라서)', 'lm-toolbtn-danger', '요약·위키·기록부처럼 지울 것만 골라 초기화해요')}
         </div>
       </details>
       <input type="file" id="lm_import_file" accept=".json,application/json" hidden>
@@ -8885,6 +9075,7 @@ function managerHtml(memory) {
       ${tool('lm_wiki_build', 'sparkle', wikiPages.length ? '위키 새로 정리' : '위키 만들기', 'lm-toolbtn-accent')}
       ${tool('lm_wiki_md', 'download', '.md')}
       ${tool('lm_wiki_html', 'download', '.html')}
+      ${wikiPages.length ? tool('lm_wiki_reset', 'reset', '위키 초기화', 'lm-toolbtn-danger', '위키 문서를 모두 지워요. 기록부와 사건은 그대로예요') : ''}
     </div>
     <p class="lm-hint lm-pane-intro">기록부와 사건을 바탕으로 인물, 장소, 물건을 문서로 정리해요.${memory.wiki?.updatedAt ? ` 마지막 정리: ${new Date(memory.wiki.updatedAt).toLocaleString()}` : ''}</p>
     ${wikiPages.length ? `<div class="lm-search">${icon('search')}<input class="text_pole lm-filter" id="lm_wiki_filter" placeholder="위키 찾기" aria-label="위키 찾기"></div>${bulkBar('wiki')}` : ''}
@@ -9248,7 +9439,7 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
         }
         const menu = root.querySelector('.lm-menu');
         if (menu?.open && !event.target.closest('.lm-menu > summary')) menu.open = false;
-        const tool = event.target.closest('#lm_ko, #lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_ttable, #lm_tgraph, #lm_relmap, #lm_statuslog, #lm_verify, #lm_canon_pick, .lm-canon-del');
+        const tool = event.target.closest('#lm_ko, #lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_wiki_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_ttable, #lm_tgraph, #lm_relmap, #lm_statuslog, #lm_verify, #lm_canon_pick, .lm-canon-del');
         if (!tool) return;
         if (tool.classList.contains('lm-canon-del')) {
             const i = Number(tool.dataset.i);
@@ -9332,6 +9523,9 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
                 break;
             case 'lm_reset':
                 await closeThen(runReset);
+                break;
+            case 'lm_wiki_reset':
+                await closeThen(() => runReset({ only: ['wiki'] }));
                 break;
         }
     });
