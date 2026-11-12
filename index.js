@@ -733,41 +733,66 @@ function rewindIfTailHidden(memory) {
 }
 
 // Show every message the extension hid, in this chat. The memory stays; only the hiding goes.
-async function runUnhideAll() {
+// A chat message hidden from the AI (the 👻 eye in SillyTavern): a normal user or character
+// message with is_system set. Real system notes (/sys, /comment, narrator) also carry
+// is_system but have their own type and are not "hidden"; showing them would send them as
+// chat lines, so they are left alone.
+function isHiddenChatMessage(m) {
+    if (!m?.is_system) return false;
+    if (m.extra?.type || m.extra?.isSmallSys) return false;
+    if (m.name === 'SillyTavern System') return false;
+    return true;
+}
+
+// Show hidden messages again in this chat: by default every hidden one (hidden by the
+// extension, by hand with the eye button or /hide, or by another extension). The memory stays.
+async function runUnhideAll({ scope = null } = {}) {
     if (busy) return toastr.warning('작업 중입니다.');
     if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
     const c = ctx();
     const memory = getMemory(false);
-    const idx = [];
-    c.chat.forEach((m, i) => { if (m?.is_system && m.extra?.lm_hidden) idx.push(i); });
-    if (memory) for (const i of rangesToList(memory.hiddenRanges)) if (c.chat[i]?.is_system && !idx.includes(i)) idx.push(i);
-    if (!idx.length) return toastr.info('코끼리가 숨긴 메시지가 없어요.', APP_NAME);
+    const ours = new Set();
+    c.chat.forEach((m, i) => { if (m?.is_system && m.extra?.lm_hidden) ours.add(i); });
+    if (memory) for (const i of rangesToList(memory.hiddenRanges)) if (c.chat[i]?.is_system) ours.add(i);
+    const others = [];
+    c.chat.forEach((m, i) => { if (!ours.has(i) && isHiddenChatMessage(m)) others.push(i); });
+    if (!ours.size && !others.length) return toastr.info('숨겨진 메시지가 없어요.', APP_NAME);
     const s = getSettings();
-    const body = document.createElement('div');
-    body.innerHTML = `<div class="lm-root"><h3>숨긴 원본 모두 보이기</h3>
-<p>이 채팅에서 코끼리가 요약하면서 숨긴 메시지 <b>${idx.length.toLocaleString()}개</b>를 모두 다시 보이게 해요. 요약한 기억은 그대로 남아요.</p>
-<p class="lm-hint">긴 채팅은 다음 답변부터 원본이 한꺼번에 AI에게 가서 토큰이 크게 늘어요. 직접 숨긴 메시지(코끼리가 숨긴 게 아닌 것)는 건드리지 않아요.</p>
+    let pick = scope || 'all';
+    if (!scope) {
+        const body = document.createElement('div');
+        body.innerHTML = `<div class="lm-root"><h3>숨긴 메시지 모두 보이기</h3>
+<p>이 채팅에서 AI에게 안 보내지는(👻) 메시지를 다시 보이게 해요. 요약한 기억은 그대로 남아요.</p>
+<label class="lm-mode"><input type="radio" name="lm_unhide_scope" value="all" checked><span class="lm-mode-name">숨겨진 메시지 전부 (${(ours.size + others.length).toLocaleString()}개)</span><span class="lm-mode-desc">코끼리가 숨긴 것 ${ours.size.toLocaleString()}개 + 직접 숨기거나 다른 확장이 숨긴 것 ${others.length.toLocaleString()}개</span></label>
+<label class="lm-mode"><input type="radio" name="lm_unhide_scope" value="ours" ${ours.size ? '' : 'disabled'}><span class="lm-mode-name">코끼리가 숨긴 것만 (${ours.size.toLocaleString()}개)</span><span class="lm-mode-desc">요약하면서 숨긴 원본만 다시 보이게 해요</span></label>
+<label class="lm-mode"><input type="radio" name="lm_unhide_scope" value="others" ${others.length ? '' : 'disabled'}><span class="lm-mode-name">코끼리가 안 숨긴 것만 (${others.length.toLocaleString()}개)</span><span class="lm-mode-desc">직접 숨기거나 다른 확장이 숨긴 메시지만 다시 보이게 해요</span></label>
+<p class="lm-hint">긴 채팅은 다음 답변부터 원본이 한꺼번에 AI에게 가서 토큰이 크게 늘어요. /sys·/comment 같은 시스템 메모는 숨긴 메시지가 아니라서 건드리지 않아요.</p>
 <label class="checkbox_label"><input type="checkbox" id="lm_unhide_stop" ${s.hideSummarized ? '' : 'checked'}><span>앞으로 요약할 때도 숨기지 않기 (설정 → 요약의 '요약한 원본은 AI에게서 숨기기' 끄기)</span></label></div>`;
-    applyThemeMode(body.firstElementChild);
-    const ok = await new c.Popup(body, c.POPUP_TYPE.CONFIRM, '', { okButton: '모두 보이기', cancelButton: '취소', leftAlign: true }).show();
-    if (ok !== c.POPUP_RESULT.AFFIRMATIVE) return;
-    const stop = body.querySelector('#lm_unhide_stop')?.checked;
+        applyThemeMode(body.firstElementChild);
+        const ok = await new c.Popup(body, c.POPUP_TYPE.CONFIRM, '', { okButton: '보이게 하기', cancelButton: '취소', leftAlign: true }).show();
+        if (ok !== c.POPUP_RESULT.AFFIRMATIVE) return;
+        pick = body.querySelector('input[name=lm_unhide_scope]:checked')?.value || 'all';
+        if (body.querySelector('#lm_unhide_stop')?.checked && s.hideSummarized) {
+            s.hideSummarized = false;
+            c.saveSettingsDebounced();
+            syncSettingInputs();
+        }
+    }
+    const mine = pick === 'others' ? [] : [...ours];
+    const theirs = pick === 'ours' ? [] : others;
+    const idx = [...mine, ...theirs];
+    if (!idx.length) return toastr.info('다시 보이게 할 메시지가 없어요.', APP_NAME);
     setHidden(idx, false);
-    for (const i of idx) if (c.chat[i]?.extra) delete c.chat[i].extra.lm_hidden;
-    if (memory) {
+    for (const i of mine) if (c.chat[i]?.extra) delete c.chat[i].extra.lm_hidden;
+    if (memory && mine.length) {
         memory.hiddenRanges = [];
         memory.rev = (memory.rev || 0) + 1;
-    }
-    if (stop && s.hideSummarized) {
-        s.hideSummarized = false;
-        c.saveSettingsDebounced();
-        syncSettingInputs();
     }
     await persistChat();
     refreshInjection();
     updateStatus();
-    logActivity('forget', `숨긴 원본 ${idx.length}개를 모두 다시 보이게 했어요${stop ? ' (앞으로도 숨기지 않음)' : ''}`);
-    toastr.success(`숨긴 원본 ${idx.length}개를 다시 보이게 했어요.${stop ? ' 앞으로 요약할 때도 숨기지 않아요.' : ''}`, APP_NAME);
+    logActivity('forget', `숨긴 메시지 ${idx.length}개를 다시 보이게 했어요 (코끼리가 숨긴 것 ${mine.length}개, 그 밖 ${theirs.length}개)`);
+    toastr.success(`숨긴 메시지 ${idx.length}개를 다시 보이게 했어요.`, APP_NAME);
 }
 
 // Other extensions (for example a reply rewriter or translator) change a message and announce it
@@ -7492,7 +7517,7 @@ function settingsHtml() {
           ${selectRow('language', '요약 언어', selectOptions(LANGUAGES, s.language), s.language, 'English가 토큰을 가장 적게 써요')}
           ${selectRow('detail', '상세도', selectOptions({ concise: '간결', standard: '보통', detailed: '상세' }, s.detail), s.detail, '상세할수록 오래 기억하지만 토큰이 늘어요')}
           ${numberRow('keepRecent', '최근 원본 유지', 0, 5000, '이만큼의 최근 메시지는 요약하지 않고 그대로 둬요')}
-          <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_unhide">${icon('undo')}<span>숨긴 원본 모두 보이기</span></button><span class="lm-hint">이 채팅에서 코끼리가 숨긴 메시지를 한 번에 다시 보이게 해요. 기억은 그대로예요</span></div>
+          <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_unhide">${icon('undo')}<span>숨긴 메시지 모두 보이기</span></button><span class="lm-hint">이 채팅에서 숨겨진 메시지를 한 번에 다시 보이게 해요. 코끼리가 숨긴 것도, 직접·다른 확장이 숨긴 것도요. 기억은 그대로예요</span></div>
           ${group('QR 메시지', '빠른 답장으로 넣은 메시지')}
           ${selectRow('qrMessages', 'QR·슬래시 명령 메시지', selectOptions(QR_MODES, s.qrMessages === 'comment' ? 'aside' : s.qrMessages), s.qrMessages === 'comment' ? 'aside' : s.qrMessages, '빠른 답장(QR)으로 만든 분석(/comment)과 롤플을 멈추고 만든 번외편(퀴즈, 인터뷰, 만약에 시뮬레이션 같은 것)을 요약·회상·답변 점검에서 빼요. 장면을 넘기거나 이어 쓰게 하는 QR은 그대로 기억해요')}
           <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_qrsort">${icon('ledger')}<span>QR 메시지 분류</span></button><span class="lm-hint">이 버전 전에 들어온 QR 메시지를 번외편/이야기로 직접 골라요</span></div>
@@ -9355,7 +9380,7 @@ function managerHtml(memory) {
           ${tool('lm_handoff_load', 'receive', '이전 채팅 기억 이어받기', '', '저장해 둔 이전 채팅의 기억을 이 채팅으로 가져와요')}
           ${tool('lm_merge', 'merge', '다른 채팅 기억 합치기', '', '다른 채팅이나 파일의 기억을 지금 기억에 더해요')}
           <hr>
-          ${tool('lm_unhide_all', 'undo', '숨긴 원본 모두 보이기', '', '코끼리가 요약하면서 숨긴 메시지를 이 채팅에서 모두 다시 보이게 해요. 기억은 그대로예요')}
+          ${tool('lm_unhide_all', 'undo', '숨긴 메시지 모두 보이기', '', '이 채팅에서 숨겨진 메시지를 모두 다시 보이게 해요. 코끼리가 숨긴 것, 직접 숨긴 것 모두요. 기억은 그대로예요')}
           ${tool('lm_reset', 'reset', '초기화 (골라서)', 'lm-toolbtn-danger', '요약·위키·기록부처럼 지울 것만 골라 초기화해요')}
         </div>
       </details>
@@ -11606,11 +11631,12 @@ function registerCommands() {
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lm-unhide',
-        callback: async () => {
-            await runUnhideAll();
+        callback: async (_args, value) => {
+            const v = String(value || '').trim();
+            await runUnhideAll(['all', 'ours', 'others'].includes(v) ? { scope: v } : {});
             return '';
         },
-        helpString: '<div>코끼리를 생각하지마: 요약하면서 숨긴 원본 메시지를 이 채팅에서 모두 다시 보이게 합니다. 기억은 그대로예요.</div>',
+        helpString: '<div>코끼리를 생각하지마: 이 채팅에서 숨겨진 메시지를 모두 다시 보이게 합니다(코끼리가 숨긴 것 + 직접·다른 확장이 숨긴 것). 기억은 그대로예요. <code>/lm-unhide ours</code>는 코끼리가 숨긴 것만, <code>/lm-unhide others</code>는 그 밖의 것만.</div>',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lm-undo',

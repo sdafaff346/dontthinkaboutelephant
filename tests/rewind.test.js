@@ -28,13 +28,17 @@ const { load, makeChat } = require('./harness');
     assert.ok(chat[lastEp.from - 1].is_system, 'earlier episodes stay hidden');
     assert.ok(h.toasts.some(t => /이어 채팅하면 돼요/.test(t)));
 
+    // messages hidden by hand / another extension, and a /sys note that must stay as it is
+    chat[1].is_system = true; delete chat[1].extra.lm_hidden;
+    chat.push({ name: 'Narrator', is_user: false, is_system: true, mes: 'note', extra: { type: 'narrator' } });
     // unhide everything (confirm popup answered yes; checkbox stub)
     h.context.Popup = class { constructor() {} async show() { return 1; } };
     h.context.POPUP_RESULT = { AFFIRMATIVE: 1 }; h.context.POPUP_TYPE = { CONFIRM: 2 };
-    const fake = () => { const el = { innerHTML: '', firstElementChild: null, querySelector: () => ({ checked: false }) }; return el; };
+    const fake = () => { const el = { innerHTML: '', firstElementChild: null, querySelector: (q) => (q.includes('scope') ? { value: 'all' } : { checked: false }) }; return el; };
     h.sandbox.document.createElement = () => fake();
     await T.runUnhideAll();
-    assert.strictEqual(chat.filter(x => x.is_system).length, 0, 'all shown');
+    assert.strictEqual(chat.filter(x => x.is_system && !x.extra?.type).length, 0, 'all hidden messages shown, ours and others');
+    assert.ok(chat[chat.length - 1].is_system, 'system note left alone');
     assert.strictEqual(T.getMemory(false).hiddenRanges.length, 0);
     assert.ok(T.getMemory(false).timeline.length >= 1, 'memory kept');
     console.log('rewind ok');
