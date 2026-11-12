@@ -2910,66 +2910,224 @@ function bannedNote() {
     return `[Style: never use these words or expressions; write the idea another way: ${list.slice(0, 40).join(', ')}]`;
 }
 
-// Finds wording the AI keeps repeating in its recent replies (phrases of 1-6 words that show up
-// in many replies), so the user can put them on the avoid list.
-function findRepeatedPhrases({ replies = 40, top = 24 } = {}) {
+// Finds wording the AI keeps repeating in its recent replies, so the user can put it on the avoid
+// list. Plain word counts mostly surface names ("톰은"), grammar ("있던", "내가") and story nouns
+// ("소파"), which are not what anyone wants to ban. So: names and their particle forms are dropped,
+// single words are kept only when they look like descriptive modifiers (서늘한, 나지막이, 가볍게),
+// longer phrases rank above single words, and an optional model pass picks the real tics
+// (오존 냄새, 입꼬리가 미세하게) out of the candidates.
+
+const KO_JOSA = /(으로써|으로서|에게서|한테서|에서는|에게는|으로는|으로|에게|에서|한테|까지|부터|처럼|보다|이랑|하고|이나|이며|에는|와는|과는|은|는|이|가|을|를|의|에|와|과|도|만|로|랑|야)$/;
+const KO_STOP = new Set(('그는 그녀는 그가 그녀가 그의 그녀의 그를 그녀를 그리고 하지만 그러나 그래서 그런데 그러자 그때 그건 그게 이건 이게 저건 '
+    + '있었다 했다 있는 없는 있던 없던 있을 없을 있어 없어 있다 없다 있고 없고 있지 없지 않은 않는 않았다 않고 않아 했던 하는 하던 한 할 해 하고 하며 하자 '
+    + '것이 것을 것은 것도 것처럼 수 더 또 이 그 저 다시 다른 대신 위에 아래 앞에 뒤에 옆에 안에 밖에 사이 쪽으로 내가 네가 나는 너는 나를 너를 나의 너의 내 네 '
+    + '우리 우리는 우리가 모두 모든 조금 많이 아주 정말 너무 이미 아직 바로 계속 함께 같은 같이 없이 그저 단지 오직 이제 지금 여기 거기 저기 '
+    + '말했다 물었다 대답했다 생각했다 보았다 봤다 왔다 갔다 됐다 되었다 되는 된 될 듯 듯이 채 때 때문에 동안 순간 정도 만큼 '
+    + 'the a an and to of in on at for with he she his her him was were is are be been it its that this you your i my me we our they their them as by from but or not so then just').split(/\s+/));
+// Endings of descriptive words: 서늘한, 가볍게, 조용히, 나지막이, 슬며시, 은근스레, 아련한.
+const MODIFIER_END = /(스레|스럽게|스러운|스러이|롭게|로운|하게|한|히|게|듯이|듯|적인|적으로|며시|그시|직이|막이|다랗게|다란)$/;
+const LONG_JOSA = /(으로써|으로서|에게서|한테서|에서는|에게는|으로는|으로|에게|에서|한테|까지|부터|처럼|보다|이랑|하고|이나|이며|에는|와는|과는)$/;
+
+function stemKo(w) {
+    const stem = w.replace(KO_JOSA, '');
+    return stem.length >= 1 ? stem : w;
+}
+
+function properNames() {
+    const c = ctx();
+    const m = getMemory(false);
+    const list = [c.name1, c.name2, ...(c.groupId ? (c.groups?.find(g => g.id === c.groupId)?.members || []).map(a => c.characters?.find(ch => ch.avatar === a)?.name) : [])];
+    if (m) {
+        list.push(...(m.cast || []).map(x => x.name));
+        list.push(...(m.wiki?.pages || []).map(x => x.title));
+        for (const e of m.events || []) { list.push(...(e.characters || []), e.place); }
+    }
+    const out = new Set();
+    for (const raw of list) {
+        for (const part of String(raw || '').toLowerCase().split(/[\s,·/()]+/)) if (part.length >= 1) out.add(part);
+    }
+    return out;
+}
+
+function recentReplies(limit) {
     const c = ctx();
     const msgs = [];
-    for (let i = c.chat.length - 1; i >= 0 && msgs.length < replies; i--) {
+    for (let i = c.chat.length - 1; i >= 0 && msgs.length < limit; i--) {
         const m = c.chat[i];
         if (!m || m.is_user || isQrMessage(m) || (m.is_system && !m.extra?.lm_hidden)) continue;
         msgs.push(stripMessage(m.mes));
     }
-    if (msgs.length < 5) return { scanned: msgs.length, phrases: [] };
-    const names = new Set([c.name1, c.name2, ...(getMemory(false)?.cast || []).map(x => x.name)].filter(Boolean).map(x => String(x).toLowerCase()));
-    const STOP = new Set(['그는', '그녀는', '그가', '그녀가', '그의', '그녀의', '그리고', '하지만', '그러나', '그래서', '있었다', '했다', '있는', '없는', '것이', '것을', '것은', '수', '더', '또', '이', '그', '저', 'the', 'a', 'an', 'and', 'to', 'of', 'in', 'he', 'she', 'his', 'her', 'was', 'is', 'it', 'that', 'you', 'i']);
+    return msgs;
+}
+
+function findRepeatedPhrases({ replies = 40, top = 24, pool = false } = {}) {
+    const msgs = recentReplies(replies);
+    if (msgs.length < 5) return { scanned: msgs.length, phrases: [], texts: msgs };
+    const names = properNames();
+    const isName = (w) => names.has(w) || names.has(stemKo(w));
+    const isStop = (w) => KO_STOP.has(w) || KO_STOP.has(stemKo(w)) || /^\d+$/.test(w) || w.length < 2 && !/[가-힣]/.test(w);
     const counts = new Map();
     for (const text of msgs) {
         const words = text.toLowerCase().replace(/[^\p{L}\p{N}\s'-]/gu, ' ').split(/\s+/).filter(Boolean);
         const seen = new Set();
-        for (let n = 1; n <= 6; n++) {
+        for (let n = 1; n <= 5; n++) {
             for (let i = 0; i + n <= words.length; i++) {
                 const gram = words.slice(i, i + n);
-                if (gram.every(w => STOP.has(w) || names.has(w))) continue;
-                if (n === 1 && (gram[0].length < 2 || STOP.has(gram[0]) || names.has(gram[0]) || /^\d+$/.test(gram[0]))) continue;
+                if (gram.some(isName)) continue;
+                if (gram.every(isStop)) continue;
+                if (n === 1) {
+                    const w = gram[0];
+                    if (w.length < 2) continue;
+                    // A lone word with a particle is a noun in a sentence (손을, 시선이, 소파): story, not style.
+                    if (/[가-힣]/.test(w) && (LONG_JOSA.test(w) || !MODIFIER_END.test(w))) continue;
+                    if (/^[a-z'-]+$/.test(w) && !/ly$/.test(w)) continue;
+                }
+                // Phrases must not start or end on a bare grammar word ("그는 천천히" → just "천천히").
+                if (n > 1 && (isStop(gram[0]) || isStop(gram[n - 1]))) continue;
                 seen.add(gram.join(' '));
+                // Count "오존 냄새가" and "오존 냄새." as the same "오존 냄새".
+                if (n > 1 && /[가-힣]/.test(gram[n - 1])) {
+                    const tail = stemKo(gram[n - 1]);
+                    if (tail !== gram[n - 1] && tail.length >= 1) seen.add([...gram.slice(0, -1), tail].join(' '));
+                }
             }
         }
         for (const g of seen) counts.set(g, (counts.get(g) || 0) + 1);
     }
-    const minShare = (g) => (g.includes(' ') ? 0.25 : 0.4);
+    const minShare = (g) => (g.includes(' ') ? 0.15 : 0.3);
     let phrases = [...counts.entries()]
-        .filter(([g, n]) => n >= 3 && n / msgs.length >= minShare(g))
-        .map(([g, n]) => ({ text: g, replies: n, share: n / msgs.length }))
-        .sort((a, b) => b.replies - a.replies || b.text.length - a.text.length);
+        .filter(([g, n]) => n >= 3 && n / msgs.length >= (pool ? minShare(g) * 0.6 : minShare(g)))
+        .map(([g, n]) => {
+            const len = g.split(' ').length;
+            return { text: g, replies: n, share: n / msgs.length, score: n * (1 + 0.6 * (len - 1)) };
+        })
+        .sort((a, b) => b.score - a.score || b.text.length - a.text.length);
     // Drop a short phrase when a longer one containing it is about as frequent.
     phrases = phrases.filter(p => !phrases.some(q => q !== p && q.text.length > p.text.length && q.text.includes(p.text) && q.replies >= p.replies * 0.8));
-    return { scanned: msgs.length, phrases: phrases.slice(0, top) };
+    return { scanned: msgs.length, phrases: phrases.slice(0, top), texts: msgs };
 }
+
+function phraseContext(texts, phrase) {
+    const low = phrase.toLowerCase();
+    for (const t of texts) {
+        const i = t.toLowerCase().indexOf(low);
+        if (i >= 0) return t.slice(Math.max(0, i - 30), i + phrase.length + 30).replace(/\s+/g, ' ').trim();
+    }
+    return '';
+}
+
+const REPEAT_KINDS = ['감각 묘사', '몸짓·표정', '습관적 수식어', '상투적 비유', '말버릇', '기타'];
+
+// Model pass: from the counted candidates, keep the stylistic tics and say why.
+async function pickTicsWithModel(found, { signal = null } = {}) {
+    const pool = found.phrases.slice(0, 120);
+    if (!pool.length) return [];
+    const list = pool.map((p, i) => `${i + 1}. ${p.text} (in ${p.replies} of ${found.scanned} replies) — "${phraseContext(found.texts, p.text)}"`).join('\n');
+    const system = `You help a roleplay writer find the stock phrases an AI keeps reusing. You get phrases that recur across the AI's recent replies, each with how often and one example.
+
+Pick only stylistic tics worth banning:
+- clichéd sensory description (a smell of ozone, a chill in the air, a metallic tang)
+- stock body language and expressions (the corner of the mouth lifting slightly, a breath caught, eyes darkening)
+- habitual filler modifiers and adverbs (slowly, quietly, faintly, a low voice)
+- overused metaphors and stock phrasings
+- a narrator's verbal habits
+
+Never pick: names of people or places, objects, places or terms that belong to this story, plain grammar words, ordinary words with no stylistic weight, or a character's deliberate catchphrase.
+
+For each pick give the shortest form that still identifies the tic (drop trailing particles or endings when the core is clear), copied from the list text. Best first, at most 25.
+Reply with lines only, in this format:
+- phrase | category | reason
+category is one of: ${REPEAT_KINDS.join(', ')}
+reason is in Korean, under 15 words.`;
+    const raw = await callModel(system, list, { retries: 1, signal });
+    const joined = found.texts.join('\n').toLowerCase();
+    const names = properNames();
+    const out = [];
+    const seen = new Set();
+    for (const line of String(raw || '').split('\n')) {
+        const m = line.match(/^\s*[-*•]\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*$/);
+        if (!m) continue;
+        const text = m[1].replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim();
+        const low = text.toLowerCase();
+        // Must really occur in the replies, or the ban would never match anything.
+        if (!text || seen.has(low) || !joined.includes(low)) continue;
+        if (low.split(/\s+/).some(w => names.has(w) || names.has(stemKo(w)))) continue;
+        seen.add(low);
+        const base = pool.find(p => p.text.includes(low)) || pool.find(p => low.includes(p.text));
+        const replies = base?.replies ?? found.texts.filter(t => t.toLowerCase().includes(low)).length;
+        out.push({ text, kind: REPEAT_KINDS.includes(m[2].trim()) ? m[2].trim() : '기타', why: m[3].trim().slice(0, 60), replies, share: replies / found.scanned });
+        if (out.length >= 25) break;
+    }
+    return out;
+}
+
+let repeatAi = null; // { chatId, at, picks, running }
 
 async function openRepeatFinder() {
     const c = ctx();
     if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
-    const { scanned, phrases } = findRepeatedPhrases();
+    const chatId = c.getCurrentChatId();
+    const found = findRepeatedPhrases({ top: 30 });
     const current = new Set(bannedList().list.map(w => w.toLowerCase()));
+    const ai = repeatAi?.chatId === chatId ? repeatAi : null;
     const wrap = document.createElement('div');
-    wrap.innerHTML = `<div class="lm-root lm-manager lm-repeat"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>자주 반복되는 표현</h3></div>
-  <p class="lm-hint lm-pane-intro">최근 AI 답변 ${scanned}개에서 여러 번 나온 표현이에요. 고른 것을 금지어에 넣으면 코끼리가 넣는 기억과 (켜 두면) AI에게 보내는 최근 대화에서 빠져요. 저장된 채팅은 그대로예요.</p>
-  ${phrases.length ? `<div class="lm-repeat-list">${phrases.map((p, i) => `
-    <label class="lm-repeat-row"><input type="checkbox" data-i="${i}" ${current.has(p.text) ? 'checked disabled' : ''}><span class="lm-repeat-text">${esc(p.text)}</span><span class="lm-repeat-n">답변 ${p.replies}개 · ${Math.round(p.share * 100)}%</span></label>`).join('')}</div>`
-        : `<div class="lm-empty">${scanned < 5 ? 'AI 답변이 5개 이상 쌓이면 찾을 수 있어요.' : '눈에 띄게 반복되는 표현이 없어요.'}</div>`}
+    const rowHtml = (p, i, src) => `
+    <label class="lm-repeat-row${p.kind ? ' ai' : ''}"><input type="checkbox" data-src="${src}" data-i="${i}" ${current.has(p.text.toLowerCase()) ? 'checked disabled' : ''}>
+      <span class="lm-repeat-main"><span class="lm-repeat-text">${esc(p.text)}</span>${p.why ? `<small class="lm-repeat-why">${esc(p.why)}</small>` : ''}</span>
+      ${p.kind ? `<span class="lm-chip lm-repeat-kind">${esc(p.kind)}</span>` : ''}
+      <span class="lm-repeat-n">답변 ${p.replies}개</span></label>`;
+    const render = () => {
+        const a = repeatAi?.chatId === chatId ? repeatAi : null;
+        wrap.innerHTML = `<div class="lm-root lm-manager lm-repeat"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>자주 반복되는 표현</h3></div>
+  <p class="lm-hint lm-pane-intro">최근 AI 답변 ${found.scanned}개에서 여러 번 나온 표현이에요. 이름과 은·는·이·가 같은 말, 그냥 이야기 속 물건 이름은 빼고 찾아요. 고른 것을 금지어에 넣으면 코끼리가 넣는 기억과 (켜 두면) AI에게 보내는 최근 대화에서 빠져요. 저장된 채팅은 그대로예요.</p>
+  <div class="lm-repeat-ai">
+    ${a?.picks?.length ? `<div class="lm-repeat-head"><b>AI가 고른 상투 표현</b><small>${new Date(a.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}에 고름 · 미리 체크해 뒀어요</small><span class="lm-spacer"></span><button type="button" class="lm-link-btn" id="lm_rep_ai">다시 고르기</button></div>
+      <div class="lm-repeat-list">${a.picks.map((p, i) => rowHtml(p, i, 'ai')).join('')}</div>`
+        : a?.running ? '<div class="lm-repeat-head"><b>AI가 고르는 중이에요…</b><small>창을 닫아도 계속돼요. 끝나면 알려줄게요.</small></div>'
+            : a && !a.picks?.length ? `<div class="lm-repeat-head"><b>AI가 보기엔 상투 표현이 따로 없어요.</b><span class="lm-spacer"></span><button type="button" class="lm-link-btn" id="lm_rep_ai">다시 고르기</button></div>`
+                : `<button type="button" class="menu_button lm-btn lm-btn-primary" id="lm_rep_ai" ${found.scanned < 5 ? 'disabled' : ''}>${icon('sparkle')}<span>AI가 상투 표현 골라 주기</span></button><small class="lm-hint">"오존 냄새", "입꼬리가 미세하게"처럼 버릇이 된 묘사만 골라요. 요약 모델로 한 번 요청해요.</small>`}
+  </div>
+  <div class="lm-repeat-head"><b>자주 나온 표현</b><small>횟수로만 찾은 거라 이야기에 꼭 필요한 말도 섞여 있어요</small></div>
+  ${found.phrases.length ? `<div class="lm-repeat-list">${found.phrases.map((p, i) => rowHtml(p, i, 'count')).join('')}</div>`
+        : `<div class="lm-empty">${found.scanned < 5 ? 'AI 답변이 5개 이상 쌓이면 찾을 수 있어요.' : '눈에 띄게 반복되는 표현이 없어요.'}</div>`}
 </div>`;
-    applyThemeMode(wrap.firstElementChild);
+        applyThemeMode(wrap.firstElementChild);
+        if (a?.picks?.length) wrap.querySelectorAll('input[data-src="ai"]:not(:disabled)').forEach(el => { el.checked = true; });
+    };
+    render();
+    wrap.addEventListener('click', (e) => {
+        if (!e.target.closest('#lm_rep_ai')) return;
+        e.preventDefault();
+        if (repeatAi?.running) return;
+        repeatAi = { chatId, running: true, picks: null, at: 0 };
+        render();
+        (async () => {
+            try {
+                const pool = findRepeatedPhrases({ top: 120, pool: true });
+                const picks = await pickTicsWithModel(pool);
+                repeatAi = { chatId, running: false, picks, at: Date.now() };
+                if (wrap.isConnected) render();
+                else toastr.success(`AI가 상투 표현 ${picks.length}개를 골랐어요. 반복 표현 찾기를 다시 열면 보여요.`, APP_NAME, { timeOut: 7000 });
+            } catch (err) {
+                repeatAi = null;
+                if (wrap.isConnected) render();
+                reportError('상투 표현 고르기 실패', err);
+            }
+        })();
+    });
     const result = await new c.Popup(wrap, c.POPUP_TYPE.CONFIRM, '', { okButton: '금지어에 넣기', cancelButton: '닫기', wide: true, allowVerticalScrolling: true, leftAlign: true }).show();
     if (result !== c.POPUP_RESULT.AFFIRMATIVE) return;
-    const picked = [...wrap.querySelectorAll('.lm-repeat-row input:checked:not(:disabled)')].map(el => phrases[Number(el.dataset.i)]?.text).filter(Boolean);
-    if (!picked.length) return;
+    const a = repeatAi?.chatId === chatId ? repeatAi : null;
+    const picked = [...wrap.querySelectorAll('.lm-repeat-row input:checked:not(:disabled)')]
+        .map(el => (el.dataset.src === 'ai' ? a?.picks : found.phrases)?.[Number(el.dataset.i)]?.text).filter(Boolean);
+    const fresh = [...new Set(picked)].filter(t => !current.has(t.toLowerCase()));
+    if (!fresh.length) return;
     const s = getSettings();
-    s.bannedWords = [String(s.bannedWords || '').trim(), ...picked].filter(Boolean).join('\n');
+    s.bannedWords = [String(s.bannedWords || '').trim(), ...fresh].filter(Boolean).join('\n');
     c.saveSettingsDebounced();
     syncSettingInputs();
     refreshInjection();
-    toastr.success(`금지어에 ${picked.length}개를 넣었어요.`, APP_NAME);
+    toastr.success(`금지어에 ${fresh.length}개를 넣었어요.`, APP_NAME);
 }
 
 // ---------------------------------------------------------------- injection
@@ -4049,7 +4207,8 @@ Reply with only:
 <cast>
 [{"name":"...","core":"...","speech":"...","quotes":["..."]}]
 </cast>
-Write each "name" exactly as the card writes it (same script and spelling; never romanize or translate it).`;
+Write each "name" exactly as the card writes it (same script and spelling; never romanize or translate it).
+A card can be a narrator, simulation, game or RPG card: named after a setting, a system or a narrator, and describing several characters. Then write one object for each character it describes, and do not add the card's own name as a character unless the card itself is one.`;
     const lore = await loreFor(cards.map(c => c.text).join('\n'), 1500);
     const user = [
         frameNotes && `<story_frame>\n${frameNotes}\n</story_frame>`,
@@ -4318,6 +4477,20 @@ function castHealthHtml(memory) {
       ${rows.map(r => `<div class="lm-health-row ${r.ok ? 'ok' : 'bad'}"><i class="lm-dot" aria-hidden="true"></i><span class="lm-health-label">${r.label}</span><span class="lm-health-detail">${esc(r.detail)}</span>${r.fix ? `<button type="button" class="lm-chipbtn" data-cast-fix="${r.fix[0]}">${r.fix[1]}</button>` : ''}</div>`).join('')}`;
 }
 
+// A single card that voices several people (다인봇, simulation, RPG): its name labels every AI
+// message but is not a character. Recognised when the cast lists two or more characters and none
+// of them is the card's name. Group chats are not this case: there each card is one speaker.
+function ensembleCardName(memory) {
+    const c = ctx();
+    if (c.groupId || !memory) return '';
+    const card = String(c.name2 || '').trim();
+    if (!card) return '';
+    const norm = (x) => String(x || '').trim().toLowerCase();
+    const others = (memory.cast || []).map(m => norm(m.name)).filter(n => n && n !== norm(c.name1));
+    if (others.length < 2 || others.includes(norm(card))) return '';
+    return card;
+}
+
 async function maybeSeedCast(chatId) {
     const s = getSettings();
     const memory = getMemory(true);
@@ -4411,6 +4584,8 @@ function summaryUserPrompt(memory, batch, lore = '') {
     }
     if (s.hooksEnabled) parts.push(`<open_hooks>\nSetups from earlier that have not been paid off yet. Resolve one only if this transcript pays it off.\n${openHooksText(memory) || '(none)'}\n</open_hooks>`);
     parts.push(`<transcript messages="#${batch.from}-#${batch.to}">\n${batch.lines.join('\n\n')}\n</transcript>`);
+    const voice = ensembleCardName(memory);
+    if (voice) parts.push(`The speaker label "${voice}" is a narrator, simulation or game card that writes for several characters. Attribute every line and action to the character named in the text, never to "${voice}", and do not record "${voice}" as a character.`);
     if (batchHasStar(batch)) parts.push('Messages marked ★ were flagged by the user as important. Record what happens in them in full detail, keep their key lines word for word, and rate this episode importance 4 or higher.');
     if (batch.notes) parts.push(`<reviewer_notes>\nA fact check of an earlier summary of this transcript found these mistakes. Avoid them and stay strictly faithful to the transcript:\n${batch.notes}\n</reviewer_notes>`);
     const blocks = ['<episode>', '<ledger>', s.eventsEnabled && '<events>', s.voiceEnabled && '<voices>', s.hooksEnabled && '<hooks>'].filter(Boolean);
@@ -8701,27 +8876,52 @@ function koSection(title, body) {
 }
 
 // Collect every translatable string of the memory in order, and a renderer for the result.
-function koreanViewParts(memory) {
+// What "한국어로 보기" can translate, one part at a time or everything at once.
+const KO_SCOPES = {
+    all: '전부',
+    saga: '지금까지의 이야기',
+    cast: '등장인물',
+    timeline: '타임라인',
+    ledger: '기록부',
+    hooks: '복선',
+    wiki: '위키',
+};
+
+function koScopeCount(memory, scope) {
+    switch (scope) {
+        case 'saga': return memory.saga.text.trim() ? 1 : 0;
+        case 'cast': return (memory.cast || []).filter(m => m.name && (m.core || m.speech || m.growth.length)).length;
+        case 'timeline': return memory.timeline.length;
+        case 'ledger': return memory.ledger.entries.filter(e => e.status !== 'closed').length;
+        case 'hooks': return (memory.hooks || []).filter(h => h.status !== 'resolved').length;
+        case 'wiki': return memory.wiki?.pages?.length || 0;
+        default: return Object.keys(KO_SCOPES).filter(k => k !== 'all').reduce((n, k) => n + koScopeCount(memory, k), 0);
+    }
+}
+
+// Collect the translatable strings of the chosen part(s) in order, and a renderer for the result.
+function koreanViewParts(memory, scope = 'all') {
+    const want = (k) => scope === 'all' || scope === k;
     const jobs = [];
     const push = (t) => { jobs.push(String(t ?? '')); return jobs.length - 1; };
-    const saga = memory.saga.text.trim() ? push(memory.saga.text.trim()) : -1;
-    const nodes = memory.timeline.map(n => ({ tier: n.tier, from: n.from, to: n.to, when: n.when ? push(n.when) : -1, title: push(n.title), text: push(n.text) }));
-    const hooks = (memory.hooks || []).filter(h => h.status !== 'resolved').map(h => push(h.text));
-    const cast = (memory.cast || []).filter(m => m.name && (m.core || m.speech || m.growth.length)).map(m => ({
+    const saga = want('saga') && memory.saga.text.trim() ? push(memory.saga.text.trim()) : -1;
+    const nodes = want('timeline') ? memory.timeline.map(n => ({ tier: n.tier, from: n.from, to: n.to, when: n.when ? push(n.when) : -1, title: push(n.title), text: push(n.text) })) : [];
+    const hooks = want('hooks') ? (memory.hooks || []).filter(h => h.status !== 'resolved').map(h => push(h.text)) : [];
+    const cast = want('cast') ? (memory.cast || []).filter(m => m.name && (m.core || m.speech || m.growth.length)).map(m => ({
         name: m.name,
         core: m.core ? push(m.core) : -1,
         speech: m.speech ? push(m.speech) : -1,
         growth: m.growth.map(g => push(g.text)),
-    }));
-    const entries = memory.ledger.entries.filter(e => e.status !== 'closed').map(e => ({
+    })) : [];
+    const entries = want('ledger') ? memory.ledger.entries.filter(e => e.status !== 'closed').map(e => ({
         cat: CATEGORIES[e.cat] || e.cat, key: e.key, value: push(e.value),
-    }));
-    const wiki = (memory.wiki?.pages || []).map(pg => ({
+    })) : [];
+    const wiki = want('wiki') ? (memory.wiki?.pages || []).map(pg => ({
         type: WIKI_TYPES[pg.type] || pg.type, title: pg.title,
         summary: pg.summary ? push(pg.summary) : -1,
         details: pg.details ? push(pg.details) : -1,
         status: pg.status ? push(pg.status) : -1,
-    }));
+    })) : [];
     const render = (tr) => {
         const g = (i) => (i >= 0 ? esc(tr[i]) : '');
         const timelineHtml = nodes.map(n => `<article class="lm-ko-node"><header><span class="lm-chip lm-chip-${n.tier === 'chapter' ? 'chapter' : 'episode'}">${n.tier === 'chapter' ? '챕터' : '에피소드'}</span><b>${g(n.title)}</b><span class="lm-range">${n.from === -1 ? '이전 채팅' : n.from < 0 ? '원본 삭제됨' : `#${n.from}~#${n.to}`}${n.when >= 0 ? ` · ${g(n.when)}` : ''}</span></header><p>${g(n.text).replace(/\n/g, '<br>')}</p></article>`).join('');
@@ -8737,13 +8937,15 @@ function koreanViewParts(memory) {
             koSection('위키', wikiHtml),
         ].filter(Boolean).join('') || '<div class="lm-empty">한국어로 옮길 내용이 없어요.</div>';
     };
-    return { jobs, render };
+    return { jobs, render, scope, sig: hashString(`${scope}\u0002${jobs.join('\u0001')}`) };
 }
 
 // Finished translations are kept per chat in the browser (not in the chat file, which would grow
 // with every copy), newest first, so a past translation opens instantly with the time it was made.
+// Up to five per part (전부, 위키, ...).
 const KO_SAVED_MAX = 5;
 const koSavedKey = (chatId) => `lm_ko_saved:${chatId}`;
+const koScopeOf = (v) => v.scope || 'all';
 
 async function loadKoSaved(chatId = ctx().getCurrentChatId()) {
     try { return (await store()?.getItem(koSavedKey(chatId))) || []; } catch { return []; }
@@ -8752,8 +8954,9 @@ async function loadKoSaved(chatId = ctx().getCurrentChatId()) {
 async function saveKoVersion(chatId, version) {
     const st = store();
     if (!st) return [];
-    let list = await loadKoSaved(chatId);
-    list = [version, ...list.filter(v => v.sig !== version.sig)].slice(0, KO_SAVED_MAX);
+    const all = await loadKoSaved(chatId);
+    const same = [version, ...all.filter(v => koScopeOf(v) === koScopeOf(version) && v.sig !== version.sig)].slice(0, KO_SAVED_MAX);
+    const list = [...same, ...all.filter(v => koScopeOf(v) !== koScopeOf(version))].sort((a, b) => b.at - a.at);
     try { await st.setItem(koSavedKey(chatId), list); } catch (err) { console.warn(LOG_PREFIX, 'save translation', err); }
     return list;
 }
@@ -8769,12 +8972,12 @@ function koStamp(at) {
     return `${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일 ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
-// The read-only Korean window. With saved versions it gets a picker: which translation, made when,
-// and whether the memory changed since.
-function showKoreanView(html, failed = 0, { versions = [], currentSig = '', chatId = ctx().getCurrentChatId(), onRetranslate = null, pickAt = null } = {}) {
+// The read-only Korean window. With saved versions it gets a picker: which translation of this
+// part, made when, and whether the memory changed since.
+function showKoreanView(html, failed = 0, { versions = [], currentSig = '', chatId = ctx().getCurrentChatId(), onRetranslate = null, pickAt = null, scope = 'all' } = {}) {
     const c = ctx();
     const wrap = document.createElement('div');
-    wrap.innerHTML = `<div class="lm-root lm-manager lm-ko-view"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>한국어로 보기</h3></div>
+    wrap.innerHTML = `<div class="lm-root lm-manager lm-ko-view"><div class="lm-manager-head"><h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>한국어로 보기${scope !== 'all' ? ` <span class="lm-chip">${esc(KO_SCOPES[scope] || scope)}</span>` : ''}</h3></div>
   <div class="lm-ko-bar"></div>
   <p class="lm-hint lm-pane-intro"></p>
   <div id="lm_ko_body"></div></div>`;
@@ -8782,8 +8985,10 @@ function showKoreanView(html, failed = 0, { versions = [], currentSig = '', chat
     const bar = wrap.querySelector('.lm-ko-bar');
     const intro = wrap.querySelector('.lm-pane-intro');
     const body = wrap.querySelector('#lm_ko_body');
-    let list = versions;
+    let list = versions.filter(v => koScopeOf(v) === scope);
+    let shownAt = null;
     const show = (v) => {
+        shownAt = v?.at || null;
         body.innerHTML = v ? v.html : html;
         const f = v ? v.failed : failed;
         const stale = v && currentSig && v.sig !== currentSig;
@@ -8799,6 +9004,8 @@ function showKoreanView(html, failed = 0, { versions = [], currentSig = '', chat
     const renderBar = () => {
         bar.innerHTML = `${list.length ? `<label class="lm-ko-pick"><span>저장된 번역본</span><select class="text_pole lm-quiet" id="lm_ko_ver">${list.map(v => `<option value="${v.at}">${koStamp(v.at)}${currentSig && v.sig === currentSig ? ' · 최신' : ''}</option>`).join('')}</select></label>` : ''}
           <span class="lm-spacer"></span>
+          <button type="button" class="lm-toolbtn" id="lm_ko_html" title="보기 좋게 꾸민 웹 문서로 저장해요. 휴대폰·PC 브라우저에서 바로 열려요">${icon('download')}<span>파일로 저장</span></button>
+          <button type="button" class="lm-toolbtn" id="lm_ko_md" title="글자만 담은 마크다운(.md) 파일로 저장해요">${icon('download')}<span>.md</span></button>
           ${onRetranslate ? `<button type="button" class="lm-toolbtn" id="lm_ko_new">${icon('sparkle')}<span>지금 기억으로 새로 번역</span></button>` : ''}
           ${list.length ? `<button type="button" class="lm-toolbtn lm-danger" id="lm_ko_del" title="이 번역본 지우기">${icon('trash')}</button>` : ''}`;
     };
@@ -8809,16 +9016,23 @@ function showKoreanView(html, failed = 0, { versions = [], currentSig = '', chat
         show(list.find(v => v.at === Number(e.target.value)));
     });
     bar.addEventListener('click', async (e) => {
+        const exp = e.target.closest('#lm_ko_html, #lm_ko_md');
+        if (exp) {
+            const at = shownAt || Date.now();
+            const name = `elephant-ko-${scope}-${fileSafe(c.getCurrentChatId())}-${koFileStamp(at)}`;
+            if (exp.id === 'lm_ko_html') downloadFile(`${name}.html`, koExportHtml(body.innerHTML, { scope, at, chat: c.getCurrentChatId() }), 'text/html');
+            else downloadFile(`${name}.md`, koExportMd(body, { scope, at, chat: c.getCurrentChatId() }), 'text/markdown');
+            return;
+        }
         if (e.target.closest('#lm_ko_new')) {
             e.target.closest('#lm_ko_new').disabled = true;
             onRetranslate?.();
-            toastr.info('새로 번역하기 시작했어요. 창을 닫고 채팅해도 돼요. 다 되면 알려줄게요.', APP_NAME, { timeOut: 5000 });
             return;
         }
         if (e.target.closest('#lm_ko_del')) {
             const at = Number(bar.querySelector('#lm_ko_ver')?.value);
             if (!at || !await c.Popup.show.confirm('번역본 지우기', `${koStamp(at)}에 저장한 번역본을 지울까요? 기억은 그대로예요.`)) return;
-            list = await deleteKoVersion(chatId, at);
+            list = (await deleteKoVersion(chatId, at)).filter(v => koScopeOf(v) === scope);
             renderBar();
             show(list[0] || null);
             if (!list.length) body.innerHTML = '<div class="lm-empty">저장된 번역본이 없어요. "지금 기억으로 새로 번역"을 눌러 주세요.</div>';
@@ -8828,77 +9042,189 @@ function showKoreanView(html, failed = 0, { versions = [], currentSig = '', chat
 }
 
 // The translation runs in the background, not behind a window: a popup in SillyTavern blocks the
-// chat, so waiting inside one meant no chatting until every summary was translated. Now the
-// window opens only once the text is ready (instantly when it was translated or saved before).
+// chat, so waiting inside one meant no chatting until every summary was translated. While it runs,
+// a small notice stays in the corner with the progress (and the 한국어로 보기 button says so), so
+// it is clear something is happening; the chat stays usable the whole time.
 let koJob = null;
 
-function startKoreanJob(parts, chatId, sig) {
+function koFileStamp(at) {
+    const d = new Date(at);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+// A standalone page that reads well on a phone or a PC: light and dark, comfortable line length,
+// a contents row at the top.
+function koExportHtml(bodyHtml, { scope = 'all', at = Date.now(), chat = '' } = {}) {
+    const part = scope === 'all' ? '기억 전부' : KO_SCOPES[scope];
+    return `<!doctype html>
+<html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(`${part} · ${chat || '채팅'}`)}</title>
+<style>
+:root { --bg:#FBF8F2; --card:#FFFFFF; --ink:#24212B; --muted:#6B6675; --line:#E7E1D6; --accent:#9A6B2E; --chip:#F3ECDF; }
+@media (prefers-color-scheme: dark) { :root { --bg:#18171C; --card:#222128; --ink:#EEEAE3; --muted:#ADA8B6; --line:#34323C; --accent:#E2B565; --chip:#2C2A33; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.75 "Pretendard", "Apple SD Gothic Neo", "Noto Sans KR", "Malgun Gothic", system-ui, sans-serif; word-break: keep-all; overflow-wrap: anywhere; }
+main { max-width: 760px; margin: 0 auto; padding: 32px 18px 64px; }
+header.top { margin-bottom: 28px; padding-bottom: 16px; border-bottom: 2px solid var(--line); }
+header.top h1 { margin: 0 0 6px; font-size: 26px; line-height: 1.3; letter-spacing: -0.02em; }
+header.top p { margin: 0; color: var(--muted); font-size: 14px; }
+nav { display: flex; flex-wrap: wrap; gap: 6px; margin: 14px 0 0; }
+nav a { padding: 3px 12px; border-radius: 999px; background: var(--chip); color: var(--ink); text-decoration: none; font-size: 13px; }
+.lm-ko-sec { margin: 0 0 36px; scroll-margin-top: 16px; }
+.lm-ko-sec h4 { margin: 0 0 12px; font-size: 20px; letter-spacing: -0.02em; color: var(--accent); }
+.lm-ko-node { margin: 0 0 10px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 14px; background: var(--card); }
+.lm-ko-node header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; margin-bottom: 4px; }
+.lm-ko-node b { font-size: 17px; }
+.lm-ko-node p { margin: 6px 0 0; }
+.lm-chip { display: inline-block; padding: 0 9px; border-radius: 999px; background: var(--chip); color: var(--muted); font-size: 12px; font-weight: 600; }
+.lm-range { color: var(--muted); font-size: 13px; }
+.lm-hint { color: var(--muted); font-size: 14px; }
+.lm-ko-list { margin: 0; padding: 0; list-style: none; }
+.lm-ko-list li { padding: 10px 2px; border-bottom: 1px dashed var(--line); }
+.lm-empty { color: var(--muted); }
+footer { margin-top: 40px; color: var(--muted); font-size: 12.5px; }
+@media print { body { background: #fff; color: #000; } .lm-ko-node { break-inside: avoid; } nav { display: none; } }
+</style></head>
+<body><main>
+<header class="top"><h1>${esc(part)}</h1><p>${esc(chat)} · ${esc(koStamp(at))}에 번역 · 읽기용 번역본이에요. 원래 기억은 바뀌지 않았어요.</p><nav id="toc"></nav></header>
+${bodyHtml}
+<footer>코끼리를 생각하지마 · 한국어로 보기에서 저장</footer>
+</main>
+<script>
+document.querySelectorAll('.lm-ko-sec').forEach(function (sec, i) {
+  var h = sec.querySelector('h4'); if (!h) return; sec.id = 'sec' + i;
+  var a = document.createElement('a'); a.href = '#sec' + i; a.textContent = h.textContent; document.getElementById('toc').appendChild(a);
+});
+</script>
+</body></html>`;
+}
+
+// Text version of what the window shows: section headings, one heading per card, list items.
+function koExportMd(root, { scope = 'all', at = Date.now(), chat = '' } = {}) {
+    const part = scope === 'all' ? '기억 전부' : KO_SCOPES[scope];
+    const out = [`# ${part} (한국어)`, '', `${chat} · ${koStamp(at)}에 번역 · 읽기용 번역본`, ''];
+    const text = (el) => String(el?.textContent ?? '').replace(/[ \t]+/g, ' ').trim();
+    const para = (el) => String(el?.innerHTML ?? '').replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").trim();
+    root.querySelectorAll('.lm-ko-sec').forEach(sec => {
+        out.push(`## ${text(sec.querySelector('h4'))}`, '');
+        sec.querySelectorAll(':scope > p').forEach(p => out.push(para(p), ''));
+        sec.querySelectorAll('.lm-ko-node').forEach(node => {
+            const head = node.querySelector('header');
+            const title = text(node.querySelector('b'));
+            const extra = head ? [...(head.children || [])].filter(el => el.tagName !== 'B').map(text).filter(Boolean) : [];
+            out.push(`### ${title}${extra.length ? ` (${extra.join(' · ')})` : ''}`, '');
+            node.querySelectorAll('p').forEach(p => out.push(para(p), ''));
+        });
+        sec.querySelectorAll('.lm-ko-list li').forEach(li => out.push(`- ${text(li)}`));
+        out.push('');
+    });
+    return out.join('\n').replace(/\n{3,}/g, '\n\n');
+}
+
+function koProgressText() {
+    if (!koJob) return '';
+    const part = koJob.scope === 'all' ? '기억 전부' : KO_SCOPES[koJob.scope];
+    const code = part.charCodeAt(part.length - 1) - 0xAC00;
+    const obj = code >= 0 && code <= 11171 && code % 28 ? '을' : '를';
+    return `${part}${obj} 한국어로 옮기는 중이에요${koJob.total > 1 ? ` (${koJob.step}/${koJob.total})` : '…'} 그동안 채팅해도 돼요.`;
+}
+
+function updateKoProgress() {
+    if (!koJob) return;
+    const text = koProgressText();
+    try { koJob.toast?.find?.('.toast-message')?.text(text); } catch { /* toast gone */ }
+    document.querySelectorAll('.lm-ko-state').forEach(el => {
+        el.textContent = `번역 중${koJob.total > 1 ? ` ${koJob.step}/${koJob.total}` : '…'}`;
+        el.hidden = false;
+    });
+}
+
+function startKoreanJob(parts, chatId) {
     if (koJob) return;
-    koJob = { step: 0, total: 0, chatId };
+    const { sig, scope } = parts;
+    koJob = { step: 0, total: 0, chatId, scope, toast: null };
     translateBusy = true;
-    logActivity('model', '한국어로 보기: 번역 시작');
+    koJob.toast = toastr.info(koProgressText(), APP_NAME, { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false, closeButton: false });
+    updateKoProgress();
+    logActivity('model', `한국어로 보기(${KO_SCOPES[scope]}): 번역 시작`);
     (async () => {
         try {
-            const tr = await translateTexts(parts.jobs, 'Korean', { onProgress: (i, n) => { koJob.step = i; koJob.total = n; } });
+            const tr = await translateTexts(parts.jobs, 'Korean', { onProgress: (i, n) => { koJob.step = i; koJob.total = n; updateKoProgress(); } });
             const html = parts.render(tr);
             const failed = tr.failed || 0;
             const at = Date.now();
-            const versions = await saveKoVersion(chatId, { at, sig, html, failed });
-            logActivity('model', `한국어로 보기: 번역 끝${failed ? ` (${failed}개 실패)` : ''}, ${koStamp(at)}에 저장`);
-            if (ctx().getCurrentChatId() !== chatId) return;
-            toastr.success(`한국어 번역이 끝나서 저장했어요${failed ? ` (${failed}개는 원문)` : ''}. 여기를 누르면 열려요.`, APP_NAME, {
-                timeOut: 20000,
-                extendedTimeOut: 10000,
-                onclick: () => showKoreanView(html, failed, { versions, currentSig: sig, chatId, pickAt: at, onRetranslate: () => retranslateKorean() }),
-            });
+            const versions = await saveKoVersion(chatId, { at, sig, html, failed, scope });
+            logActivity('model', `한국어로 보기(${KO_SCOPES[scope]}): 번역 끝${failed ? ` (${failed}개 실패)` : ''}, ${koStamp(at)}에 저장`);
+            if (ctx().getCurrentChatId() !== chatId) {
+                toastr.success('한국어 번역이 끝나서 저장했어요. 그 채팅에서 \'한국어로 보기\'를 누르면 바로 열려요.', APP_NAME, { timeOut: 8000 });
+                return;
+            }
+            toastr.success(`${scope === 'all' ? '' : `${KO_SCOPES[scope]} `}한국어 번역이 끝나서 저장했어요${failed ? ` (${failed}개는 원문)` : ''}.`, APP_NAME, { timeOut: 4000 });
+            // Open it right away; the chat is usable again as soon as the window is closed.
+            showKoreanView(html, failed, { versions, currentSig: sig, chatId, pickAt: at, scope, onRetranslate: () => retranslateKorean(scope) });
         } catch (err) {
             if (String(err?.message) === 'aborted') toastr.info('한국어 번역을 멈췄어요. 다시 누르면 남은 부분만 이어서 번역해요.', APP_NAME);
             else reportError('한국어 번역 실패', err);
         } finally {
+            try { if (koJob?.toast) toastr.clear(koJob.toast); } catch { /* ignore */ }
             koJob = null;
             translateBusy = false;
+            document.querySelectorAll('.lm-ko-state').forEach(el => { el.hidden = true; });
         }
     })();
 }
 
-// "Translate again": forget the cached copies of this memory's texts so changed wording is redone.
-function retranslateKorean() {
+// "Translate again": forget the cached copies of this part's texts so changed wording is redone.
+function retranslateKorean(scope = 'all') {
     const memory = getMemory(false);
     if (!memory) return;
-    const parts = koreanViewParts(memory);
+    if (koJob) return toastr.info(koProgressText(), APP_NAME);
+    const parts = koreanViewParts(memory, scope);
     for (const t of parts.jobs) TRANSLATE_CACHE.delete(`Korean\u0000${t}`);
-    startKoreanJob(parts, ctx().getCurrentChatId(), hashString(parts.jobs.join('\u0001')));
+    startKoreanJob(parts, ctx().getCurrentChatId());
 }
 
-async function openKoreanView(memory) {
-    if (!hasContent(memory) && !(memory.wiki?.pages?.length) && !(memory.cast?.length)) {
-        return toastr.info('아직 한국어로 볼 기억이 없어요.');
+async function openKoreanView(memory, scope = 'all') {
+    if (!KO_SCOPES[scope]) scope = 'all';
+    if (!koScopeCount(memory, scope)) {
+        return toastr.info(scope === 'all' ? '아직 한국어로 볼 기억이 없어요.' : `${KO_SCOPES[scope]}에 아직 내용이 없어요.`);
     }
-    if (koJob) {
-        return toastr.info(`한국어로 옮기는 중이에요${koJob.total > 1 ? ` (${koJob.step}/${koJob.total})` : ''}. 끝나면 알려줄게요. 그동안 채팅해도 돼요.`, APP_NAME);
-    }
+    if (koJob) return toastr.info(koProgressText(), APP_NAME);
     const chatId = ctx().getCurrentChatId();
-    const parts = koreanViewParts(memory);
-    const sig = hashString(parts.jobs.join('\u0001'));
-    let versions = await loadKoSaved(chatId);
-    const retranslate = () => retranslateKorean();
+    const parts = koreanViewParts(memory, scope);
+    const sig = parts.sig;
+    let versions = (await loadKoSaved(chatId));
+    const mine = () => versions.filter(v => koScopeOf(v) === scope);
+    const retranslate = () => retranslateKorean(scope);
     // Everything already translated this session: show it now, and keep a dated copy.
     const ready = await translateTexts(parts.jobs, 'Korean', { cacheOnly: true });
     if (ready) {
         const html = parts.render(ready);
-        let pickAt = versions.find(v => v.sig === sig)?.at || null;
-        if (!pickAt) { pickAt = Date.now(); versions = await saveKoVersion(chatId, { at: pickAt, sig, html, failed: ready.failed || 0 }); }
-        return showKoreanView(html, 0, { versions, currentSig: sig, chatId, pickAt, onRetranslate: retranslate });
+        let pickAt = mine().find(v => v.sig === sig)?.at || null;
+        if (!pickAt) { pickAt = Date.now(); versions = await saveKoVersion(chatId, { at: pickAt, sig, html, failed: ready.failed || 0, scope }); }
+        return showKoreanView(html, 0, { versions, currentSig: sig, chatId, pickAt, scope, onRetranslate: retranslate });
     }
-    // A saved translation exists: open it right away (newest matching one first). Only start a new
-    // translation when the memory changed and the user asks, or nothing was saved yet.
-    if (versions.length) {
-        const match = versions.find(v => v.sig === sig);
+    // A saved translation of this part exists: open it right away (the one matching the current
+    // memory first). Only translate again when the memory changed and the user asks.
+    if (mine().length) {
+        const match = mine().find(v => v.sig === sig);
         if (!match) toastr.info('저장된 번역본을 먼저 보여줄게요. 그 뒤로 기억이 바뀌었으면 "지금 기억으로 새로 번역"을 누르세요.', APP_NAME, { timeOut: 6000 });
-        return showKoreanView('', 0, { versions, currentSig: sig, chatId, pickAt: (match || versions[0]).at, onRetranslate: () => startKoreanJob(parts, chatId, sig) });
+        return showKoreanView('', 0, { versions, currentSig: sig, chatId, pickAt: (match || mine()[0]).at, scope, onRetranslate: () => startKoreanJob(parts, chatId) });
     }
-    toastr.info('기억을 한국어로 옮기기 시작했어요. 창을 닫고 채팅해도 돼요. 다 되면 알려줄게요.', APP_NAME, { timeOut: 5000 });
-    startKoreanJob(parts, chatId, sig);
+    startKoreanJob(parts, chatId);
+}
+
+// The 한국어로 보기 button in the 기억장 header: everything, or one part.
+function koMenuHtml(memory) {
+    const items = Object.entries(KO_SCOPES).map(([k, label]) => {
+        const n = koScopeCount(memory, k);
+        return `<button type="button" class="lm-toolbtn" data-ko-scope="${k}" ${n ? '' : 'disabled'}>${k === 'all' ? icon('wiki') : '<span class="lm-ko-dot" aria-hidden="true"></span>'}<span>${esc(label)}</span>${k === 'all' ? '' : `<span class="lm-count">${n}</span>`}</button>${k === 'all' ? '<hr>' : ''}`;
+    }).join('');
+    return `<details class="lm-menu lm-ko-menu">
+        <summary class="lm-toolbtn" title="요약·기록·위키를 한국어로 번역해서 읽어요. 저장된 기억은 그대로예요">${icon('wiki')}<span>한국어로 보기</span><span class="lm-ko-state lm-chip" ${koJob ? '' : 'hidden'}>${koJob ? `번역 중${koJob.total > 1 ? ` ${koJob.step}/${koJob.total}` : '…'}` : ''}</span></summary>
+        <div class="lm-menu-list" role="menu"><p class="lm-menu-cap">무엇을 한국어로 볼까요?</p>${items}</div>
+      </details>`;
 }
 
 function managerHtml(memory) {
@@ -8924,7 +9250,7 @@ function managerHtml(memory) {
   <div class="lm-manager-head">
     <h3><span class="lm-mascot lm-mascot-sm">${ELEPHANT_SVG}</span>코끼리의 기억장</h3>
     <div class="lm-manager-tools">
-      ${tool('lm_ko', 'wiki', '한국어로 보기', '', '요약·기록·위키를 한국어로 번역해서 읽어요. 저장된 기억은 그대로예요')}
+      ${koMenuHtml(memory)}
       ${tool('lm_backups', 'backup', '백업')}
       <details class="lm-menu">
         <summary class="lm-toolbtn" aria-label="더보기"><span class="lm-dots" aria-hidden="true">⋯</span><span>더보기</span></summary>
@@ -9075,6 +9401,7 @@ function managerHtml(memory) {
       ${tool('lm_wiki_build', 'sparkle', wikiPages.length ? '위키 새로 정리' : '위키 만들기', 'lm-toolbtn-accent')}
       ${tool('lm_wiki_md', 'download', '.md')}
       ${tool('lm_wiki_html', 'download', '.html')}
+      ${wikiPages.length && needsTranslation(memory) ? `<button type="button" class="lm-toolbtn" data-ko-scope="wiki" title="위키만 한국어로 번역해서 읽어요">${icon('wiki')}<span>한국어로</span></button>` : ''}
       ${wikiPages.length ? tool('lm_wiki_reset', 'reset', '위키 초기화', 'lm-toolbtn-danger', '위키 문서를 모두 지워요. 기록부와 사건은 그대로예요') : ''}
     </div>
     <p class="lm-hint lm-pane-intro">기록부와 사건을 바탕으로 인물, 장소, 물건을 문서로 정리해요.${memory.wiki?.updatedAt ? ` 마지막 정리: ${new Date(memory.wiki.updatedAt).toLocaleString()}` : ''}</p>
@@ -9439,6 +9766,12 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
         }
         const menu = root.querySelector('.lm-menu');
         if (menu?.open && !event.target.closest('.lm-menu > summary')) menu.open = false;
+        const koPick = event.target.closest('[data-ko-scope]');
+        if (koPick) {
+            koPick.closest('details')?.removeAttribute('open');
+            await openKoreanView(collectManager(root, memory), koPick.dataset.koScope);
+            return;
+        }
         const tool = event.target.closest('#lm_ko, #lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_wiki_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_ttable, #lm_tgraph, #lm_relmap, #lm_statuslog, #lm_verify, #lm_canon_pick, .lm-canon-del');
         if (!tool) return;
         if (tool.classList.contains('lm-canon-del')) {
