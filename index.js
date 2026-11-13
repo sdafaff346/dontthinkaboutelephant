@@ -5853,6 +5853,14 @@ function onDocumentClick(event) {
     else openManager({ focusOwner: ctx().chat[id]?.extra?.lm_owner });
 }
 
+function isPendingBackgroundReply(id) {
+    const msg = ctx().chat[id];
+    if (!msg) return false;
+    if (msg.extra?.bg_reply) return true;
+    const info = Array.isArray(msg.swipe_info) ? msg.swipe_info[Number(msg.swipe_id ?? 0)] : null;
+    return !!info?.extra?.bg_reply;
+}
+
 function onMessageReceived(id, type) {
     runDeferredSync();
     // A new swipe starts from a copy of the previous swipe's extra, so that swipe's warning and
@@ -5863,6 +5871,10 @@ function onMessageReceived(id, type) {
     updateStatus();
     decorateMessage(Number(id));
     if (['quiet', 'impersonate', 'first_message'].includes(type)) return;
+    // Background Reply (ST-Background-Reply): when the user leaves a chat mid-reply, SillyTavern
+    // still "receives" the partial text, marked extra.bg_reply. The full reply arrives later with
+    // its own MESSAGE_RECEIVED, so checking, live updates and auto-compress wait for that one.
+    if (isPendingBackgroundReply(Number(id))) return;
     try { if (tagQrMessage(Number(id), type)) return; } catch (err) { console.warn(LOG_PREFIX, 'qr tag failed', err); }
     try { latestStatus(); } catch (err) { console.warn(LOG_PREFIX, 'status bar read failed', err); }
     maybeAutoCompress();
