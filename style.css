@@ -18,8 +18,9 @@
     --lm-accent: #A9773A;
     --lm-accent-ink: #855B26;
     --lm-accent-soft: #F5EBDD;
-    --lm-primary: #26242E;
-    --lm-on-primary: #FAF8F3;
+    /* Main action buttons (압축 and friends): warm brown, same family as the bronze accent. */
+    --lm-primary: #8C5A2E;
+    --lm-on-primary: #FFF9EF;
     --lm-elephant: #8E98AE;
     --lm-elephant-deep: #555E75;
     --lm-sage: #87A27F;
@@ -61,8 +62,8 @@
     --lm-accent: #D3A45F;
     --lm-accent-ink: #E2BA7D;
     --lm-accent-soft: #382D20;
-    --lm-primary: #ECE8E1;
-    --lm-on-primary: #19181D;
+    --lm-primary: #946638;
+    --lm-on-primary: #FFF7EA;
     --lm-elephant: #A6AEC3;
     --lm-elephant-deep: #CBD0DD;
     --lm-sage: #9FBB95;
@@ -2281,3 +2282,19 @@
 .lm-menu-list .lm-toolbtn .lm-count { margin-left: auto; }
 .lm-menu-list .lm-toolbtn:disabled { opacity: 0.45; }
 .lm-ko-dot { flex: 0 0 auto; width: 6px; height: 6px; margin: 0 5px; border-radius: 50%; background: var(--lm-accent); opacity: 0.6; }
+
+/* Reduced motion: nothing moves, but a job in progress still shows itself with a slow fade
+   (a change of brightness, not movement), so "is it still working?" stays answerable. */
+@keyframes lm-fade-busy { 50% { opacity: 0.4; } }
+@media (prefers-reduced-motion: reduce) {
+    .lm-root .lm-live-busy .lm-dot,
+    .lm-live-busy .lm-dot,
+    .lm-root.lm-busy .lm-head .lm-mascot svg,
+    .lm-check-held.fa-hourglass-half { animation: lm-fade-busy 2.4s ease-in-out infinite !important; }
+    .lm-root .lm-progress.active,
+    .lm-progress.active {
+        background-image: none;
+        background-color: color-mix(in srgb, var(--lm-accent) 12%, transparent);
+        animation: lm-fade-busy 2.4s ease-in-out infinite !important;
+    }
+}

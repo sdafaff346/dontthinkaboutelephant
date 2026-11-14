@@ -435,6 +435,16 @@ function getMemory(create = true) {
     for (const key of Object.keys(base)) {
         if (!Object.hasOwn(memory, key)) memory[key] = base[key];
     }
+    // Imported or hand-edited memories can carry null or the wrong shape; fix those before any code reads them.
+    for (const key of ['timeline', 'archive', 'events', 'hiddenRanges', 'history', 'qna', 'merged']) {
+        if (!Array.isArray(memory[key])) memory[key] = [];
+    }
+    if (!memory.saga || typeof memory.saga !== 'object') memory.saga = base.saga;
+    if (!memory.ledger || typeof memory.ledger !== 'object') memory.ledger = base.ledger;
+    if (!memory.wiki || typeof memory.wiki !== 'object') memory.wiki = base.wiki;
+    if (!Array.isArray(memory.wiki.pages)) memory.wiki.pages = [];
+    if (!memory.canon || typeof memory.canon !== 'object') memory.canon = base.canon;
+    if (!Array.isArray(memory.canon.facts)) memory.canon.facts = [];
     memory.frame = { ...emptyFrame(), ...memory.frame };
     memory.ledger.scene = { ...base.ledger.scene, ...memory.ledger.scene };
     if (!Array.isArray(memory.ledger.entries)) memory.ledger.entries = [];
@@ -478,16 +488,6 @@ function estTokens(str) {
         if ((c >= 0x3000 && c <= 0x9fff) || (c >= 0xac00 && c <= 0xd7af) || (c >= 0xf900 && c <= 0xfaff)) cjk++;
     }
     return Math.ceil(cjk * 1.1 + (str.length - cjk) / 3.5);
-}
-
-async function countTokens(str) {
-    try {
-        const { getTokenCountAsync } = ctx();
-        if (typeof getTokenCountAsync === 'function') return await getTokenCountAsync(str);
-    } catch (err) {
-        console.debug(LOG_PREFIX, 'token count fallback', err);
-    }
-    return estTokens(str);
 }
 
 // ---------------------------------------------------------------- hidden ranges
@@ -2082,7 +2082,9 @@ function canonIndex(memory) {
 }
 
 function validCanon(memory) {
-    const ids = new Set(['saga', ...memory.timeline.map(n => n.id), ...memory.archive.map(a => a.id)]);
+    // Archived summaries count only while they still belong to a chapter, the story-so-far or a
+    // shortened episode. One archived with no owner was taken out (rewind), so its facts go too.
+    const ids = new Set(['saga', ...memory.timeline.map(n => n.id), ...memory.archive.filter(a => a.ownerId).map(a => a.id)]);
     return (memory.canon?.facts || []).filter(f => f?.text && Array.isArray(f.cites) && f.cites.some(id => ids.has(id)));
 }
 
@@ -2318,6 +2320,8 @@ function buildNowText(memory) {
     }
     const threads = memory.ledger.entries.filter(e => e.cat === 'thread' && e.status !== 'closed').sort((a, b) => b.importance - a.importance).slice(0, 6).map(e => e.key);
     if (threads.length) lines.push(`Open threads: ${threads.join('; ')}`);
+    const divergences = memory.ledger.entries.filter(e => e.cat === 'divergence').slice(0, 4).map(e => e.key);
+    if (divergences.length) lines.push(`Story overrides canon on: ${divergences.join('; ')}`);
     if (!lines.length) return '';
     return `[Now: stay consistent with <story_memory>]\n${lines.join('\n')}`;
 }
@@ -7600,7 +7604,7 @@ function settingsHtml() {
           ${checkRow('indexAllMessages', '숨긴 메시지까지 전부 색인', '요약 여부와 상관없이, 숨김 처리된 메시지까지 모든 원본 대사를 검색 대상에 넣어요 (최근 원본은 빼고)')}
           ${group('임베딩', '의미 검색에 쓸 모델')}
           ${selectRow('embedSource', '임베딩 소스', selectOptions(EMBED_SOURCES, s.embedSource), s.embedSource, 'API 키는 ST의 API 연결 화면에 저장된 것을 써요')}
-          ${textRow('embedModel', '임베딩 모델', '비우면 ST 벡터 저장소 설정을 따라가요. Google AI Studio는 gemini-embedding-001, Vertex는 text-embedding-005가 안정적이에요', '예: gemini-embedding-001')}
+          ${textRow('embedModel', '임베딩 모델', '비우면 ST 벡터 저장소 설정을 따라가요. Google AI Studio는 gemini-embedding-001, Vertex는 text-embedding-005가 안정적이에요. NanoGPT는 한국어에 강한 BAAI/bge-m3를 권해요', '예: gemini-embedding-001')}
           <div class="lm-actions lm-actions-inline">
             <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_reindex">${icon('db')}<span>전체 색인</span></button>
             <button type="button" class="menu_button lm-btn lm-btn-quiet" id="lm_btn_embed_test">${icon('plug')}<span>임베딩 테스트</span></button>
@@ -7620,7 +7624,8 @@ function settingsHtml() {
             ${numberRow('rawChunkChars', '원본 묶음 최대 글자', 200, 20000)}
             ${numberRow('eventMax', '사건 최대 보관', 10, 1000000)}
             ${numberRow('queryTimeoutMs', '검색 시간 제한', 500, 120000, '넘으면 키워드 검색 결과만 써요')}
-            ${numberRow('expansionTimeoutMs', '검색어 확장 시간 제한', 1000, 120000)}`)}
+            ${numberRow('expansionTimeoutMs', '검색어 확장 시간 제한', 1000, 120000)}
+            ${numberRow('qnaTopK', '질문에 참고할 기억 수', 1, 50, '기억장 → 질문에서 답을 찾을 때 가져오는 기억 개수')}`)}
           ${resetFoot()}
         </section>
 
@@ -7656,7 +7661,9 @@ function settingsHtml() {
             ${numberRow('archiveMax', '보관함 최대 항목', 0, 100000)}
             ${numberRow('voiceKeep', '인물당 대사 샘플 보관', 1, 100, '고정한 샘플은 지우지 않아요')}
             ${numberRow('maxUndo', '되돌리기 기록', 0, 50)}
-            ${numberRow('backupKeep', '백업 보관 개수', 1, 50)}`)}
+            ${numberRow('backupKeep', '백업 보관 개수', 1, 50)}
+            ${numberRow('wikiMaxPages', '위키 최대 쪽수', 5, 500, '위키 만들기에서 정리할 인물·장소·물건의 최대 개수')}
+            ${numberRow('wikiBatch', '위키 한 번에 정리할 수', 1, 30, '줄이면 API 호출이 늘지만 한 쪽씩 더 자세해요')}`)}
           ${resetFoot()}
         </section>
 
@@ -7837,6 +7844,14 @@ function pickBundle(s) {
     return out;
 }
 
+// A drop-down setting only takes a value its menu offers; otherwise the menu would show blank.
+// When the settings panel isn't drawn yet there is nothing to check against, so the value is kept.
+function isKnownChoice(key, value) {
+    const select = document.querySelector(`select[data-lm-setting="${key}"]`);
+    if (!select) return true;
+    return [...select.options].some(o => o.value === value);
+}
+
 // Only keys we know, with the same type as the default, so an old or hand-edited file can't break settings.
 function cleanBundleValues(values) {
     const out = {};
@@ -7846,6 +7861,7 @@ function cleanBundleValues(values) {
         const d = defaultSettings[k];
         const v = values[k];
         const ok = Array.isArray(d) ? Array.isArray(v) : (d !== null && typeof d === 'object') ? (v && typeof v === 'object' && !Array.isArray(v)) : typeof v === typeof d;
+        if (ok && typeof v === 'string' && !isKnownChoice(k, v)) continue;
         if (ok) out[k] = structuredClone(v);
     }
     return out;
@@ -7910,6 +7926,22 @@ function afterBundleChange() {
     updateStatus();
 }
 
+// A drop-down whose saved value isn't one of its options (old bundle, hand-edited settings) would
+// show blank or the wrong item: put the default back so what is shown is what is used.
+function fixUnknownChoices(root) {
+    const s = getSettings();
+    let fixed = false;
+    root.querySelectorAll('select[data-lm-setting]').forEach(el => {
+        const key = el.dataset.lmSetting;
+        const value = s[key];
+        if (typeof defaultSettings[key] !== 'string' || [...el.options].some(o => o.value === value)) return;
+        s[key] = defaultSettings[key];
+        el.value = s[key];
+        fixed = true;
+    });
+    if (fixed) ctx().saveSettingsDebounced();
+}
+
 // Re-read every control in the settings panel after the values were swapped underneath it.
 function refreshSettingsInputs() {
     const root = document.getElementById('lm_settings');
@@ -7920,6 +7952,7 @@ function refreshSettingsInputs() {
         if (el.type === 'checkbox') el.checked = !!s[key];
         else el.value = s[key] ?? '';
     });
+    fixUnknownChoices(root);
     const profile = root.querySelector('#lm_profile');
     if (profile) profile.innerHTML = profileOptions(s.profileId);
     const fallback = root.querySelector('#lm_fallback');
@@ -8878,12 +8911,6 @@ function eventRow(e) {
 // on consistent text. This translates a copy to Korean for reading only; nothing is saved.
 
 const TRANSLATE_CACHE = new Map();
-let translateBusy = false;
-
-async function translateToKorean(texts) {
-    return translateTexts(texts, 'Korean');
-}
-
 // Translation for reading only. Long summaries are sent alone as plain text, short ones in
 // small numbered batches, so one long episode can no longer push a whole batch past the output
 // limit (which used to leave most of the list in English). Failures are never cached.
@@ -9274,7 +9301,6 @@ function startKoreanJob(parts, chatId) {
     if (koJob) return;
     const { sig, scope } = parts;
     koJob = { step: 0, total: 0, chatId, scope, toast: null };
-    translateBusy = true;
     koJob.toast = toastr.info(koProgressText(), APP_NAME, { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false, closeButton: false });
     updateKoProgress();
     logActivity('model', `한국어로 보기(${KO_SCOPES[scope]}): 번역 시작`);
@@ -9299,7 +9325,6 @@ function startKoreanJob(parts, chatId) {
         } finally {
             try { if (koJob?.toast) toastr.clear(koJob.toast); } catch { /* ignore */ }
             koJob = null;
-            translateBusy = false;
             document.querySelectorAll('.lm-ko-state').forEach(el => { el.hidden = true; });
         }
     })();
@@ -9895,15 +9920,16 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
             });
             return;
         }
-        const menu = root.querySelector('.lm-menu');
-        if (menu?.open && !event.target.closest('.lm-menu > summary')) menu.open = false;
+        // Close every open menu the click did not land on (there are two: 한국어로 보기 and 더보기).
+        const menuHit = event.target.closest('.lm-menu > summary')?.parentElement;
+        for (const menu of root.querySelectorAll('.lm-menu[open]')) if (menu !== menuHit) menu.open = false;
         const koPick = event.target.closest('[data-ko-scope]');
         if (koPick) {
             koPick.closest('details')?.removeAttribute('open');
             await openKoreanView(collectManager(root, memory), koPick.dataset.koScope);
             return;
         }
-        const tool = event.target.closest('#lm_ko, #lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_unhide_all, #lm_wiki_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_ttable, #lm_tgraph, #lm_relmap, #lm_statuslog, #lm_verify, #lm_canon_pick, .lm-canon-del');
+        const tool = event.target.closest('#lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_unhide_all, #lm_wiki_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_ttable, #lm_tgraph, #lm_relmap, #lm_statuslog, #lm_verify, #lm_canon_pick, .lm-canon-del');
         if (!tool) return;
         if (tool.classList.contains('lm-canon-del')) {
             const i = Number(tool.dataset.i);
@@ -9972,9 +9998,6 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
             }
             case 'lm_export':
                 await openExportMenu(() => collectManager(root, memory));
-                break;
-            case 'lm_ko':
-                await openKoreanView(collectManager(root, memory));
                 break;
             case 'lm_backups':
                 await closeThen(openBackups);
@@ -11945,6 +11968,7 @@ function mountPanel() {
         if (host && !document.getElementById('lm_settings')) {
             host.insertAdjacentHTML('beforeend', settingsHtml());
             bindSettings(document.getElementById('lm_settings'));
+            fixUnknownChoices(document.getElementById('lm_settings'));
             applySimpleView(document.getElementById('lm_settings'));
             setBusyUI(false);
             updateStatus();
