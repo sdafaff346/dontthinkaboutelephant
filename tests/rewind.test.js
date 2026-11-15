@@ -5,7 +5,7 @@ const assert = require('assert');
 const { load, makeChat } = require('./harness');
 (async () => {
     const h = load({ chat: makeChat(60) });
-    const T = h.get('({ getSettings, getMemory, runCompress, reconcileAfterDeletion, runUnhideAll, ctx })');
+    const T = h.get('({ getSettings, getMemory, runCompress, reconcileAfterDeletion, runUnhideAll, ctx, buildCorpus })');
     const s = T.getSettings();
     Object.assign(s, { vectorEnabled: false, retries: 0, voiceEnabled: false, hooksEnabled: false, keepRecent: 10, batchMessages: 20, hideSummarized: true, canonEnabled: false, autoCompact: false, previewBeforeSave: false, verifySummaries: false });
     let k = 0;
@@ -23,6 +23,9 @@ const { load, makeChat } = require('./harness');
     await T.reconcileAfterDeletion();
     assert.ok(!T.getMemory(false).timeline.some(n => n.title === lastEp.title), 'tail episode rewound');
     assert.ok(T.getMemory(false).archive.some(a => a.title === lastEp.title), 'kept in the archive');
+    const rewound = T.getMemory(false).archive.find(a => a.title === lastEp.title);
+    assert.ok(rewound.rewound, 'marked as rewound');
+    assert.ok(!T.buildCorpus(T.getMemory(false)).some(it => it.kind === 'archive' && it.display.startsWith(lastEp.title + ':')), 'not recalled');
     for (let i = lastEp.from; i <= cut; i++) assert.ok(!chat[i].is_system && !chat[i].extra.lm_hidden && !chat[i].extra.lm_owner, `#${i} visible again`);
     assert.strictEqual(T.getMemory(false).cursor, lastEp.from - 1, 'compress resumes from there');
     assert.ok(chat[lastEp.from - 1].is_system, 'earlier episodes stay hidden');

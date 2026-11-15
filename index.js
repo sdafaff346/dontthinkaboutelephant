@@ -705,6 +705,10 @@ function rewindIfTailHidden(memory) {
     if (node && node.tier === 'episode') {
         pushHistory(memory, `되감기: ${node.title}`);
         archiveNode(memory, node, 'timeline');
+        // Kept for the user to look at, but not recalled: part of it describes deleted messages,
+        // and the rest is summarized again from the messages shown below.
+        const kept = memory.archive.find(a => a.id === node.id);
+        if (kept) kept.rewound = true;
         memory.timeline = memory.timeline.filter(n => n !== node);
         memory.events = memory.events.filter(e => e.episodeId !== node.id);
         shown = chat.map((m, i) => (m?.extra?.lm_owner === node.id ? i : -1)).filter(i => i >= 0);
@@ -2433,6 +2437,7 @@ function buildCorpus(memory) {
         items.push({ hash: hashString(`ev|${e.id}|${text}`), kind: 'event', text, display: e.text, importance: e.importance || 3, from: e.from, to: e.to, when: e.when || '' });
     }
     for (const a of memory.archive || []) {
+        if (a.rewound) continue;
         const text = `${a.title}: ${a.text}${a.keywords?.length ? ` | Keywords: ${a.keywords.join(', ')}` : ''}`;
         items.push({ hash: hashString(`ar|${a.id}|${text}`), kind: 'archive', text, display: `${a.title}: ${a.text}`, importance: a.importance || 3, from: a.from, to: a.to });
     }
@@ -9502,7 +9507,7 @@ function managerHtml(memory) {
     const archive = memory.archive.slice(-100).reverse()
         .map(a => `
 <article class="lm-result lm-arch lm-item" data-archive-id="${esc(a.id)}">
-  <header>${selBox()}<span class="lm-chip lm-chip-archive">${a.kind === 'ledger' ? '기록' : '요약'}</span><span class="lm-range">${a.from === -1 ? '이전 채팅' : `#${a.from ?? '?'}~#${a.to ?? '?'}`}</span><span class="lm-spacer"></span>${deleteButton()}</header>
+  <header>${selBox()}<span class="lm-chip lm-chip-archive">${a.kind === 'ledger' ? '기록' : '요약'}</span>${a.rewound ? '<span class="lm-chip" title="지운 메시지 때문에 되감은 요약이에요. 회상에는 쓰지 않아요">되감음</span>' : ''}<span class="lm-range">${a.from === -1 ? '이전 채팅' : `#${a.from ?? '?'}~#${a.to ?? '?'}`}</span><span class="lm-spacer"></span>${deleteButton()}</header>
   <p><b>${esc(a.title)}</b><br>${esc(a.text)}</p>
 </article>`).join('');
     const frameModes = Object.entries(FRAME_MODES).map(([value, label]) => {
