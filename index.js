@@ -2124,7 +2124,7 @@ Output only:
 - [record-id, record-id] fact
 </facts>`;
     const user = `<story_record>\n${rows.map(r => r.text).join('\n')}\n</story_record>`;
-    const out = await callModel(system, user, { retries: 1, expectTag: 'facts', signal });
+    const out = await callModel(system, user, { writesMemory: true, retries: 1, expectTag: 'facts', signal });
     const facts = parseCanon(out, new Set(rows.map(r => r.id)), n);
     if (!facts.length) throw new Error('핵심 사실을 해석하지 못했어요.');
     memory.canon = { facts, pickedAt: Date.now(), nodesAtPick: memory.timeline.length + (memory.saga?.text ? 1 : 0) };
@@ -3453,8 +3453,11 @@ function untilAborted(promise, signal) {
     });
 }
 
-async function callModel(systemText, userText, { retries = null, expectTag = null, profileId = undefined, noFallback = false, signal = null } = {}) {
+async function callModel(systemText, userText, { retries = null, expectTag = null, profileId = undefined, noFallback = false, signal = null, writesMemory = false } = {}) {
     const s = getSettings();
+    // Calls that write memory notes end with the summary-language reminder.
+    const reminder = writesMemory ? languageReminder(writesMemory === 'ledger' ? 'ledger' : 'all') : '';
+    if (reminder) userText = `${userText}\n\n${reminder}`;
     const primary = profileId === undefined ? s.profileId : profileId;
     try {
         return await callModelOnce(systemText, userText, { retries, expectTag, profileId: primary, signal });
@@ -3726,6 +3729,28 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
 function languageRule() {
     const lang = LANGUAGES[getSettings().language] ?? LANGUAGES.chat;
     return `${lang.instruction} Keep proper nouns (names, places, titles) in their original spelling.`;
+}
+
+// The summary language as a name ("English"), or '' when it follows the chat.
+function fixedSummaryLanguage() {
+    return { en: 'English', ko: 'Korean', ja: 'Japanese', zh: 'Simplified Chinese' }[getSettings().language] || '';
+}
+
+// Said last, right before the model answers. One line in a long system prompt loses to a long
+// transcript in another language (and to earlier notes that already slipped into it), so
+// summaries drifted into the chat language after ~100 messages.
+function languageReminder(scope = 'all') {
+    const lang = fixedSummaryLanguage();
+    if (!lang) return '';
+    // The after-reply review copies exact quotes for its warnings; only the ledger values are notes.
+    if (scope === 'ledger') return `Language: write every ledger value in ${lang}, even where the story is in another language: translate, never copy sentences over. Names stay in the original, and "quote" and "evidence" stay exact copies.`;
+    return `Language: write everything in ${lang}, even where the transcript or earlier notes are in another language: translate, never copy sentences over. Only names and short exact quotes of dialogue stay in the original.`;
+}
+
+// "Keep the language of the text" for steps that rewrite notes, unless a summary language is set.
+function rewriteLanguageRule(what) {
+    const lang = fixedSummaryLanguage();
+    return lang ? `Write the result in ${lang}, translating any part written in another language. Keep proper nouns in their original spelling.` : `Keep the same language as ${what}.`;
 }
 
 // ---------------------------------------------------------------- user-editable prompts
@@ -4339,7 +4364,7 @@ A card can be a narrator, simulation, game or RPG card: named after a setting, a
     let list = [];
     for (let attempt = 0; attempt < 2 && !list.length; attempt++) {
         const reminder = attempt ? '\n\nIMPORTANT: answer with the <cast> block containing a JSON array exactly as shown, nothing else.' : '';
-        const out = await callModel(system, user + reminder, { expectTag: 'cast' });
+        const out = await callModel(system, user + reminder, { writesMemory: true, expectTag: 'cast' });
         const body = extractTag(out, 'cast') ?? out;
         list = parseRecords(body).filter(x => String(x.name || '').trim());
     }
@@ -4454,7 +4479,7 @@ ${sp.items.map(it => `[#${it.i}] ${it.text}`).join('\n\n')}
 </samples>`;
             let parsed = null;
             try {
-                const out = await callModel(system, user, { expectTag: 'voice' });
+                const out = await callModel(system, user, { writesMemory: true, expectTag: 'voice' });
                 parsed = parseRecords(extractTag(out, 'voice') ?? out)[0];
             } catch (err) {
                 if (String(err?.message) === 'aborted') throw err;
@@ -4517,7 +4542,7 @@ Reply with only the entries you changed (leave out the ones that are already fin
             cast && `<character_sheet>\n${cast}\n</character_sheet>`,
             `<character_entries>\n${JSON.stringify(chunk.map(e => ({ key: e.key, value: e.value })), null, 1)}\n</character_entries>`,
         ].filter(Boolean).join('\n\n');
-        const out = await callModel(system, user, { expectTag: 'entries' });
+        const out = await callModel(system, user, { writesMemory: true, expectTag: 'entries' });
         for (const x of parseJsonLenient(extractTag(out, 'entries') || '') || []) {
             const e = chunk.find(en => en.key.toLowerCase() === String(x?.key || '').toLowerCase());
             const value = String(x?.value || '').trim();
@@ -4707,7 +4732,7 @@ function summaryUserPrompt(memory, batch, lore = '') {
     const voice = ensembleCardName(memory);
     if (voice) parts.push(`The speaker label "${voice}" is a narrator, simulation or game card that writes for several characters. Attribute every line and action to the character named in the text, never to "${voice}", and do not record "${voice}" as a character.`);
     if (batchHasStar(batch)) parts.push('Messages marked ★ were flagged by the user as important. Record what happens in them in full detail, keep their key lines word for word, and rate this episode importance 4 or higher.');
-    if (batch.notes) parts.push(`<reviewer_notes>\nA fact check of an earlier summary of this transcript found these mistakes. Avoid them and stay strictly faithful to the transcript:\n${batch.notes}\n</reviewer_notes>`);
+    if (batch.notes) parts.push(`<reviewer_notes>\nA fact check of an earlier summary of this transcript found these mistakes (written in Korean for the user; they do not change the language you write in). Avoid them and stay strictly faithful to the transcript:\n${batch.notes}\n</reviewer_notes>`);
     const blocks = ['<episode>', '<ledger>', s.eventsEnabled && '<events>', s.voiceEnabled && '<voices>', s.hooksEnabled && '<hooks>'].filter(Boolean);
     parts.push(`Write the ${blocks.join(', ')} blocks for this transcript now.`);
     return parts.join('\n\n');
@@ -5027,7 +5052,7 @@ async function summarizeBatchOnce(memory, batch) {
     let hooks = null;
     for (let attempt = 0; attempt < 2 && !node; attempt++) {
         const reminder = attempt > 0 ? '\n\nIMPORTANT: your previous reply could not be parsed. Output only the <episode> block and the <ledger> block in the exact format described.' : '';
-        const out = await callModel(system, user + reminder, { expectTag: 'episode' });
+        const out = await callModel(system, user + reminder, { writesMemory: true, expectTag: 'episode' });
         node = parseNodeBlock(extractTag(out, 'episode'));
         if (!node && attempt > 0) {
             // Fall back to treating the whole reply as the summary text, unless it is a refusal.
@@ -5482,7 +5507,7 @@ async function afterTurn(messageId, { recheck = false } = {}) {
             recent.length && `<recent_messages>\nMessages #${firstShown}-#${messageId - 1}, right before the new reply, in order. ${omittedFrom >= 0 ? `Messages #${gapStart}-#${omittedFrom} (also after the memory) are not shown; do not report a conflict with the memory that they could explain. ` : 'Every message after the memory is included. '}These are the newest established facts, including small physical details (what someone holds, wears, drinks, where they stand).\n${recent.join('\n\n')}\n</recent_messages>`,
             `<new_reply>\n${replyLine}\n</new_reply>`,
         ].filter(Boolean).join('\n\n');
-        const out = await withTimeout(callModel(afterTurnSystemPrompt(doCheck, doState, doVoice, storyMedium(memory.frame)), user, { retries: 0, signal: turnSignal }), TURN_TIMEOUT_MS);
+        const out = await withTimeout(callModel(afterTurnSystemPrompt(doCheck, doState, doVoice, storyMedium(memory.frame)), user, { writesMemory: doState ? 'ledger' : false, retries: 0, signal: turnSignal }), TURN_TIMEOUT_MS);
         if (!stillSameChat(chatId) || ctx().chat[messageId] !== msg) return;
         if (doCheck) {
             let issues = (parseJsonLenient(extractTag(out, 'issues') || '') || [])
@@ -6456,7 +6481,7 @@ Reply with only a JSON array, one object per requested entry:
                 ...batch.map(e => `<entry name="${e.name.replace(/"/g, "'")}" type="${e.type}">\n${entityContext(memory, e) || '(no notes)'}\n</entry>`),
                 `Write the wiki entries for: ${batch.map(e => e.name).join(', ')}.`,
             ].filter(Boolean).join('\n\n');
-            const out = await callModel(system, user);
+            const out = await callModel(system, user, { writesMemory: true });
             const pages = (parseJsonLenient(out) || []).filter(p => p && typeof p === 'object' && String(p.title || '').trim() && String(p.summary || p.details || '').trim());
             if (!stillSameChat(chatId)) break;
             if (!memory.wiki) memory.wiki = { updatedAt: 0, pages: [] };
@@ -6637,7 +6662,7 @@ Reply with one block per note, using the same id, and nothing else:
     const user = candidates
         .map(n => `<note id="${n.id}" importance="${n.importance}" messages="#${n.from}-#${n.to}">\n${n.text}\n</note>`)
         .join('\n\n');
-    const out = await callModel(compactSystemPrompt(task), user, { expectTag: 'note' });
+    const out = await callModel(compactSystemPrompt(task), user, { writesMemory: true, expectTag: 'note' });
     const results = extractAllTags(out, 'note');
     let changed = 0;
     for (const { id, text } of results) {
@@ -6685,7 +6710,7 @@ summary:
     const user = run
         .map(n => `<episode importance="${n.importance}"${n.starred ? ' marked_important="yes"' : ''} messages="#${n.from}-#${n.to}" title="${esc(n.title)}">\n${n.text}\n</episode>`)
         .join('\n\n');
-    const out = await callModel(compactSystemPrompt(task), user, { expectTag: 'chapter' });
+    const out = await callModel(compactSystemPrompt(task), user, { writesMemory: true, expectTag: 'chapter' });
     const parsed = parseNodeBlock(extractTag(out, 'chapter'));
     if (!parsed) throw new Error('챕터 병합 응답을 해석하지 못했습니다.');
     const chapterId = newId();
@@ -6742,7 +6767,7 @@ Reply with exactly this block and nothing else:
         `<story_so_far>\n${memory.saga.text.trim() || '(empty)'}\n</story_so_far>`,
         ...run.map(n => `<chapter messages="#${n.from}-#${n.to}" title="${esc(n.title)}">\n${n.text}\n</chapter>`),
     ].join('\n\n');
-    const out = await callModel(compactSystemPrompt(task), user, { expectTag: 'saga' });
+    const out = await callModel(compactSystemPrompt(task), user, { writesMemory: true, expectTag: 'saga' });
     const saga = extractTag(out, 'saga');
     if (!saga) throw new Error('전체 줄거리 갱신 응답을 해석하지 못했습니다.');
     const runIds = run.map(n => n.id);
@@ -6810,12 +6835,12 @@ async function condenseLedger(memory, forced = null, { again = false } = {}) {
         .sort((a, b) => estTokens(b.value) - estTokens(a.value))
         .slice(0, 20);
     if (!picks.length) return false;
-    const task = `Task: rewrite each fact sheet entry below to about half its length. Keep every name, number, state, secret and who knows it, and the current status; drop history, repetition and description. Keep the same language as each entry.
+    const task = `Task: rewrite each fact sheet entry below to about half its length. Keep every name, number, state, secret and who knows it, and the current status; drop history, repetition and description. ${rewriteLanguageRule('each entry')}
 
 Reply with one block per entry, using the same id, and nothing else:
 <entry id="ID">shortened value</entry>`;
     const user = picks.map(e => `<entry id="${e.id}" key="${esc(e.key)}">\n${e.value}\n</entry>`).join('\n\n');
-    const out = await callModel(compactSystemPrompt(task), user, { expectTag: 'entry' });
+    const out = await callModel(compactSystemPrompt(task), user, { writesMemory: true, expectTag: 'entry' });
     let changed = 0;
     for (const { id, text } of extractAllTags(out, 'entry')) {
         const e = memory.ledger.entries.find(x => x.id === id);
@@ -6900,7 +6925,7 @@ async function condenseSagaOnce(memory, pass, target) {
         const goal = Math.max(150, Math.round(estTokens(part) * ratio));
         const words = Math.max(60, Math.round(goal / 1.6));
         setProgress(`지금까지의 이야기 줄이는 중 ${i + 1}/${parts.length}`);
-        const task = `Task: condense this part of "the story so far" to about ${words} words (Korean/Japanese/Chinese text: at most ${goal} characters). This is a hard limit; shorter is fine. It is part ${i + 1} of ${parts.length}, in chronological order. Keep who the characters are to each other, major turning points, lasting promises and secrets (and who knows them), deaths and injuries with lasting effect, and anything still unresolved. Drop scene detail, dialogue and repetition. Do not flatten or reinterpret personalities. Keep the same language as the text.
+        const task = `Task: condense this part of "the story so far" to about ${words} words (Korean/Japanese/Chinese text: at most ${goal} characters). This is a hard limit; shorter is fine. It is part ${i + 1} of ${parts.length}, in chronological order. Keep who the characters are to each other, major turning points, lasting promises and secrets (and who knows them), deaths and injuries with lasting effect, and anything still unresolved. Drop scene detail, dialogue and repetition. Do not flatten or reinterpret personalities. ${rewriteLanguageRule('the text')}
 
 Reply with exactly this block and nothing else:
 <part>
@@ -6908,7 +6933,7 @@ Reply with exactly this block and nothing else:
 </part>`;
         let condensed = '';
         try {
-            condensed = (extractTag(await callModel(compactSystemPrompt(task), part, { expectTag: 'part' }), 'part') || '').trim();
+            condensed = (extractTag(await callModel(compactSystemPrompt(task), part, { writesMemory: true, expectTag: 'part' }), 'part') || '').trim();
         } catch (err) {
             if (isAuthError?.(err)) throw err;
             console.warn('[elephant] saga part failed', err);
@@ -6916,7 +6941,7 @@ Reply with exactly this block and nothing else:
         if (condensed && estTokens(condensed) > goal * 1.4) {
             // The model ignored the limit; ask once more for half the length and keep the shorter one.
             const strict = task.replace(`about ${words} words`, `about ${Math.max(40, Math.round(words / 2))} words`).replace(`at most ${goal} characters`, `at most ${Math.max(100, Math.round(goal / 2))} characters`);
-            const again = (extractTag(await callModel(compactSystemPrompt(strict), part, { expectTag: 'part' }).catch(() => ''), 'part') || '').trim();
+            const again = (extractTag(await callModel(compactSystemPrompt(strict), part, { writesMemory: true, expectTag: 'part' }).catch(() => ''), 'part') || '').trim();
             if (again && again.length < condensed.length) condensed = again;
         }
         out.push(condensed && condensed.length < part.length ? condensed : part);
@@ -8146,6 +8171,7 @@ function bindSettings(root) {
             saveSettingsDebounced();
             refreshInjection();
             updateStatus();
+            if (key === 'language') suggestAlignLanguage();
         });
         if (el.type === 'number') {
             el.addEventListener('blur', () => { el.value = s[key]; });
@@ -8931,7 +8957,7 @@ function alreadyIn(text, targetLang) {
 }
 
 async function translateOne(text, targetLang, signal = null) {
-    const system = `You are a translator. Translate the user's text into natural ${targetLang}. Keep proper nouns (names, places, titles) and any #numbers unchanged. Keep line breaks. Do not summarize, add, or omit anything. Reply with only the translation, without quotes or notes.`;
+    const system = `You are a translator. Translate the user's text into natural ${targetLang}. Keep proper nouns (names, places, titles), any #numbers and dialogue quoted inside quotation marks unchanged. Keep line breaks. Do not summarize, add, or omit anything. Reply with only the translation, without quotes or notes.`;
     const raw = await callModel(system, text, { retries: 1, signal });
     const out = String(raw || '').trim().replace(/^```[a-z]*\s*|\s*```$/g, '').trim();
     return out && !looksRefused(out) ? out : null;
@@ -8939,7 +8965,7 @@ async function translateOne(text, targetLang, signal = null) {
 
 async function translateBatch(items, targetLang, signal = null) {
     const input = Object.fromEntries(items.map((t, i) => [String(i + 1), t]));
-    const system = `You are a translator. The user sends a JSON object of numbered texts. Translate every value into natural ${targetLang}. Keep proper nouns (names, places, titles) and any #numbers unchanged. Do not summarize, merge, add, or omit anything. Reply with ONLY a JSON object with exactly the same keys, each mapped to its translation.`;
+    const system = `You are a translator. The user sends a JSON object of numbered texts. Translate every value into natural ${targetLang}. Keep proper nouns (names, places, titles), any #numbers and dialogue quoted inside quotation marks unchanged. Do not summarize, merge, add, or omit anything. Reply with ONLY a JSON object with exactly the same keys, each mapped to its translation.`;
     const raw = await callModel(system, JSON.stringify(input), { retries: 1, signal });
     let parsed = parseJsonLenient(raw);
     if (Array.isArray(parsed) && parsed.length === 1 && parsed[0] && typeof parsed[0] === 'object' && !Array.isArray(parsed[0])) parsed = parsed[0];
@@ -9057,6 +9083,94 @@ function koScopeCount(memory, scope) {
 }
 
 // Collect the translatable strings of the chosen part(s) in order, and a renderer for the result.
+// ---------------------------------------------------------------- align memory language
+// Notes written in another language than the summary language (it drifted, or the setting was
+// changed later) are translated in place, so nothing has to be summarized again. Names and
+// quoted dialogue are left alone.
+const ALIGN_KEY_CATS = new Set(['thread', 'fact', 'divergence']);
+
+function languageFields(memory) {
+    const fields = [];
+    const add = (obj, key) => { if (obj && typeof obj[key] === 'string' && obj[key].trim()) fields.push({ obj, key, text: obj[key] }); };
+    add(memory.saga, 'text');
+    for (const n of memory.timeline) { add(n, 'title'); add(n, 'text'); add(n, 'when'); }
+    for (const e of memory.events) { add(e, 'text'); add(e, 'place'); }
+    for (const e of memory.ledger.entries) { add(e, 'value'); if (ALIGN_KEY_CATS.has(e.cat)) add(e, 'key'); }
+    const scene = memory.ledger.scene || {};
+    add(scene, 'time'); add(scene, 'place'); add(scene, 'mood');
+    for (const h of memory.hooks || []) { add(h, 'text'); add(h, 'how'); }
+    for (const m of memory.cast || []) { add(m, 'core'); add(m, 'speech'); for (const g of m.growth || []) add(g, 'text'); }
+    for (const pg of memory.wiki.pages) { add(pg, 'summary'); add(pg, 'details'); add(pg, 'status'); }
+    for (const f of memory.canon.facts) add(f, 'text');
+    return fields;
+}
+
+function foreignFields(memory, lang) {
+    return languageFields(memory).filter(f => !alreadyIn(f.text, lang));
+}
+
+// After the summary language is changed: say so if earlier notes are in another language.
+function suggestAlignLanguage() {
+    const lang = fixedSummaryLanguage();
+    const memory = getMemory(false);
+    if (!lang || !memory || !hasContent(memory)) return;
+    const n = foreignFields(memory, lang).length;
+    if (n < 3) return;
+    toastr.info(`이전 기억 ${n}곳은 다른 말로 적혀 있어요. 기억장 → 더보기 → "기억을 요약 언어로 맞추기"로 한 번에 옮길 수 있어요.`, APP_NAME, { timeOut: 9000 });
+}
+
+async function runAlignLanguage() {
+    if (busy) return toastr.warning('작업 중입니다.');
+    const lang = fixedSummaryLanguage();
+    if (!lang) return toastr.info('설정 → 요약 → "요약 언어"를 English 같은 한 언어로 정하면 쓸 수 있어요.', APP_NAME);
+    const memory = getMemory(false);
+    if (!memory || !hasContent(memory)) return toastr.info('맞출 기억이 아직 없어요.');
+    const fields = foreignFields(memory, lang);
+    const label = { en: '영어', ko: '한국어', ja: '일본어', zh: '중국어' }[getSettings().language] || lang;
+    if (!fields.length) return toastr.success(`기억이 이미 모두 ${label}로 적혀 있어요.`, APP_NAME);
+    const tokens = fields.reduce((sum, f) => sum + estTokens(f.text), 0);
+    // Same split as translateTexts: a token budget per request, and at most 12 notes each.
+    const calls = Math.max(1, Math.ceil(tokens / Math.max(400, Math.min(TRANSLATE_BATCH_TOKENS, Math.floor(getSettings().maxOutputTokens * 0.45)))), Math.ceil(fields.length / 12));
+    const ok = await ctx().Popup.show.confirm('기억을 요약 언어로 맞추기',
+        `기억 중 ${fields.length.toLocaleString()}곳이 ${label}가 아닌 말로 적혀 있어요. 요약 모델을 ${calls}번쯤 불러 ${label}로 옮겨요. 이름과 대사 인용은 그대로 둬요. 다시 요약하지 않아도 되고, 되돌리기로 되돌릴 수 있어요. 진행할까요?`);
+    if (!ok) return;
+    const chatId = ctx().getCurrentChatId();
+    busy = true;
+    abortController = new AbortController();
+    setBusyUI(true);
+    let changed = 0;
+    try {
+        pushHistory(memory, `언어 맞추기 (${label})`);
+        const out = await translateTexts(fields.map(f => f.text), lang, {
+            signal: abortController.signal,
+            onProgress: (i, n) => setProgress(`${label}로 옮기는 중 ${i}/${n}`),
+        });
+        if (!stillSameChat(chatId) || getMemory(false) !== memory) return toastr.info('채팅이 바뀌어서 옮긴 내용을 적용하지 않았어요.');
+        fields.forEach((f, i) => {
+            const next = String(out[i] ?? '').trim();
+            // Skip a field that changed while we waited (an after-reply update, say).
+            if (!next || next === f.text || f.obj[f.key] !== f.text) return;
+            f.obj[f.key] = next;
+            changed++;
+        });
+        memory.rev = (memory.rev || 0) + 1;
+        await persistChat();
+        refreshInjection();
+        const left = foreignFields(memory, lang).length;
+        toastr.success(`${changed.toLocaleString()}곳을 ${label}로 옮겼어요.${left ? ` ${left}곳은 옮기지 못했어요. 한 번 더 누르면 남은 것만 다시 해요.` : ''}`, APP_NAME);
+    } catch (err) {
+        if (String(err?.message) === 'aborted') toastr.info('중지했어요. 기억은 바뀌지 않았어요.');
+        else reportError('언어 맞추기 실패', err);
+    } finally {
+        busy = false;
+        abortController = null;
+        setBusyUI(false);
+        setProgress('');
+        updateStatus();
+        syncAfter();
+    }
+}
+
 function koreanViewParts(memory, scope = 'all') {
     const want = (k) => scope === 'all' || scope === k;
     const jobs = [];
@@ -9416,6 +9530,7 @@ function managerHtml(memory) {
           ${tool('lm_handoff_save', 'handoff', '새 채팅으로 이어가기', '', '이 기억을 저장해 두고, 같은 캐릭터로 새 채팅을 열 때 이어받아요')}
           ${tool('lm_handoff_load', 'receive', '이전 채팅 기억 이어받기', '', '저장해 둔 이전 채팅의 기억을 이 채팅으로 가져와요')}
           ${tool('lm_merge', 'merge', '다른 채팅 기억 합치기', '', '다른 채팅이나 파일의 기억을 지금 기억에 더해요')}
+          ${tool('lm_align_lang', 'sparkle', '기억을 요약 언어로 맞추기', '', '요약 언어와 다른 말로 적힌 기억을 요약 언어로 옮겨요. 다시 요약하지 않아도 돼요')}
           <hr>
           ${tool('lm_unhide_all', 'undo', '숨긴 메시지 모두 보이기', '', '이 채팅에서 숨겨진 메시지를 모두 다시 보이게 해요. 코끼리가 숨긴 것, 직접 숨긴 것 모두요. 기억은 그대로예요')}
           ${tool('lm_reset', 'reset', '초기화 (골라서)', 'lm-toolbtn-danger', '요약·위키·기록부처럼 지울 것만 골라 초기화해요')}
@@ -9929,7 +10044,7 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
             await openKoreanView(collectManager(root, memory), koPick.dataset.koScope);
             return;
         }
-        const tool = event.target.closest('#lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_unhide_all, #lm_wiki_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_ttable, #lm_tgraph, #lm_relmap, #lm_statuslog, #lm_verify, #lm_canon_pick, .lm-canon-del');
+        const tool = event.target.closest('#lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_unhide_all, #lm_align_lang, #lm_wiki_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_ttable, #lm_tgraph, #lm_relmap, #lm_statuslog, #lm_verify, #lm_canon_pick, .lm-canon-del');
         if (!tool) return;
         if (tool.classList.contains('lm-canon-del')) {
             const i = Number(tool.dataset.i);
@@ -10013,6 +10128,9 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
                 break;
             case 'lm_unhide_all':
                 await closeThen(runUnhideAll);
+                break;
+            case 'lm_align_lang':
+                await closeThen(runAlignLanguage);
                 break;
             case 'lm_wiki_reset':
                 await closeThen(() => runReset({ only: ['wiki'] }));
