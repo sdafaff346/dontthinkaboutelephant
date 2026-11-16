@@ -85,6 +85,9 @@ const defaultSettings = Object.freeze({
     enabled: true,
     profileId: '',
     fallbackProfileId: '',
+    // Off: every job uses the summary model. On: a job with its own pick uses that profile instead.
+    perTaskModels: false,
+    taskProfiles: {},
     softenSensitive: false,
     splitOnBlock: true,
     includePreset: true,
@@ -2128,7 +2131,7 @@ Output only:
 - [record-id, record-id] fact
 </facts>`;
     const user = `<story_record>\n${rows.map(r => r.text).join('\n')}\n</story_record>`;
-    const out = await callModel(system, user, { writesMemory: true, retries: 1, expectTag: 'facts', signal });
+    const out = await callModel(system, user, { task: 'character', writesMemory: true, retries: 1, expectTag: 'facts', signal });
     const facts = parseCanon(out, new Set(rows.map(r => r.id)), n);
     if (!facts.length) throw new Error('핵심 사실을 해석하지 못했어요.');
     memory.canon = { facts, pickedAt: Date.now(), nodesAtPick: memory.timeline.length + (memory.saga?.text ? 1 : 0) };
@@ -3164,7 +3167,7 @@ Reply with lines only, in this format:
 - phrase | category | reason
 category is one of: ${REPEAT_KINDS.join(', ')}
 reason is in Korean, under 15 words.`;
-    const raw = await callModel(system, list, { retries: 1, signal });
+    const raw = await callModel(system, list, { task: 'helper', retries: 1, signal });
     const joined = found.texts.join('\n').toLowerCase();
     const names = properNames();
     const out = [];
@@ -3328,7 +3331,7 @@ async function expandQueries(memory, recentChat) {
     const cross = memLang && !sameLanguage(memLang, scriptOf(msgs)) ? ` The memory notes are written in ${memLang}, so write every query in ${memLang} as well (one line per language).` : '';
     const system = `${getPrompt('expand')}${cross} Reply with only: <queries>one query per line</queries>`;
     const user = `${terms ? `<known_terms>${terms}</known_terms>\n\n` : ''}<latest_messages>\n${msgs}\n</latest_messages>`;
-    const out = await withTimeout(callModel(system, user, { retries: 0 }), s.expansionTimeoutMs);
+    const out = await withTimeout(callModel(system, user, { task: 'recall', retries: 0 }), s.expansionTimeoutMs);
     return (extractTag(out, 'queries') || '').split('\n')
         .map(q => q.replace(/^[-*\d.)\s]+/, '').trim())
         .filter(q => q.length >= 2)
@@ -3458,12 +3461,34 @@ function untilAborted(promise, signal) {
     });
 }
 
-async function callModel(systemText, userText, { retries = null, expectTag = null, profileId = undefined, noFallback = false, signal = null, writesMemory = false } = {}) {
+// Jobs that can get their own model. '' = same as the summary model, CURRENT_API = the API the
+// chat itself uses (no profile), otherwise a Connection Manager profile id.
+const MODEL_TASKS = {
+    compress: { label: '압축', hint: '대화를 에피소드로 요약' },
+    tidy: { label: '기억 정리', hint: '줄이기·챕터·지금까지의 이야기·기록부 정리' },
+    character: { label: '캐릭터·위키·핵심 사실', hint: '캐해 정리, 말투 모으기, 위키, 핵심 사실 고르기' },
+    check: { label: '답변 점검', hint: '모순·캐해 검사, 실시간 갱신, 요약 검수' },
+    recall: { label: '회상·질문', hint: '돌려 말해도 찾기, 기억장 질문' },
+    helper: { label: '번역·도우미', hint: '한국어로 보기, 언어 맞추기, 상투 표현 골라 주기' },
+};
+const CURRENT_API = '@current';
+
+function taskProfile(task) {
+    const s = getSettings();
+    if (!s.perTaskModels || !task) return s.profileId;
+    const pick = s.taskProfiles?.[task] || '';
+    if (pick === CURRENT_API) return '';
+    // A deleted profile falls back to the summary model instead of failing every call.
+    if (pick && findProfile(pick)) return pick;
+    return s.profileId;
+}
+
+async function callModel(systemText, userText, { retries = null, expectTag = null, profileId = undefined, noFallback = false, signal = null, writesMemory = false, task = '' } = {}) {
     const s = getSettings();
     // Calls that write memory notes end with the summary-language reminder.
     const reminder = writesMemory ? languageReminder(writesMemory === 'ledger' ? 'ledger' : 'all') : '';
     if (reminder) userText = `${userText}\n\n${reminder}`;
-    const primary = profileId === undefined ? s.profileId : profileId;
+    const primary = profileId === undefined ? taskProfile(task) : profileId;
     try {
         return await callModelOnce(systemText, userText, { retries, expectTag, profileId: primary, signal });
     } catch (err) {
@@ -4369,7 +4394,7 @@ A card can be a narrator, simulation, game or RPG card: named after a setting, a
     let list = [];
     for (let attempt = 0; attempt < 2 && !list.length; attempt++) {
         const reminder = attempt ? '\n\nIMPORTANT: answer with the <cast> block containing a JSON array exactly as shown, nothing else.' : '';
-        const out = await callModel(system, user + reminder, { writesMemory: true, expectTag: 'cast' });
+        const out = await callModel(system, user + reminder, { task: 'character', writesMemory: true, expectTag: 'cast' });
         const body = extractTag(out, 'cast') ?? out;
         list = parseRecords(body).filter(x => String(x.name || '').trim());
     }
@@ -4484,7 +4509,7 @@ ${sp.items.map(it => `[#${it.i}] ${it.text}`).join('\n\n')}
 </samples>`;
             let parsed = null;
             try {
-                const out = await callModel(system, user, { writesMemory: true, expectTag: 'voice' });
+                const out = await callModel(system, user, { task: 'character', writesMemory: true, expectTag: 'voice' });
                 parsed = parseRecords(extractTag(out, 'voice') ?? out)[0];
             } catch (err) {
                 if (String(err?.message) === 'aborted') throw err;
@@ -4547,7 +4572,7 @@ Reply with only the entries you changed (leave out the ones that are already fin
             cast && `<character_sheet>\n${cast}\n</character_sheet>`,
             `<character_entries>\n${JSON.stringify(chunk.map(e => ({ key: e.key, value: e.value })), null, 1)}\n</character_entries>`,
         ].filter(Boolean).join('\n\n');
-        const out = await callModel(system, user, { writesMemory: true, expectTag: 'entries' });
+        const out = await callModel(system, user, { task: 'character', writesMemory: true, expectTag: 'entries' });
         for (const x of parseJsonLenient(extractTag(out, 'entries') || '') || []) {
             const e = chunk.find(en => en.key.toLowerCase() === String(x?.key || '').toLowerCase());
             const value = String(x?.value || '').trim();
@@ -5057,7 +5082,7 @@ async function summarizeBatchOnce(memory, batch) {
     let hooks = null;
     for (let attempt = 0; attempt < 2 && !node; attempt++) {
         const reminder = attempt > 0 ? '\n\nIMPORTANT: your previous reply could not be parsed. Output only the <episode> block and the <ledger> block in the exact format described.' : '';
-        const out = await callModel(system, user + reminder, { writesMemory: true, expectTag: 'episode' });
+        const out = await callModel(system, user + reminder, { task: 'compress', writesMemory: true, expectTag: 'episode' });
         node = parseNodeBlock(extractTag(out, 'episode'));
         if (!node && attempt > 0) {
             // Fall back to treating the whole reply as the summary text, unless it is a refusal.
@@ -5512,7 +5537,7 @@ async function afterTurn(messageId, { recheck = false } = {}) {
             recent.length && `<recent_messages>\nMessages #${firstShown}-#${messageId - 1}, right before the new reply, in order. ${omittedFrom >= 0 ? `Messages #${gapStart}-#${omittedFrom} (also after the memory) are not shown; do not report a conflict with the memory that they could explain. ` : 'Every message after the memory is included. '}These are the newest established facts, including small physical details (what someone holds, wears, drinks, where they stand).\n${recent.join('\n\n')}\n</recent_messages>`,
             `<new_reply>\n${replyLine}\n</new_reply>`,
         ].filter(Boolean).join('\n\n');
-        const out = await withTimeout(callModel(afterTurnSystemPrompt(doCheck, doState, doVoice, storyMedium(memory.frame)), user, { writesMemory: doState ? 'ledger' : false, retries: 0, signal: turnSignal }), TURN_TIMEOUT_MS);
+        const out = await withTimeout(callModel(afterTurnSystemPrompt(doCheck, doState, doVoice, storyMedium(memory.frame)), user, { task: 'check', writesMemory: doState ? 'ledger' : false, retries: 0, signal: turnSignal }), TURN_TIMEOUT_MS);
         if (!stillSameChat(chatId) || ctx().chat[messageId] !== msg) return;
         if (doCheck) {
             let issues = (parseJsonLenient(extractTag(out, 'issues') || '') || [])
@@ -5659,7 +5684,7 @@ Reply with only:
 [{"i":<warning number>,"keep":true|false,"why":"<one short reason>"}]
 </verdicts>`;
     const list = issues.map((x, i) => `${i}. reply says: "${x.quote}" | conflicts with: "${x.evidence || '(no evidence given)'}" (${x.source || '?'}) | ${x.problem}${x.unverified ? ` [the checker's ${x.unverified === 'quote' ? 'quote from the reply' : 'evidence'} was not found word for word; check the text yourself and keep it only if the contradiction is clearly real]` : ''}`).join('\n');
-    const out = await withTimeout(callModel(system, `${context}\n\n<warnings>\n${list}\n</warnings>`, { retries: 0, expectTag: 'verdicts', signal }), TURN_TIMEOUT_MS);
+    const out = await withTimeout(callModel(system, `${context}\n\n<warnings>\n${list}\n</warnings>`, { task: 'check', retries: 0, expectTag: 'verdicts', signal }), TURN_TIMEOUT_MS);
     const verdicts = parseJsonLenient(extractTag(out, 'verdicts') || '');
     if (!Array.isArray(verdicts)) throw new Error('재확인 응답을 해석하지 못했어요');
     const byIndex = new Map(verdicts.filter(v => v && Number.isInteger(Number(v.i))).map(v => [Number(v.i), v]));
@@ -6318,7 +6343,7 @@ async function askMemory(question) {
         lore && `<lorebook_reference>\n${lore}\n</lorebook_reference>`,
         `<question>\n${question}\n</question>`,
     ].filter(Boolean).join('\n\n');
-    const answer = cleanOutput(await callModel(system, user, { retries: 1 }));
+    const answer = cleanOutput(await callModel(system, user, { task: 'recall', retries: 1 }));
     const sources = results.map(({ item }) => ({ kind: item.kind, from: item.from, to: item.to, when: item.when || '', text: item.display.slice(0, 300) }));
     memory.qna = [...(memory.qna || []), { q: question, a: answer, at: Date.now(), sources }].slice(-30);
     ctx().saveMetadataDebounced?.();
@@ -6486,7 +6511,7 @@ Reply with only a JSON array, one object per requested entry:
                 ...batch.map(e => `<entry name="${e.name.replace(/"/g, "'")}" type="${e.type}">\n${entityContext(memory, e) || '(no notes)'}\n</entry>`),
                 `Write the wiki entries for: ${batch.map(e => e.name).join(', ')}.`,
             ].filter(Boolean).join('\n\n');
-            const out = await callModel(system, user, { writesMemory: true });
+            const out = await callModel(system, user, { task: 'character', writesMemory: true });
             const pages = (parseJsonLenient(out) || []).filter(p => p && typeof p === 'object' && String(p.title || '').trim() && String(p.summary || p.details || '').trim());
             if (!stillSameChat(chatId)) break;
             if (!memory.wiki) memory.wiki = { updatedAt: 0, pages: [] };
@@ -6667,7 +6692,7 @@ Reply with one block per note, using the same id, and nothing else:
     const user = candidates
         .map(n => `<note id="${n.id}" importance="${n.importance}" messages="#${n.from}-#${n.to}">\n${n.text}\n</note>`)
         .join('\n\n');
-    const out = await callModel(compactSystemPrompt(task), user, { writesMemory: true, expectTag: 'note' });
+    const out = await callModel(compactSystemPrompt(task), user, { task: 'tidy', writesMemory: true, expectTag: 'note' });
     const results = extractAllTags(out, 'note');
     let changed = 0;
     for (const { id, text } of results) {
@@ -6715,7 +6740,7 @@ summary:
     const user = run
         .map(n => `<episode importance="${n.importance}"${n.starred ? ' marked_important="yes"' : ''} messages="#${n.from}-#${n.to}" title="${esc(n.title)}">\n${n.text}\n</episode>`)
         .join('\n\n');
-    const out = await callModel(compactSystemPrompt(task), user, { writesMemory: true, expectTag: 'chapter' });
+    const out = await callModel(compactSystemPrompt(task), user, { task: 'tidy', writesMemory: true, expectTag: 'chapter' });
     const parsed = parseNodeBlock(extractTag(out, 'chapter'));
     if (!parsed) throw new Error('챕터 병합 응답을 해석하지 못했습니다.');
     const chapterId = newId();
@@ -6772,7 +6797,7 @@ Reply with exactly this block and nothing else:
         `<story_so_far>\n${memory.saga.text.trim() || '(empty)'}\n</story_so_far>`,
         ...run.map(n => `<chapter messages="#${n.from}-#${n.to}" title="${esc(n.title)}">\n${n.text}\n</chapter>`),
     ].join('\n\n');
-    const out = await callModel(compactSystemPrompt(task), user, { writesMemory: true, expectTag: 'saga' });
+    const out = await callModel(compactSystemPrompt(task), user, { task: 'tidy', writesMemory: true, expectTag: 'saga' });
     const saga = extractTag(out, 'saga');
     if (!saga) throw new Error('전체 줄거리 갱신 응답을 해석하지 못했습니다.');
     const runIds = run.map(n => n.id);
@@ -6845,7 +6870,7 @@ async function condenseLedger(memory, forced = null, { again = false } = {}) {
 Reply with one block per entry, using the same id, and nothing else:
 <entry id="ID">shortened value</entry>`;
     const user = picks.map(e => `<entry id="${e.id}" key="${esc(e.key)}">\n${e.value}\n</entry>`).join('\n\n');
-    const out = await callModel(compactSystemPrompt(task), user, { writesMemory: true, expectTag: 'entry' });
+    const out = await callModel(compactSystemPrompt(task), user, { task: 'tidy', writesMemory: true, expectTag: 'entry' });
     let changed = 0;
     for (const { id, text } of extractAllTags(out, 'entry')) {
         const e = memory.ledger.entries.find(x => x.id === id);
@@ -6938,7 +6963,7 @@ Reply with exactly this block and nothing else:
 </part>`;
         let condensed = '';
         try {
-            condensed = (extractTag(await callModel(compactSystemPrompt(task), part, { writesMemory: true, expectTag: 'part' }), 'part') || '').trim();
+            condensed = (extractTag(await callModel(compactSystemPrompt(task), part, { task: 'tidy', writesMemory: true, expectTag: 'part' }), 'part') || '').trim();
         } catch (err) {
             if (isAuthError?.(err)) throw err;
             console.warn('[elephant] saga part failed', err);
@@ -6946,7 +6971,7 @@ Reply with exactly this block and nothing else:
         if (condensed && estTokens(condensed) > goal * 1.4) {
             // The model ignored the limit; ask once more for half the length and keep the shorter one.
             const strict = task.replace(`about ${words} words`, `about ${Math.max(40, Math.round(words / 2))} words`).replace(`at most ${goal} characters`, `at most ${Math.max(100, Math.round(goal / 2))} characters`);
-            const again = (extractTag(await callModel(compactSystemPrompt(strict), part, { writesMemory: true, expectTag: 'part' }).catch(() => ''), 'part') || '').trim();
+            const again = (extractTag(await callModel(compactSystemPrompt(strict), part, { task: 'tidy', writesMemory: true, expectTag: 'part' }).catch(() => ''), 'part') || '').trim();
             if (again && again.length < condensed.length) condensed = again;
         }
         out.push(condensed && condensed.length < part.length ? condensed : part);
@@ -7325,6 +7350,29 @@ function profileOptions(selected, emptyLabel = '현재 연결 사용') {
     return opts.join('');
 }
 
+function taskModelOptions(selected) {
+    const opts = profileOptions(selected, '요약 모델과 같게');
+    return opts.replace('</option>', `</option><option value="${CURRENT_API}" ${selected === CURRENT_API ? 'selected' : ''}>지금 채팅에 쓰는 API</option>`);
+}
+
+function taskModelRows() {
+    const s = getSettings();
+    return Object.entries(MODEL_TASKS).map(([task, t]) => `
+    <label class="lm-taskrow"><span class="lm-taskrow-text"><b>${esc(t.label)}</b><small>${esc(t.hint)}</small></span>
+      <select class="text_pole lm-select" data-lm-task="${task}" aria-label="${esc(t.label)} 모델">${taskModelOptions(s.taskProfiles?.[task] || '')}</select></label>`).join('');
+}
+
+// Show or hide the per-job model list and refill it (profiles may have been added or renamed).
+function syncTaskModels(root) {
+    const box = root?.querySelector('#lm_taskmodels');
+    if (!box) return;
+    const s = getSettings();
+    box.hidden = !s.perTaskModels;
+    box.querySelectorAll('select[data-lm-task]').forEach(sel => {
+        sel.innerHTML = taskModelOptions(s.taskProfiles?.[sel.dataset.lmTask] || '');
+    });
+}
+
 function selectOptions(map, selected, useLabelKey = true) {
     return Object.entries(map)
         .map(([value, label]) => `<option value="${esc(value)}" ${value === selected ? 'selected' : ''}>${esc(useLabelKey && typeof label === 'object' ? label.label : label)}</option>`)
@@ -7557,6 +7605,10 @@ function settingsHtml() {
           ${selectRow('', '요약 모델', profileOptions(s.profileId), s.profileId, 'Connection Manager에 저장한 프로필. 비우면 지금 쓰는 API를 써요', 'lm_profile')}
           <div class="lm-inline-action"><button type="button" class="lm-chipbtn" id="lm_btn_test">${icon('plug')}<span>연결 테스트</span></button><span class="lm-hint">요약 모델이 응답하는지 바로 확인해요</span></div>
           ${selectRow('', '검열되면 대신 쓸 모델', profileOptions(s.fallbackProfileId, '사용 안 함'), s.fallbackProfileId, '요약 모델이 거부하거나 막힐 때만 이 프로필로 다시 보내요. Gemini를 쓴다면 DeepSeek·GLM 같은 다른 회사 모델을 추천해요', 'lm_fallback')}
+          ${checkRow('perTaskModels', '작업마다 다른 모델 쓰기', '꺼 두면 모든 작업을 위의 요약 모델 하나로 해요. 켜면 압축·정리처럼 중요한 일은 좋은 모델로, 점검·회상처럼 자주 하는 일은 싼 모델로 따로 고를 수 있어요')}
+          <div class="lm-inline-action lm-taskmodels" id="lm_taskmodels" hidden>${taskModelRows()}
+            <span class="lm-hint">"요약 모델과 같게"로 둔 작업은 위의 요약 모델을 따라가요. 검열되면 대신 쓸 모델은 모든 작업에 그대로 적용돼요.</span>
+          </div>
           ${selectRow('memoryReasoning', '요약 모델의 생각(추론)', selectOptions({ min: '최소로 (권장)', preset: '프로필 프리셋 그대로' }, s.memoryReasoning), s.memoryReasoning, '요약 같은 짧은 작업에 생각을 길게 하면 느리고 빈 답이 나기 쉬워요. 요약 모델을 연결 프로필로 정했을 때 OpenRouter·Google AI Studio·Vertex AI에 "생각 최소"로 요청해요. 모델이 거부하면 알아서 빼고 보내요')}
           ${group('요약 방식', '무엇을 얼마나 자세히 남길지')}
           ${checkRow('softenSensitive', '민감한 장면 순화 (기본 꺼짐)', '꺼져 있으면 모든 장면을 있는 그대로 요약해요. 켜면 야하거나 잔인한 장면을 짧고 덤덤하게 줄여 적어서 검열에 덜 걸리지만, 그만큼 덜 자세히 기억해요')}
@@ -7765,11 +7817,11 @@ function settingsHtml() {
 // opening "고급 설정" folds that contain a match. Clicking a tab or clearing the box goes back.
 // Simple view: only the settings most people touch. Everything else (and the 로어북, 넣는 위치,
 // 프롬프트 tabs) appears with "모든 설정 보기", and the settings search always finds everything.
-const ESSENTIAL_SETTINGS = new Set(['language', 'detail', 'keepRecent', 'softenSensitive', 'voiceEnabled',
+const ESSENTIAL_SETTINGS = new Set(['perTaskModels', 'language', 'detail', 'keepRecent', 'softenSensitive', 'voiceEnabled',
     'autoCompress', 'autoCompressAt', 'checkContradictions', 'liveStateUpdate', 'yieldToReply',
     'recallEnabled', 'vectorEnabled', 'embedSource', 'memoryBudget',
     'recallRawDialogue', 'bannedWords', 'bannedInChat', 'memoryReasoning', 'canonEnabled']);
-const ESSENTIAL_IDS = new Set(['lm_btn_unhide', 'lm_profile', 'lm_fallback', 'lm_btn_test', 'lm_btn_repeat']);
+const ESSENTIAL_IDS = new Set(['lm_taskmodels', 'lm_btn_unhide', 'lm_profile', 'lm_fallback', 'lm_btn_test', 'lm_btn_repeat']);
 const ADVANCED_PANES = new Set(['lore', 'inject', 'prompt']);
 
 function applySimpleView(root) {
@@ -7791,6 +7843,7 @@ function applySimpleView(root) {
             if (child.classList.contains('lm-pane-foot')) return;
             const essential = !advPane && child.matches(ITEMS) && !child.matches('.lm-note') && (
                 [...child.querySelectorAll('[data-lm-setting]')].some(el => ESSENTIAL_SETTINGS.has(el.dataset.lmSetting))
+                || ESSENTIAL_IDS.has(child.id)
                 || [...child.querySelectorAll('[id]')].some(el => ESSENTIAL_IDS.has(el.id)));
             child.classList.toggle('lm-adv', !essential);
             if (essential) groupKeep = true;
@@ -7987,6 +8040,7 @@ function refreshSettingsInputs() {
     if (profile) profile.innerHTML = profileOptions(s.profileId);
     const fallback = root.querySelector('#lm_fallback');
     if (fallback) fallback.innerHTML = profileOptions(s.fallbackProfileId, '사용 안 함');
+    syncTaskModels(root);
     const desc = root.querySelector('#lm_preset_desc');
     if (desc) desc.textContent = INJECT_PRESETS[s.injectPreset]?.desc || '';
     try { renderPromptEditors(root); renderStyleList(root, s.promptStyle || 'default'); renderLoreList(); } catch (err) { console.warn(LOG_PREFIX, 'settings refresh', err); }
@@ -8177,6 +8231,7 @@ function bindSettings(root) {
             refreshInjection();
             updateStatus();
             if (key === 'language') suggestAlignLanguage();
+            if (key === 'perTaskModels') syncTaskModels(root);
         });
         if (el.type === 'number') {
             el.addEventListener('blur', () => { el.value = s[key]; });
@@ -8230,6 +8285,14 @@ function bindSettings(root) {
         s.profileId = profile.value;
         saveSettingsDebounced();
     });
+    root.querySelectorAll('select[data-lm-task]').forEach(sel => {
+        sel.addEventListener('focus', () => { sel.innerHTML = taskModelOptions(s.taskProfiles?.[sel.dataset.lmTask] || ''); });
+        sel.addEventListener('change', () => {
+            s.taskProfiles = { ...(s.taskProfiles || {}), [sel.dataset.lmTask]: sel.value };
+            saveSettingsDebounced();
+        });
+    });
+    syncTaskModels(root);
     const fallback = root.querySelector('#lm_fallback');
     fallback.addEventListener('focus', () => {
         fallback.innerHTML = profileOptions(s.fallbackProfileId, '사용 안 함');
@@ -8963,7 +9026,7 @@ function alreadyIn(text, targetLang) {
 
 async function translateOne(text, targetLang, signal = null) {
     const system = `You are a translator. Translate the user's text into natural ${targetLang}. Keep proper nouns (names, places, titles), any #numbers and dialogue quoted inside quotation marks unchanged. Keep line breaks. Do not summarize, add, or omit anything. Reply with only the translation, without quotes or notes.`;
-    const raw = await callModel(system, text, { retries: 1, signal });
+    const raw = await callModel(system, text, { task: 'helper', retries: 1, signal });
     const out = String(raw || '').trim().replace(/^```[a-z]*\s*|\s*```$/g, '').trim();
     return out && !looksRefused(out) ? out : null;
 }
@@ -8971,7 +9034,7 @@ async function translateOne(text, targetLang, signal = null) {
 async function translateBatch(items, targetLang, signal = null) {
     const input = Object.fromEntries(items.map((t, i) => [String(i + 1), t]));
     const system = `You are a translator. The user sends a JSON object of numbered texts. Translate every value into natural ${targetLang}. Keep proper nouns (names, places, titles), any #numbers and dialogue quoted inside quotation marks unchanged. Do not summarize, merge, add, or omit anything. Reply with ONLY a JSON object with exactly the same keys, each mapped to its translation.`;
-    const raw = await callModel(system, JSON.stringify(input), { retries: 1, signal });
+    const raw = await callModel(system, JSON.stringify(input), { task: 'helper', retries: 1, signal });
     let parsed = parseJsonLenient(raw);
     if (Array.isArray(parsed) && parsed.length === 1 && parsed[0] && typeof parsed[0] === 'object' && !Array.isArray(parsed[0])) parsed = parsed[0];
     const out = new Array(items.length).fill(null);
@@ -10404,7 +10467,7 @@ Reply with exactly this block and nothing else:
         `<summary>\ntitle: ${node.title}\nwhen: ${node.when || ''}\n${node.text}\n</summary>`,
         'Check the summary against the transcript now.',
     ].join('\n\n');
-    const out = await callModel(system, user, { expectTag: 'issues', retries: 1 });
+    const out = await callModel(system, user, { task: 'check', expectTag: 'issues', retries: 1 });
     const list = parseJsonLenient(extractTag(out, 'issues') || '[]');
     if (!Array.isArray(list)) return [];
     return list

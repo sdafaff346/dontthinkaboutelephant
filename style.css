@@ -2298,3 +2298,24 @@
         animation: lm-fade-busy 2.4s ease-in-out infinite !important;
     }
 }
+
+/* Per-job models: a quiet inset list under the "작업마다 다른 모델 쓰기" switch. */
+.lm-root .lm-taskmodels {
+    display: flex; flex-direction: column; align-items: stretch; gap: 0;
+    margin: -2px 0 12px; padding: 4px 12px 10px;
+    border: 1px solid var(--lm-line); border-left: 3px solid var(--lm-accent);
+    border-radius: 10px; background: var(--lm-sunken);
+}
+.lm-root .lm-taskmodels[hidden] { display: none !important; }
+.lm-root .lm-taskrow {
+    display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 4px 12px; align-items: center;
+    padding: 8px 0; border-bottom: 1px solid var(--lm-line); margin: 0; cursor: default;
+}
+.lm-root .lm-taskrow-text { display: flex; flex-direction: column; min-width: 0; }
+.lm-root .lm-taskrow-text b { font-size: 0.95em; color: var(--lm-text); }
+.lm-root .lm-taskrow-text small { font-size: 0.8em; color: var(--lm-muted); line-height: 1.35; }
+.lm-root .lm-taskrow .lm-select { width: 100%; max-width: none; flex: none; margin: 0; }
+.lm-root .lm-taskmodels > .lm-hint { padding-top: 8px; }
+@container lm (max-width: 380px) {
+    .lm-root .lm-taskrow { grid-template-columns: 1fr; }
+}
