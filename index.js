@@ -2442,12 +2442,12 @@ function buildCorpus(memory) {
     const items = [];
     for (const e of memory.events || []) {
         const text = eventEmbedText(e);
-        items.push({ hash: hashString(`ev|${e.id}|${text}`), kind: 'event', text, display: e.text, importance: e.importance || 3, from: e.from, to: e.to, when: e.when || '' });
+        items.push({ hash: hashString(`ev|${e.id}|${text}`), kind: 'event', text, display: e.text, importance: e.importance || 3, from: e.from, to: e.to, when: e.when || '', keywords: [...(e.keywords || []), ...(e.items || []), ...(e.place ? [e.place] : [])] });
     }
     for (const a of memory.archive || []) {
         if (a.rewound) continue;
         const text = `${a.title}: ${a.text}${a.keywords?.length ? ` | Keywords: ${a.keywords.join(', ')}` : ''}`;
-        items.push({ hash: hashString(`ar|${a.id}|${text}`), kind: 'archive', text, display: `${a.title}: ${a.text}`, importance: a.importance || 3, from: a.from, to: a.to });
+        items.push({ hash: hashString(`ar|${a.id}|${text}`), kind: 'archive', text, display: `${a.title}: ${a.text}`, importance: a.importance || 3, from: a.from, to: a.to, keywords: a.keywords || [] });
     }
     const { chat } = ctx();
     const allMode = s.indexAllMessages;
@@ -2920,7 +2920,50 @@ function recallQuery(recentChat) {
     return lines.join('\n').slice(-3000);
 }
 
-async function hybridRecall(memory, query, { useDense = true, topK = null, budget = null, noRaw = false } = {}) {
+// ---------------------------------------------------------------- recall cooldown and mute
+// Recall always fills its slots, so one striking old scene can be handed to the model turn after
+// turn, and models take that as a cue to reminisce ("like the crab in Ginza 29 years ago"). For the
+// per-turn recall, a scene sent in the last few turns, or one the AI already brought up in a
+// recent reply, ranks lower; words the user muted for this chat keep a scene out entirely.
+const RECALL_COOLDOWN_TURNS = 3;
+let recallRecent = { chatId: null, turns: [] };
+
+function recallTurns() {
+    const id = ctx().getCurrentChatId?.() ?? null;
+    if (recallRecent.chatId !== id) recallRecent = { chatId: id, turns: [] };
+    return recallRecent.turns;
+}
+
+function noteRecallTurn(results) {
+    const turns = recallTurns();
+    turns.push(new Set(results.map(r => r.item.hash)));
+    while (turns.length > RECALL_COOLDOWN_TURNS) turns.shift();
+}
+
+function recallMuteWords(memory) {
+    return String(memory?.recallMute || '').split(/[\n,，、]+/).map(w => w.trim().toLowerCase()).filter(w => w.length >= 1).slice(0, 50);
+}
+
+function isMutedRecall(item, words) {
+    if (!words.length) return false;
+    const hay = `${item.display || ''} ${item.text || ''}`.toLowerCase();
+    return words.some(w => hay.includes(w));
+}
+
+// Lower score for scenes sent recently or already echoed by the AI in its last replies.
+function recallCooldown() {
+    const turns = recallTurns();
+    const replies = (ctx().chat || []).filter(m => m && !m.is_user && !m.is_system).slice(-2).map(m => String(m.mes || '').toLowerCase()).join('\n');
+    return (item) => {
+        let factor = 1;
+        for (const t of turns) if (t.has(item.hash)) factor *= 0.7;
+        const echoed = (item.keywords || []).some(k => String(k).trim().length >= 2 && replies.includes(String(k).trim().toLowerCase()));
+        if (echoed) factor *= 0.5;
+        return factor;
+    };
+}
+
+async function hybridRecall(memory, query, { useDense = true, topK = null, budget = null, noRaw = false, forTurn = false } = {}) {
     const s = getSettings();
     const maxItems = topK ?? s.recallTopK;
     const maxTokens = budget ?? s.recallTokenBudget;
@@ -2931,7 +2974,8 @@ async function hybridRecall(memory, query, { useDense = true, topK = null, budge
     const chatNow = ctx().chat || [];
     const visibleRaw = (x) => x.kind === 'raw' && x.from > memory.cursor
         && rangeIndices(x.from, x.to).every(i => chatNow[i] && !chatNow[i].is_system);
-    const searchable = corpus.filter(x => !visibleRaw(x) && !(noRaw && x.kind === 'raw'));
+    const muted = forTurn ? recallMuteWords(memory) : [];
+    const searchable = corpus.filter(x => !visibleRaw(x) && !(noRaw && x.kind === 'raw') && !isMutedRecall(x, muted));
     const byHash = new Map(searchable.map(x => [x.hash, x]));
     const lists = [];
     let dense = false;
@@ -2967,11 +3011,12 @@ async function hybridRecall(memory, query, { useDense = true, topK = null, budge
     const wRec = s.recencyWeight;
     const wSum = (wRel + wImp + wRec) || 1;
     const cursor = Math.max(memory.cursor, 1);
+    const cool = forTurn ? recallCooldown() : () => 1;
     const ranked = [...fused.values()].map(({ item, rrf }) => {
         const relevance = rrf / maxRrf;
         const importance = ((item.importance || 3) - 1) / 4;
         const recency = Math.min(1, Math.max(0, (item.to ?? 0) / cursor));
-        return { item, score: (wRel * relevance + wImp * importance + wRec * recency) / wSum, relevance };
+        return { item, score: cool(item) * (wRel * relevance + wImp * importance + wRec * recency) / wSum, relevance };
     }).sort((a, b) => b.score - a.score);
 
     const picked = [];
@@ -2999,7 +3044,7 @@ function recallText(results) {
     });
     return [
         '<recalled_memories>',
-        'Moments from earlier in this story that may be relevant right now. They already happened; use them for facts and continuity only where they fit, and do not mention this list. They are reference notes, not a style guide: write in the current voice of the conversation, and never copy their wording, phrasing or recurring expressions.',
+        'Moments from earlier in this story that may be relevant right now. They already happened; use them for facts and continuity only where they fit, and do not mention this list. Most replies need none of them: do not work them in as reminiscence, flashbacks or comparisons ("like that time years ago") unless the current scene is actually about that moment, and never bring the same past moment up again and again. They are reference notes, not a style guide: write in the current voice of the conversation, and never copy their wording, phrasing or recurring expressions.',
         ...lines,
         '</recalled_memories>',
     ].join('\n');
@@ -3360,7 +3405,7 @@ async function refreshRecall(recentChat) {
             } catch (err) {
                 console.warn(LOG_PREFIX, 'query expansion skipped', err);
             }
-            return { ...(await hybridRecall(memory, queries, { noRaw: !s.recallRawDialogue })), queries: queries.length };
+            return { ...(await hybridRecall(memory, queries, { noRaw: !s.recallRawDialogue, forTurn: true })), queries: queries.length };
         })();
         let outcome;
         let late = false;
@@ -3370,10 +3415,11 @@ async function refreshRecall(recentChat) {
             if (String(err?.message) !== 'timeout') console.warn(LOG_PREFIX, 'recall failed', err);
             late = String(err?.message) === 'timeout';
             full.catch(() => {});
-            outcome = { ...(await hybridRecall(memory, [base], { useDense: false, noRaw: !s.recallRawDialogue })), queries: 1 };
+            outcome = { ...(await hybridRecall(memory, [base], { useDense: false, noRaw: !s.recallRawDialogue, forTurn: true })), queries: 1 };
         }
         const { results, dense, queries } = outcome;
         lastRecall = results;
+        noteRecallTurn(results);
         text = recallText(results);
         const raw = results.filter(r => r.item?.kind === 'raw').length;
         const secs = ((Date.now() - started) / 1000).toFixed(1);
@@ -3913,7 +3959,7 @@ Rules:
     header: {
         label: '기억 주입 머리말',
         hint: '대화할 때 기억 앞에 붙는 설명. {{covered}}는 기억한 메시지 범위',
-        text: 'This is the authoritative record of the earlier part of this story ({{covered}}), compressed because the original messages are no longer shown. Treat everything here as established canon of this story: keep names, facts, relationships, injuries, promises and open threads consistent with it. Older events are condensed; the most recent messages continue directly after the last timeline entry. Characters only know secrets they are listed as knowing. This memory records what happened; it does not redefine who the characters are, and it is not a model of style: write in the voice the current conversation uses and do not reuse its wording. Their personalities and ways of speaking come from the character description and the [Characters] notes: keep them consistent, write their dialogue in their own voice rather than the neutral tone of these notes, and show change only where the record shows growth, gradually and without losing core traits. Use it silently; do not repeat or summarize it in replies.',
+        text: 'This is the authoritative record of the earlier part of this story ({{covered}}), compressed because the original messages are no longer shown. Treat everything here as established canon of this story: keep names, facts, relationships, injuries, promises and open threads consistent with it. Older events are condensed; the most recent messages continue directly after the last timeline entry. Characters only know secrets they are listed as knowing. This memory records what happened; it does not redefine who the characters are, and it is not a model of style: write in the voice the current conversation uses and do not reuse its wording. Their personalities and ways of speaking come from the character description and the [Characters] notes: keep them consistent, write their dialogue in their own voice rather than the neutral tone of these notes, and show change only where the record shows growth, gradually and without losing core traits. Use it silently; do not repeat or summarize it in replies, and do not bring up past events as nostalgic asides, flashbacks or comparisons (\"just like that time years ago\") unless the current scene is actually about them.',
     },
 };
 
@@ -3979,7 +4025,7 @@ Rules:
 - "quotes": up to 8 short lines of {{name}}'s own dialogue, copied exactly, character for character, in the original language. Prefer lines that show temperament, humour, affection or irritation, and lines addressed to other characters. Avoid plot exposition. Each under 120 characters.
 - Language for "speech": {{language}}`,
             voiceCheck: 'Also report out-of-character slips against <cast>: the wrong speech level, first-person pronoun or form of address; a tone that does not fit the character (suddenly too polite, too sweet, too talkative or too formal); phrasing the character would not use; or behaviour that contradicts their core personality with no story reason. Do not report gradual growth that the development notes support or mood shifts with a clear cause. Start the "problem" of such an issue with "[캐해]".',
-            header: 'This is the authoritative record of the earlier part of this story ({{covered}}), compressed because the original messages are no longer shown. Keep every fact in it consistent. It records events only; it never redefines the characters. Write each character from their character description and the [Characters] notes: the same speech level, pronouns, verbal habits, forms of address and temperament as before. Match the voice samples closely without copying them. Let characters change only as far as the record shows, gradually, and never drop core traits. Characters only know secrets they are listed as knowing. Use it silently; do not repeat or summarize it in replies.',
+            header: 'This is the authoritative record of the earlier part of this story ({{covered}}), compressed because the original messages are no longer shown. Keep every fact in it consistent. It records events only; it never redefines the characters. Write each character from their character description and the [Characters] notes: the same speech level, pronouns, verbal habits, forms of address and temperament as before. Match the voice samples closely without copying them. Let characters change only as far as the record shows, gradually, and never drop core traits. Characters only know secrets they are listed as knowing. Use it silently; do not repeat or summarize it in replies, and do not bring up past events as nostalgic asides, flashbacks or comparisons (\"just like that time years ago\") unless the current scene is actually about them.',
         },
     },
     detail: {
@@ -4074,7 +4120,7 @@ Rules:
 - "speech": speech level and politeness, first-person pronoun, typical sentence endings, verbal tics, catchphrases and canon forms of address.
 - "quotes": up to 3 lines copied exactly from the card's first message or example dialogue that best show the voice. Empty if none.
 - Language for core and speech: {{language}}`,
-            header: 'This is the authoritative record of the earlier part of this story ({{covered}}), compressed because the original messages are no longer shown. Keep every fact in it consistent. Characters keep their canon personalities, speech styles, forms of address and relationships, except where this record lists a canon divergence; divergences always override canon. Use canon names and terms exactly. Characters only know secrets they are listed as knowing. Use it silently; do not repeat or summarize it in replies.',
+            header: 'This is the authoritative record of the earlier part of this story ({{covered}}), compressed because the original messages are no longer shown. Keep every fact in it consistent. Characters keep their canon personalities, speech styles, forms of address and relationships, except where this record lists a canon divergence; divergences always override canon. Use canon names and terms exactly. Characters only know secrets they are listed as knowing. Use it silently; do not repeat or summarize it in replies, and do not bring up past events as nostalgic asides, flashbacks or comparisons (\"just like that time years ago\") unless the current scene is actually about them.',
         },
     },
     bond: {
@@ -7377,6 +7423,15 @@ function taskModelRows() {
       <select class="text_pole lm-select" data-lm-task="${task}" aria-label="${esc(t.label)} 모델">${taskModelOptions(s.taskProfiles?.[task] || '')}</select></label>`).join('');
 }
 
+// The mute words belong to the open chat, so the box is refilled whenever the chat changes.
+function syncRecallMute() {
+    const box = document.getElementById('lm_recall_mute');
+    if (!box) return;
+    const memory = hasChat() ? getMemory(false) : null;
+    box.value = memory?.recallMute || '';
+    box.disabled = !hasChat();
+}
+
 // Show or hide the per-job model list and refill it (profiles may have been added or renamed).
 function syncTaskModels(root) {
     const box = root?.querySelector('#lm_taskmodels');
@@ -7687,6 +7742,10 @@ function settingsHtml() {
           ${checkRow('queryExpansion', '돌려 말해도 찾기', '"그때 그 일" 같은 말을 구체적인 검색어로 바꿔요. 답변마다 짧은 호출이 1번 늘어요')}
           ${numberRow('recallMaxWaitMs', '답변 전 최대 대기', 1000, 60000, '답변을 생성하기 전 기억 검색에 쓰는 시간의 상한이에요. 넘으면 키워드 검색 결과만 넣고 바로 답변을 생성해요. 걸린 시간은 활동 기록에 남아요')}
           ${group('옛 문체·금지어', '오래된 기록은 사실만 참고하고 말투는 따라 하지 않게')}
+          <div class="lm-field lm-field-stack" id="lm_recall_mute_row">
+            <div class="lm-field-text"><span class="lm-field-label">이 채팅에서 회상하지 않을 말</span><span class="lm-hint">쉼표로 구분해요. 이 말이 들어간 지난 장면은 회상으로 넣지 않아요. AI가 같은 옛 일을 자꾸 꺼낼 때 그 장면의 말(예: 대게, 긴자)을 적어요. 기억에서 지우지는 않아요</span></div>
+            <input class="text_pole" id="lm_recall_mute" placeholder="예: 대게, 긴자" aria-label="이 채팅에서 회상하지 않을 말">
+          </div>
           ${checkRow('recallRawDialogue', '옛 원본 대사도 회상에 넣기', '끄면 회상에 요약과 사건만 넣고 옛 대사 원문은 넣지 않아요. AI가 옛날 문체나 말버릇을 자꾸 따라 하면 꺼 보세요')}
           <div class="lm-field lm-field-stack">
             <div class="lm-field-text"><span class="lm-field-label">금지어·반복 표현</span><span class="lm-hint">한 줄에 하나(또는 쉼표로 구분). 코끼리가 넣는 기억·회상·대사 샘플에서 빼요</span></div>
@@ -7836,7 +7895,7 @@ const ESSENTIAL_SETTINGS = new Set(['perTaskModels', 'language', 'detail', 'keep
     'autoCompress', 'autoCompressAt', 'checkContradictions', 'liveStateUpdate', 'yieldToReply',
     'recallEnabled', 'vectorEnabled', 'embedSource', 'memoryBudget',
     'recallRawDialogue', 'bannedWords', 'bannedInChat', 'memoryReasoning', 'canonEnabled']);
-const ESSENTIAL_IDS = new Set(['lm_taskmodels', 'lm_btn_unhide', 'lm_profile', 'lm_fallback', 'lm_btn_test', 'lm_btn_repeat']);
+const ESSENTIAL_IDS = new Set(['lm_recall_mute_row', 'lm_taskmodels', 'lm_btn_unhide', 'lm_profile', 'lm_fallback', 'lm_btn_test', 'lm_btn_repeat']);
 const ADVANCED_PANES = new Set(['lore', 'inject', 'prompt']);
 
 function applySimpleView(root) {
@@ -8308,6 +8367,16 @@ function bindSettings(root) {
         });
     });
     syncTaskModels(root);
+    const mute = root.querySelector('#lm_recall_mute');
+    mute?.addEventListener('change', () => {
+        const memory = getMemory(true);
+        if (!memory) return toastr.info('채팅을 먼저 열어 주세요.');
+        memory.recallMute = mute.value.trim();
+        ctx().saveMetadataDebounced?.();
+        const n = recallMuteWords(memory).length;
+        toastr.info(n ? `이 채팅에서는 ${recallMuteWords(memory).map(w => `"${w}"`).join(', ')} 중 하나라도 들어간 장면을 회상하지 않아요.` : '회상하지 않을 말을 비웠어요.', APP_NAME);
+    });
+    syncRecallMute();
     const fallback = root.querySelector('#lm_fallback');
     fallback.addEventListener('focus', () => {
         fallback.innerHTML = profileOptions(s.fallbackProfileId, '사용 안 함');
@@ -12310,6 +12379,7 @@ function onChatChanged() {
     }
     refreshInjection();
     updateStatus();
+    syncRecallMute();
     setTimeout(decorateAll, 300);
     // Opening a chat (or reloading the page) makes no model or embedding call. Background
     // indexing waits until something happens in this chat, so a chat opened by mistake is free.
