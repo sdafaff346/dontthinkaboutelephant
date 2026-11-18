@@ -1211,7 +1211,10 @@ function onGenerationStarted(type, params, dryRun) {
     }
     if (stopped.length && !slowHintShown) {
         slowHintShown = true;
-        toastr.info(`새 답변을 먼저 받으려고 코끼리의 ${stopped.join('·')}을(를) 잠시 멈췄어요. 같은 API로 동시에 요청하면 답이 늦어질 수 있어서예요. 설정 → 자동 → '답변 생성 중엔 양보하기'에서 바꿀 수 있어요.`, APP_NAME, { timeOut: 9000 });
+        // Without a profile the request goes through SillyTavern's own connection, which can't be
+        // cancelled: the elephant stops waiting, but the API still works on it next to the reply.
+        const noProfile = stopped.includes('자동 압축') && !taskProfile('compress');
+        toastr.info(`새 답변을 먼저 받으려고 코끼리의 ${stopped.join('·')}을(를) 잠시 멈췄어요. 같은 API로 동시에 요청하면 답이 늦어질 수 있어서예요.${noProfile ? " 다만 요약 모델이 '현재 연결 사용'이면 이미 보낸 요청은 API 쪽에서 끝까지 돌아서 답변이 조금 느릴 수 있어요. 설정 → 요약 → 요약 모델을 연결 프로필로 정하면 바로 끊겨요." : ''} 설정 → 자동 → '답변 생성 중엔 양보하기'에서 바꿀 수 있어요.`, APP_NAME, { timeOut: noProfile ? 14000 : 9000 });
     }
 }
 
@@ -2388,6 +2391,8 @@ function archiveNode(memory, node, kind = 'timeline', ownerId = null) {
         importance: node.importance || 3,
         from: node.from,
         to: node.to,
+        ...(node.tier ? { tier: node.tier } : {}),
+        ...(node.when ? { when: node.when } : {}),
     });
     const max = getSettings().archiveMax;
     if (memory.archive.length > max) {
@@ -6644,6 +6649,15 @@ function noteExternalTest() {
     logActivity('check', '봇 테스터가 테스트하는 동안에는 답변 점검·자동 압축·이어가기를 쉬어요');
 }
 
+// Auto compress waits while the user is writing their next message: a summary that starts
+// then would still be running when they send it, and both requests would share the API.
+let lastTypingAt = 0;
+document.addEventListener('input', (e) => { if (e.target?.id === 'send_textarea') lastTypingAt = Date.now(); }, true);
+function userIsTyping() {
+    const box = document.getElementById('send_textarea');
+    return !!box && String(box.value || '').trim().length > 0 && Date.now() - lastTypingAt < 20000;
+}
+
 function maybeAutoCompress() {
     const s = getSettings();
     if (!s.enabled || !s.autoCompress || busy || !hasChat() || autoTimer) return;
@@ -6654,7 +6668,7 @@ function maybeAutoCompress() {
     const attempt = () => {
         autoTimer = null;
         if (!stillSameChat(chatId) || busy) return;
-        if ((turnBusy || stIsGenerating()) && tries++ < 50) {
+        if ((turnBusy || stIsGenerating() || userIsTyping()) && tries++ < 100) {
             autoTimer = setTimeout(attempt, 3000);
             return;
         }
@@ -7291,6 +7305,7 @@ const ICONS = {
     compress: '<path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="m14 10 6.5-6.5"/><path d="M3.5 20.5 10 14"/>',
     layers: '<path d="M12 3 2.5 8 12 13l9.5-5z"/><path d="m2.5 12.5 9.5 5 9.5-5"/><path d="m2.5 17 9.5 5 9.5-5"/>',
     stop: '<rect x="6" y="6" width="12" height="12" rx="2.5"/>',
+    scissors: '<circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M8.1 8.1 20 20"/><path d="M8.1 15.9 20 4"/>',
     book: '<path d="M4 19.5V5a2 2 0 0 1 2-2h13v14H6.5A2.5 2.5 0 0 0 4 19.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H19v-5"/>',
     sparkle: '<path d="m12 3.5 1.9 5.1 5.1 1.9-5.1 1.9-1.9 5.1-1.9-5.1-5.1-1.9 5.1-1.9z"/><path d="m19 15.5.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/>',
     undo: '<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>',
@@ -9598,6 +9613,7 @@ function managerHtml(memory) {
           ${tool('lm_handoff_save', 'handoff', '새 채팅으로 이어가기', '', '이 기억을 저장해 두고, 같은 캐릭터로 새 채팅을 열 때 이어받아요')}
           ${tool('lm_handoff_load', 'receive', '이전 채팅 기억 이어받기', '', '저장해 둔 이전 채팅의 기억을 이 채팅으로 가져와요')}
           ${tool('lm_merge', 'merge', '다른 채팅 기억 합치기', '', '다른 채팅이나 파일의 기억을 지금 기억에 더해요')}
+          ${tool('lm_cut', 'scissors', '이 지점 이후 기억 지우기', '', '정한 메시지까지의 기억만 남기고 그 뒤를 요약한 기억을 지워요. 분기한 채팅에 원래 채팅의 뒷이야기가 따라왔을 때')}
           ${tool('lm_align_lang', 'sparkle', '기억을 요약 언어로 맞추기', '', '요약 언어와 다른 말로 적힌 기억을 요약 언어로 옮겨요. 다시 요약하지 않아도 돼요')}
           <hr>
           ${tool('lm_unhide_all', 'undo', '숨긴 메시지 모두 보이기', '', '이 채팅에서 숨겨진 메시지를 모두 다시 보이게 해요. 코끼리가 숨긴 것, 직접 숨긴 것 모두요. 기억은 그대로예요')}
@@ -9862,6 +9878,210 @@ function collectManager(root, memory) {
     return out;
 }
 
+// ---------------------------------------------------------------- cut memory at a message
+// A branch made at #150 of a chat summarized to #300 copies all of that chat's memory, so the
+// story after #150 (which didn't happen in the branch) was remembered too. Cutting keeps what
+// happened before the cut: a chapter or the story-so-far that runs past it is taken apart into
+// its archived episodes, the ones that end before the cut come back, and anything that can't be
+// put back is summarized again from the messages, which are shown again.
+
+// The end of what this chat's own messages say was summarized. In a branch only the copied
+// messages carry the elephant's tags, so this is the branch point.
+function ownedEnd(memory) {
+    const ids = new Set([SAGA_OWNER, ...memory.timeline.map(n => n.id)]);
+    let end = -1;
+    ctx().chat.forEach((m, i) => { if (m?.extra?.lm_owner && ids.has(m.extra.lm_owner)) end = i; });
+    return end;
+}
+
+// Where memory runs past this chat's own messages: the first message index it shouldn't cover, or -1.
+function foreignTailCut(memory) {
+    if (!memory || !hasContent(memory) || memory.cursor < 0) return -1;
+    const end = ownedEnd(memory);
+    if (end < 0 || memory.cursor <= end) return -1;
+    return end + 1;
+}
+
+function archivedAsNode(a) {
+    return {
+        id: a.id, tier: a.tier || 'episode', from: a.from, to: a.to, title: a.title || '', text: a.text || '',
+        when: a.when || '', importance: a.importance || 3, keywords: a.keywords || [],
+        msgCount: a.to - a.from + 1, pinned: false, starred: false, condensed: 0, stale: false,
+    };
+}
+
+// What cutting at `cut` would do, without changing anything.
+function planCut(memory, cut) {
+    const boundNodes = memory.timeline.filter(n => n.from >= 0);
+    const looseNodes = memory.timeline.filter(n => n.from < 0);
+    const sagaGoes = !!memory.saga.text && memory.saga.coversTo >= cut;
+    // Owners whose summary runs past the cut; their archived parts are candidates to come back.
+    const opened = new Set(boundNodes.filter(n => n.to >= cut).map(n => n.id));
+    if (sagaGoes) opened.add(SAGA_OWNER);
+    const pool = new Map();
+    for (const n of boundNodes) if (n.to < cut) pool.set(n.id, { node: n, kept: true });
+    for (const a of memory.archive) {
+        if (a.kind !== 'timeline' || a.rewound || !opened.has(a.ownerId) || pool.has(a.id)) continue;
+        if (a.from >= 0 && a.to < cut && a.to >= a.from) pool.set(a.id, { node: archivedAsNode(a), kept: false });
+    }
+    // Rebuild a continuous run from the start: at each point take the biggest piece that starts there.
+    const items = [...pool.values()].sort((x, y) => (x.node.from - y.node.from) || (y.node.to - x.node.to));
+    const start = sagaGoes || !memory.saga.text ? 0 : memory.saga.coversTo + 1;
+    const chosen = [];
+    let pos = start;
+    for (;;) {
+        const next = items.find(it => it.node.from >= pos && it.node.from <= pos + 2);
+        if (!next) break;
+        chosen.push(next);
+        pos = next.node.to + 1;
+    }
+    const coveredTo = chosen.length ? pos - 1 : (sagaGoes || !memory.saga.text ? -1 : memory.saga.coversTo);
+    const keepIds = new Set(chosen.map(it => it.node.id));
+    return {
+        cut, sagaGoes, looseNodes, chosen, coveredTo, keepIds,
+        removedNodes: memory.timeline.filter(n => n.from >= 0 && !keepIds.has(n.id)),
+        restored: chosen.filter(it => !it.kept).length,
+        // Messages before the cut that no kept summary covers: shown again and summarized next time.
+        resummarize: Math.max(0, cut - 1 - coveredTo),
+    };
+}
+
+function cutMemoryAt(memory, cut) {
+    const plan = planCut(memory, cut);
+    const { chat } = ctx();
+    pushHistory(memory, `#${cut} 이후 기억 지우기`);
+    const removedIds = new Set(plan.removedNodes.map(n => n.id));
+    if (plan.sagaGoes) removedIds.add(SAGA_OWNER);
+
+    memory.timeline = [...plan.looseNodes, ...plan.chosen.map(it => it.node)];
+    if (plan.sagaGoes) memory.saga = { text: '', coversTo: -1 };
+    const newIds = new Set(memory.timeline.map(n => n.id));
+    const ownerFor = (a) => memory.timeline.find(n => n.from >= 0 && a.from >= n.from && a.to <= n.to && n.id !== a.id);
+    memory.archive = memory.archive.filter(a => {
+        if (newIds.has(a.id)) return false; // back in the timeline
+        const from = a.from ?? -1;
+        const to = a.to ?? from;
+        if (from >= cut || to >= cut) return false; // describes what happened after the cut
+        if (a.kind === 'timeline' && removedIds.has(a.ownerId)) {
+            // Part of a summary that was taken apart: keep it under the piece that now covers it.
+            const owner = ownerFor(a);
+            if (!owner) return false;
+            a.ownerId = owner.id;
+        }
+        return true;
+    });
+
+    // Events of a removed summary go too: that part is summarized again and its events come back then.
+    memory.events = memory.events.filter(e => (e.to ?? e.from ?? -1) < cut && !(e.episodeId && removedIds.has(e.episodeId) && (e.to ?? -1) > plan.coveredTo));
+    memory.hooks = (memory.hooks || []).filter(h => (h.from ?? -1) < cut);
+    for (const h of memory.hooks) {
+        if (h.status === 'resolved' && (h.resolvedAt ?? -1) >= cut) Object.assign(h, { status: 'open', resolvedAt: null, how: '' });
+    }
+    // Ledger entries only remember when they last changed. Take the value from an undo snapshot
+    // made before the cut when there is one; otherwise an entry changed after the cut goes.
+    const older = memory.history
+        .map(hh => { try { return JSON.parse(hh.snap); } catch { return null; } })
+        .filter(m => m && m.cursor < cut && m.cursor >= 0)
+        .sort((a, b) => b.cursor - a.cursor)[0];
+    const olderEntries = new Map((older?.ledger?.entries || []).map(e => [e.id, e]));
+    let ledgerDropped = 0;
+    memory.ledger.entries = memory.ledger.entries.flatMap(e => {
+        if ((e.updatedAt ?? -1) < cut) return [e];
+        const prev = olderEntries.get(e.id);
+        if (prev && (prev.updatedAt ?? -1) < cut) return [prev];
+        ledgerDropped++;
+        return [];
+    });
+    memory.ledger.scene = { ...emptyMemory().ledger.scene, ...(older?.ledger?.scene || {}) };
+    for (const m of memory.cast || []) {
+        m.growth = (m.growth || []).filter(g => (g.at ?? -1) < cut);
+        m.quotes = (m.quotes || []).filter(q => (q.at ?? -1) < cut);
+    }
+    const validIds = new Set([...newIds, ...memory.archive.filter(a => a.ownerId).map(a => a.id), ...(memory.saga.text ? [SAGA_OWNER] : [])]);
+    memory.canon.facts = memory.canon.facts.filter(f => (f.cites || []).some(id => validIds.has(id)) && !(f.cites || []).some(id => removedIds.has(id)));
+    memory.checkpoint = null;
+
+    // Messages: tags follow the kept summaries; originals no summary covers any more are shown.
+    for (const msg of chat) if (msg?.extra) delete msg.extra.lm_owner;
+    if (memory.saga.text && memory.saga.coversTo >= 0) tagMessages(rangeIndices(0, Math.min(memory.saga.coversTo, chat.length - 1)), SAGA_OWNER);
+    for (const n of memory.timeline) if (n.from >= 0) tagMessages(rangeIndices(n.from, Math.min(n.to, chat.length - 1)), n.id);
+    const unhide = [];
+    chat.forEach((msg, i) => {
+        if (msg?.extra?.lm_hidden && !msg.extra.lm_owner) {
+            delete msg.extra.lm_hidden;
+            unhide.push(i);
+        }
+    });
+    setHidden(unhide, false);
+    memory.cursor = plan.coveredTo;
+    memory.hiddenRanges = listToRanges(chat.map((m, i) => (m?.extra?.lm_hidden ? i : -1)).filter(i => i >= 0));
+    memory.rev = (memory.rev || 0) + 1;
+    return { ...plan, ledgerDropped, shown: unhide.length };
+}
+
+function cutSummaryText(memory, plan) {
+    const lines = [];
+    if (plan.removedNodes.length || plan.sagaGoes) lines.push(`#${plan.cut}부터의 이야기가 담긴 요약 ${plan.removedNodes.length + (plan.sagaGoes ? 1 : 0)}개를 지워요${plan.sagaGoes ? " ('지금까지의 이야기' 포함)" : ''}.`);
+    if (plan.restored) lines.push(`챕터나 '지금까지의 이야기'로 합쳐졌던 요약 ${plan.restored}개는 보관함에서 꺼내 되살려요.`);
+    lines.push(plan.coveredTo >= 0 ? `남는 기억: #0~#${plan.coveredTo}.` : '남는 요약이 없어요.');
+    if (plan.resummarize > 0) lines.push(`#${plan.coveredTo + 1}~#${plan.cut - 1} (${plan.resummarize}개)는 원본을 다시 보이게 하고, 다음 압축 때 다시 요약해요.`);
+    lines.push('그 뒤에 생긴 사건·복선·캐릭터 변화·핵심 사실도 함께 빠져요. 위키는 뒤 내용이 섞여 있을 수 있어서, 끝나고 다시 만들기를 권해요.');
+    return lines;
+}
+
+async function runCutMemory({ cut = null, asked = false } = {}) {
+    if (busy) return toastr.warning('작업 중입니다.');
+    const memory = getMemory(false);
+    if (!memory || !hasContent(memory)) return toastr.info('지울 기억이 없어요.');
+    const { chat } = ctx();
+    if (cut === null) {
+        const suggested = foreignTailCut(memory);
+        const def = suggested >= 0 ? suggested - 1 : Math.min(memory.cursor, chat.length - 1);
+        const answer = await ctx().Popup.show.input('이 지점 이후 기억 지우기',
+            `몇 번 메시지까지의 기억을 남길까요? 그 뒤를 요약한 기억은 지워요. 지금 기억은 #${memory.cursor}까지 요약돼 있어요.${suggested >= 0 ? ` 이 채팅의 메시지로는 #${suggested - 1}까지만 확인돼요 (분기한 채팅 같아요).` : ''}`, String(Math.max(0, def)));
+        if (answer === null || answer === undefined || answer === false) return;
+        const n = Number(String(answer).replace(/[^0-9]/g, ''));
+        if (!String(answer).trim() || !Number.isFinite(n)) return toastr.warning('메시지 번호를 숫자로 적어 주세요.');
+        cut = n + 1;
+    }
+    if (cut > memory.cursor) return toastr.info(`기억은 #${memory.cursor}까지라서 #${cut - 1} 뒤로는 지울 게 없어요.`);
+    const plan = planCut(memory, cut);
+    if (!asked) {
+        const ok = await ctx().Popup.show.confirm(`#${cut - 1}까지의 기억만 남기기`, cutSummaryText(memory, plan).join('<br>') + '<br><br>되돌리기로 되돌릴 수 있어요. 진행할까요?');
+        if (!ok) return;
+    }
+    const chatId = ctx().getCurrentChatId();
+    const done = cutMemoryAt(memory, cut);
+    if (!stillSameChat(chatId)) return;
+    await persistChat();
+    refreshInjection();
+    updateStatus();
+    syncAfter();
+    logActivity('compress', `#${cut - 1} 이후 기억을 지웠어요 (요약 ${done.removedNodes.length + (done.sagaGoes ? 1 : 0)}개 지움, ${done.restored}개 되살림${done.shown ? `, 원본 ${done.shown}개 다시 보임` : ''})`);
+    toastr.success(`#${cut - 1}까지의 기억만 남겼어요.${done.resummarize > 0 ? ` #${done.coveredTo + 1}~#${cut - 1}는 다음 압축 때 다시 요약해요.` : ''}${done.ledgerDropped ? ` 그 뒤에 바뀐 기록부 항목 ${done.ledgerDropped}개는 지웠어요.` : ''}`, APP_NAME, { timeOut: 9000 });
+}
+
+// On opening a chat: a branch carries the memory of the chat it came from. Ask once.
+async function checkBranchMemory() {
+    const memory = getMemory(false);
+    const cut = foreignTailCut(memory);
+    if (cut < 0 || busy) return;
+    const key = `${cut}:${memory.cursor}`;
+    if (memory.cutDeclined === key) return;
+    const chatId = ctx().getCurrentChatId();
+    const plan = planCut(memory, cut);
+    const ok = await ctx().Popup.show.confirm('채팅보다 앞서 있는 기억',
+        `이 채팅의 메시지로는 #${cut - 1}까지만 요약이 확인되는데, 기억은 #${memory.cursor}까지 요약돼 있어요. 분기한 채팅이라 원래 채팅의 뒷이야기가 따라왔거나, 요약된 메시지가 지워진 것 같아요.<br><br>${cutSummaryText(memory, plan).join('<br>')}<br><br>#${cut - 1}까지의 기억만 남길까요? 나중에 기억장 → 더보기 → '이 지점 이후 기억 지우기'로도 할 수 있어요.`,
+        { okButton: '#' + (cut - 1) + '까지만 남기기', cancelButton: '그대로 두기' });
+    if (!stillSameChat(chatId) || getMemory(false) !== memory) return;
+    if (!ok) {
+        memory.cutDeclined = key;
+        await persistChat();
+        return;
+    }
+    await runCutMemory({ cut, asked: true });
+}
+
 // Shows the messages of deleted memories to the AI again and pulls the cursor back
 // when the newest memories were removed, so that part can be compressed again.
 function restoreSources(memory, ids, { show = true } = {}) {
@@ -10112,7 +10332,7 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
             await openKoreanView(collectManager(root, memory), koPick.dataset.koScope);
             return;
         }
-        const tool = event.target.closest('#lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_unhide_all, #lm_align_lang, #lm_wiki_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_ttable, #lm_tgraph, #lm_relmap, #lm_statuslog, #lm_verify, #lm_canon_pick, .lm-canon-del');
+        const tool = event.target.closest('#lm_export, #lm_backups, #lm_handoff_save, #lm_handoff_load, #lm_merge, #lm_reset, #lm_unhide_all, #lm_align_lang, #lm_cut, #lm_wiki_reset, #lm_wiki_build, #lm_wiki_md, #lm_wiki_html, #lm_chron, #lm_ttable, #lm_tgraph, #lm_relmap, #lm_statuslog, #lm_verify, #lm_canon_pick, .lm-canon-del');
         if (!tool) return;
         if (tool.classList.contains('lm-canon-del')) {
             const i = Number(tool.dataset.i);
@@ -10199,6 +10419,9 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
                 break;
             case 'lm_align_lang':
                 await closeThen(runAlignLanguage);
+                break;
+            case 'lm_cut':
+                await closeThen(() => runCutMemory());
                 break;
             case 'lm_wiki_reset':
                 await closeThen(() => runReset({ only: ['wiki'] }));
@@ -11860,6 +12083,15 @@ function registerCommands() {
         helpString: '<div>코끼리를 생각하지마: 이 채팅에서 숨겨진 메시지를 모두 다시 보이게 합니다(코끼리가 숨긴 것 + 직접·다른 확장이 숨긴 것). 기억은 그대로예요. <code>/lm-unhide ours</code>는 코끼리가 숨긴 것만, <code>/lm-unhide others</code>는 그 밖의 것만.</div>',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'lm-cut',
+        callback: async (_args, value) => {
+            const n = Number(String(value || '').replace(/[^0-9]/g, ''));
+            await runCutMemory(String(value || '').trim() && Number.isFinite(n) ? { cut: n + 1 } : {});
+            return '';
+        },
+        helpString: '<div>코끼리를 생각하지마: 지정한 메시지까지의 기억만 남기고 그 뒤를 요약한 기억을 지웁니다. <code>/lm-cut 149</code>는 #149까지 남겨요. 번호 없이 쓰면 물어봐요. 분기한 채팅에 원래 채팅의 뒷이야기 기억이 따라왔을 때 써요.</div>',
+    }));
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lm-undo',
         callback: async () => {
             await runUndo();
@@ -12082,6 +12314,13 @@ function onChatChanged() {
     // Opening a chat (or reloading the page) makes no model or embedding call. Background
     // indexing waits until something happens in this chat, so a chat opened by mistake is free.
     deferredSyncChat = getMemory(false) ? c.getCurrentChatId() : null;
+    // A branch brings the memory of the chat it came from; offer to cut it at the branch point.
+    const openedId = c.getCurrentChatId();
+    if (getSettings().enabled && getMemory(false)) {
+        setTimeout(() => {
+            if (stillSameChat(openedId)) checkBranchMemory().catch(err => console.warn(LOG_PREFIX, 'branch check', err));
+        }, 1500);
+    }
     setTimeout(offerHandoff, 600);
     setTimeout(checkOtherMemoryExtensions, 1500);
 }
