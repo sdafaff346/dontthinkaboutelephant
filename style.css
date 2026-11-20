@@ -2277,6 +2277,9 @@
 .lm-ko-menu > summary { gap: 6px; }
 .lm-ko-menu .lm-ko-state { margin-left: 2px; font-size: 11px; }
 .lm-ko-menu .lm-menu-list { min-width: 230px; }
+/* The 한국어로 보기 button sits at the left of the toolbar: open its menu toward the right so it
+   stays on screen on a phone (right-aligned it ran off the left edge). */
+.lm-root .lm-ko-menu .lm-menu-list { left: 0; right: auto; }
 .lm-menu-cap { margin: 2px 8px 6px; font-size: 12px; color: var(--lm-muted); }
 .lm-menu-list hr { width: 100%; margin: 4px 0; border: 0; border-top: 1px solid var(--lm-line); }
 .lm-menu-list .lm-toolbtn .lm-count { margin-left: auto; }
@@ -2319,3 +2322,27 @@
 @container lm (max-width: 380px) {
     .lm-root .lm-taskrow { grid-template-columns: 1fr; }
 }
+
+/* ---------------------------------------------------------------- readability
+   Same colors, layout and look; only the smallest text gets a little larger and looser, so
+   Korean labels stay legible on a phone. Disabled buttons stay faded but still readable. */
+.lm-root .lm-chip,
+.lm-root .lm-stale,
+.lm-root .lm-canon-cite,
+.lm-root .lm-quiet-k,
+.lm-root .lm-range { font-size: 12px; }
+.lm-root .lm-hint,
+.lm-root .lm-cast-field > .lm-hint,
+.lm-root .lm-mode-desc,
+.lm-root .lm-menu-cap { font-size: 12.5px; line-height: 1.55; }
+.lm-root .lm-subhead { font-size: 12.5px; }
+.lm-root .lm-pane .lm-field .lm-hint { font-size: 13px; line-height: 1.6; }
+.lm-root .lm-btn:disabled,
+.lm-root .lm-chipbtn:disabled,
+.lm-root .lm-quickbtn:disabled,
+.lm-menu-list .lm-toolbtn:disabled { opacity: 0.55; }
+/* Korean wraps between words instead of mid-word ("지 / 고"); a word longer than the line still breaks. */
+.lm-root,
+.lm-root textarea,
+.lm-root input,
+.lm-menu-list { word-break: keep-all; overflow-wrap: anywhere; }

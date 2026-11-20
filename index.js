@@ -524,8 +524,11 @@ function listToRanges(list) {
     return ranges;
 }
 
+const ownHideToggles = new Set();
 function setHidden(indices, hide) {
     const { chat } = ctx();
+    for (const i of indices) ownHideToggles.add(i);
+    setTimeout(() => { for (const i of indices) ownHideToggles.delete(i); }, 1500);
     for (const i of indices) {
         const msg = chat[i];
         if (!msg) continue;
@@ -823,6 +826,43 @@ function onMessageUpdated(id) {
     ctx().saveMetadataDebounced?.();
     updateStatus();
     logActivity('forget', `#${n} 요약된 메시지가 다른 확장에서 바뀌어서 그 기억에 다시 요약 표시를 했어요`, 'warn');
+}
+
+// SillyTavern has no event for hiding a message, but it flips the block's is_system attribute.
+// A message the user hides after it was summarized is still inside that memory; mark the memory
+// "다시 요약" so one click summarizes the part again without it.
+function onUserHidMessage(id) {
+    const msg = ctx().chat[id];
+    if (!msg?.is_system || msg.extra?.lm_hidden || isQrMessage(msg)) return;
+    const owner = msg.extra?.lm_owner;
+    if (!owner) return;
+    const memory = getMemory(false);
+    const node = memory?.timeline.find(n => n.id === owner);
+    if (!node) {
+        if (owner === SAGA_OWNER) logActivity('forget', `#${id}을(를) 숨겼지만 이미 '지금까지의 이야기'에 합쳐져서 다시 요약할 수 없어요. 필요하면 기억장에서 직접 고쳐 주세요`, 'warn');
+        return;
+    }
+    if (node.stale) return;
+    node.stale = true;
+    ctx().saveMetadataDebounced?.();
+    updateStatus();
+    logActivity('forget', `#${id} 요약된 메시지를 숨겨서 그 기억에 다시 요약 표시를 했어요. 다시 요약하면 숨긴 메시지는 빠져요`, 'warn');
+}
+
+let hideObserver = null;
+function watchUserHiding() {
+    const chatEl = document.getElementById('chat');
+    if (!chatEl || hideObserver || typeof MutationObserver === 'undefined') return;
+    hideObserver = new MutationObserver((records) => {
+        for (const r of records) {
+            const el = r.target;
+            if (!el?.classList?.contains('mes') || el.getAttribute('is_system') !== 'true') continue;
+            const id = Number(el.getAttribute('mesid'));
+            if (!Number.isInteger(id) || ownHideToggles.has(id)) continue;
+            try { onUserHidMessage(id); } catch (err) { console.warn(LOG_PREFIX, 'hide watch', err); }
+        }
+    });
+    hideObserver.observe(chatEl, { subtree: true, attributes: true, attributeFilter: ['is_system'] });
 }
 
 function onMessageEdited(id) {
@@ -2816,7 +2856,7 @@ async function syncVectors({ notify = false, full = false } = {}) {
         if (!denseAllowed()) {
             const n = buildCorpus(memory).length;
             logActivity('index', `키워드 검색 대상 ${n.toLocaleString()}개`);
-            const why = s.vectorEnabled ? LOCAL_BLOCK_TEXT[localEmbedBlock()] : '의미 검색이 꺼져 있어';
+            const why = s.vectorEnabled ? LOCAL_BLOCK_TEXT[localEmbedBlock()] : '의미 검색이 꺼져 있어요';
             return toastr.info(`${why}. 키워드 검색으로 ${n.toLocaleString()}개를 찾아요. 벡터 색인은 필요 없어요.`, APP_NAME, { timeOut: 12000 });
         }
         if (syncing) return toastr.info('이미 색인하는 중이에요.');
@@ -4484,6 +4524,9 @@ function speakerSamples(maxPerSpeaker = 30) {
     const by = new Map();
     chat.forEach((m, i) => {
         if (!m || m.is_user || m.extra?.isSmallSys || m.extra?.type === 'narrator') return;
+        // Hidden by the user (👻, /hide) or a side story: not part of the story, so not a voice sample.
+        // Originals we hid after summarizing (lm_hidden) still count.
+        if ((m.is_system && !m.extra?.lm_hidden) || isQrMessage(m)) return;
         const name = String(m.name || '').trim();
         if (!name || normName(name) === normName(name1)) return;
         const text = stripMessage(m.mes);
@@ -4581,9 +4624,14 @@ ${sp.items.map(it => `[#${it.i}] ${it.text}`).join('\n\n')}
         memory.castSeeded = true;
         await ctx().saveMetadata();
         refreshInjection();
-        const msg = `${names.join(', ') || '없음'} · 말투 ${speechDone}명 · 대사 샘플 ${quotesDone}줄`;
-        logActivity('compress', `원본에서 말투 다시 모음: ${msg}`);
-        toastr.success(msg, '말투를 다시 모았어요');
+        if (!speechDone && !quotesDone) {
+            logActivity('compress', '원본에서 말투를 모았지만 새로 바뀐 게 없어요');
+            toastr.info('새로 채운 말투나 대사 샘플이 없어요. 이미 다 채워져 있거나, AI 답을 읽지 못했어요.', '말투 모으기');
+        } else {
+            const msg = `${names.join(', ')} · 말투 ${speechDone}명 · 대사 샘플 ${quotesDone}줄`;
+            logActivity('compress', `원본에서 말투 다시 모음: ${msg}`);
+            toastr.success(msg, '말투를 다시 모았어요');
+        }
     } catch (err) {
         if (String(err?.message) === 'aborted') toastr.info('중지했어요. 그때까지 모은 건 저장되지 않았어요.');
         else reportError('말투 모으기 실패', err);
@@ -9000,7 +9048,7 @@ function nodeCard(node) {
       ${node.condensed ? `<span class="lm-range">${node.condensed}회 압축됨</span>` : ''}
       ${node.starred ? '<span class="lm-chip lm-chip-star" title="중요 장면이 들어 있어서 정리할 때 줄이지 않아요">★ 중요</span>' : ''}
       ${node.review?.length ? `<button type="button" class="lm-review" data-review="${esc(node.id)}" title="원본과 다른 곳이 있어요. 눌러서 확인해요">${icon('alert')}검토 필요 ${node.review.length}</button>` : node.verified ? '<span class="lm-range lm-verified" title="원본과 대조했어요">검수 통과</span>' : ''}
-      ${node.stale ? `<button type="button" class="lm-stale" data-resum="${esc(node.id)}" title="원본이 바뀌었어요. 눌러서 이 구간만 다시 요약해요">${icon('rotate')}다시 요약</button>` : ''}
+      ${node.stale ? `<button type="button" class="lm-stale" data-resum="${esc(node.id)}" title="원본이 바뀌었거나 숨긴 메시지가 있어요. 눌러서 이 구간만 다시 요약해요">${icon('rotate')}다시 요약</button>` : ''}
       <span class="lm-spacer"></span>
       <span class="lm-ctl">
         ${impControl(node.importance)}
@@ -12214,13 +12262,15 @@ function registerCommands() {
             const question = String(value || '').trim();
             if (!question || !hasChat()) return '';
             const { answer } = await askMemory(question);
+            // Typed on its own the command's result goes nowhere, so show it too.
+            if (answer) toastr.info(esc(answer).replace(/\n/g, '<br>'), `${APP_NAME} · ${esc(question).slice(0, 40)}`, { timeOut: 20000, extendedTimeOut: 10000, closeButton: true, escapeHtml: false });
             return answer;
         },
         unnamedArgumentList: [
             SlashCommandArgument.fromProps({ description: 'question about the story', typeList: [ARGUMENT_TYPE.STRING], isRequired: true }),
         ],
         returns: 'the answer',
-        helpString: '<div>코끼리를 생각하지마: 지금까지의 이야기에 대해 물어봅니다. 예: <code>/lm-ask 레온과 처음 만난 게 언제야? | /echo</code></div>',
+        helpString: '<div>코끼리를 생각하지마: 지금까지의 이야기에 대해 물어봅니다. 답은 알림으로 보여 주고, 다음 명령으로도 넘겨요. 예: <code>/lm-ask 깡이랑 처음 만난 게 언제야?</code></div>',
     }));
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'lm-wiki',
@@ -12514,6 +12564,7 @@ function guarded(label, fn) {
         onChatChanged();
     });
     eventSource.on(event_types.CHAT_CHANGED, guarded('채팅 전환', onChatChanged));
+    watchUserHiding();
     eventSource.on(event_types.MESSAGE_DELETED, guarded('메시지 삭제', onMessageDeleted));
     eventSource.on(event_types.MESSAGE_EDITED, guarded('메시지 수정', onMessageEdited));
     if (event_types.MESSAGE_UPDATED) eventSource.on(event_types.MESSAGE_UPDATED, guarded('메시지 갱신', onMessageUpdated));
