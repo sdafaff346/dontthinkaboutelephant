@@ -35,7 +35,8 @@ function load({ chat = makeChat(30), reply = '', profiles = [], sources = {}, ch
         async generateRaw(args) {
             state.calls.push({ kind: 'raw', args });
             if (state.delay) await new Promise(r => setTimeout(r, state.delay));
-            if (state.fail) throw state.fail;
+            const f = typeof state.fail === 'function' ? state.fail({ profileId: '', raw: true }) : state.fail;
+            if (f) throw f;
             return typeof state.reply === 'function' ? state.reply(args) : state.reply;
         },
         ConnectionManagerRequestService: {

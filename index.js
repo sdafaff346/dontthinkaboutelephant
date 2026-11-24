@@ -3595,8 +3595,20 @@ async function callModel(systemText, userText, { retries = null, expectTag = nul
 // preset was saved into it. Custom endpoints also lose their "include headers".
 const AUTH_RE = /\b401\b|key is required|json is required|service account|unauthori[sz]ed|no auth|not authenticated|authentication|invalid[^.]{0,24}(api[\s_-]?)?key|incorrect api key|api key not valid|missing[^.]{0,12}key|no api key|invalid (proxy )?password|wrong password|invalid token|x-api-key/i;
 
+// SillyTavern 1.19.1 staging (Nov 2026) binds each key to one exact Custom API root. A Custom
+// profile saved before that, used while the chat runs on another Custom profile, is refused
+// before anything is sent (or sent with the chat's key to the wrong root). These all mean
+// "pick this profile's key again"; the fallback to the chat's connection still gets the summary done.
+const CUSTOM_BINDING_RE = /stored key for this connection|select (a )?key again|not approved for this exact api root|select it again|remembered manual connection is unavailable|excludes its custom connection|eligible chat completion key|requires an explicit credential binding|keyless binding|credential binding|cannot carry a credential/i;
+// Shown while SillyTavern is switching profiles; gone a moment later.
+const PROFILE_APPLYING_RE = /connection profile is still being applied/i;
+
+function isCustomBindingError(err) {
+    return CUSTOM_BINDING_RE.test(errorDetail(err));
+}
+
 function isAuthError(err) {
-    return AUTH_RE.test(errorDetail(err));
+    return AUTH_RE.test(errorDetail(err)) || isCustomBindingError(err);
 }
 
 function findProfile(profileId) {
@@ -3732,15 +3744,28 @@ async function profileRepairPayload(profileId) {
 
 let authNoticeShown = false;
 
-function noticeAuthFallback(profileId, how) {
+function noticeAuthFallback(profileId, how, err = null) {
     const name = profileName(profileId);
+    if (err && isCustomBindingError(err)) {
+        logActivity('model', `${name} 프로필의 API 키가 새 실리태번에서 이 주소에 연결돼 있지 않아요 · ${how}`, 'warn');
+        if (authNoticeShown) return;
+        authNoticeShown = true;
+        toastr.warning(
+            `"${esc(name)}" 프로필은 새 실리태번에서 API 키를 다시 골라 줘야 해요. 채팅과 다른 프록시를 쓰는 예전 프로필이면 생겨요. ${how}.<br><br>`
+            + `① 연결 프로필에서 "${esc(name)}"을(를) 고르고 ② API 키 칸에서 그 프록시의 키를 다시 선택해 연결한 뒤 ③ 프로필 저장(업데이트)을 누르고 ④ 원래 채팅 프로필로 돌아오세요.`,
+            APP_NAME,
+            { timeOut: 25000, extendedTimeOut: 10000, closeButton: true, escapeHtml: false },
+        );
+        return;
+    }
     logActivity('model', `${name} 프로필이 인증 오류(401)를 냈어요 · ${how}`, 'warn');
     if (authNoticeShown) return;
     authNoticeShown = true;
     toastr.warning(
-        `"${name}" 프로필로 보낸 요청이 인증 오류(401)로 막혀서 ${how}. 프로필에 저장된 API 키가 지워졌거나 바뀌었을 때, 또는 프록시를 프로필에 저장하지 않았을 때 생겨요. API 연결 화면에서 키(와 프록시)를 맞춘 뒤 Connection Profile의 저장(업데이트) 버튼을 눌러 주면 다음부터는 바로 돼요.`,
+        `"${esc(name)}" 프로필로 보낸 요청이 인증 오류(401)로 막혀서 ${how}. 프로필에 그 API의 키가 저장돼 있지 않거나 바뀌었을 때 생겨요.<br><br>`
+        + `① 연결 프로필에서 "${esc(name)}"을(를) 고르고 ② API 키(와 프록시)를 그 API에 맞는 것으로 골라 연결한 뒤 ③ 프로필 저장(업데이트)을 누르고 ④ 원래 채팅 프로필로 돌아오세요. 꼭 "${esc(name)}"을(를) 고른 상태에서 키를 골라야 해요.`,
         APP_NAME,
-        { timeOut: 15000 },
+        { timeOut: 25000, extendedTimeOut: 10000, closeButton: true, escapeHtml: false },
     );
 }
 
@@ -3761,6 +3786,7 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
     let lastError = null;
     let repair = null;
     let authStep = 0;
+    let waitedForProfile = false;
     let regionTries = null;
     let regionOverride = null;
     let sentReasoning = {};
@@ -3824,6 +3850,23 @@ async function callModelOnce(systemText, userText, { retries = null, expectTag =
             }
             // ST answers a Vertex service-account mix-up with a bare 400 ("Response not OK").
             const vertexBare = profileId && /response not ok|status 400/i.test(errorDetail(err)) && profileSource(findProfile(profileId)) === 'vertexai';
+            // SillyTavern is still switching profiles: wait a moment and send the same request again.
+            if (profileId && PROFILE_APPLYING_RE.test(errorDetail(err)) && !waitedForProfile) {
+                waitedForProfile = true;
+                await sleep(2500);
+                attempt--;
+                continue;
+            }
+            // A key not bound to this profile's API root fails the same way with any repair payload:
+            // go straight to the chat's connection.
+            if (profileId && isCustomBindingError(err) && authStep < 2) {
+                console.warn(LOG_PREFIX, 'custom key binding refused, using the current connection', err);
+                noticeAuthFallback(profileId, '이번 요약은 지금 채팅에 쓰는 연결로 대신 보냈어요', err);
+                authStep = 2;
+                profileId = '';
+                attempt--;
+                continue;
+            }
             if (profileId && (isAuthError(err) || vertexBare) && authStep < 2) {
                 authStep++;
                 if (authStep === 1) {
@@ -4346,9 +4389,12 @@ function errorHint(detail) {
     if (d.includes('could not find profile')) return '선택한 연결 프로필을 찾지 못했어요. 설정 → 요약 탭에서 요약 모델을 다시 골라주세요.';
     if (d.includes('connection manager is not available')) return 'ST 확장 목록에서 Connection Manager를 켜주세요.';
     if (d.includes('not supported') || d.includes('has an api')) return '이 프로필의 API 종류는 쓸 수 없어요. Chat Completion이나 Text Completion 프로필을 골라주세요.';
+    if (CUSTOM_BINDING_RE.test(d)) {
+        return '새 실리태번에서는 Custom(프록시) 연결의 API 키를 주소마다 따로 골라 줘야 해요. 요약에 쓰는 연결 프로필을 고른 뒤 API 키 칸에서 그 프록시의 키를 다시 선택해 연결하고, 프로필 저장(업데이트)을 누른 다음 원래 채팅 프로필로 돌아오세요. 급하면 설정 → 요약의 요약 모델을 "현재 연결 사용"으로 바꿔도 돼요.';
+    }
     if (/\b(401|403)\b|unauthori|permission|api key|api_key|invalid.*key|forbidden|credential|password/.test(d)) {
         return getSettings().profileId || getSettings().fallbackProfileId
-            ? 'API 키나 프록시 인증이 맞지 않아요(401). 요약 모델로 고른 연결 프로필에 예전 키가 저장돼 있거나, 프록시가 프로필에 저장되지 않았을 때 자주 생겨요. ① API 연결 화면에서 키·프록시를 지금 쓰는 것으로 맞추고 ② Connection Profile의 저장(업데이트)을 누르거나, 설정 → 요약 탭의 요약 모델을 "현재 연결 사용"으로 바꿔 보세요.'
+            ? 'API 키나 프록시 인증이 맞지 않아요(401). 요약 모델로 고른 연결 프로필에 그 API의 키가 저장돼 있지 않을 때 자주 생겨요. ① 연결 프로필에서 요약용 프로필을 고르고 ② 그 API에 맞는 키·프록시를 골라 연결한 뒤 ③ 프로필 저장(업데이트)을 누르고 ④ 원래 채팅 프로필로 돌아오세요. 급하면 설정 → 요약의 요약 모델을 "현재 연결 사용"으로 바꿔도 돼요.'
             : 'API 키나 프록시 인증이 맞지 않아요(401). 채팅은 되는데 요약만 안 된다면 SillyTavern을 새로고침해 보고, API 연결 화면에서 키가 선택돼 있는지 확인해주세요.';
     }
     if (/\b429\b|quota|rate.?limit|resource.?exhausted|too many requests/.test(d)) return '사용량 한도에 걸렸어요. 잠시 뒤에 다시 하거나 다른 모델이나 키를 써주세요.';
