@@ -2346,3 +2346,16 @@
 .lm-root textarea,
 .lm-root input,
 .lm-menu-list { word-break: keep-all; overflow-wrap: anywhere; }
+
+/* A gap a deleted memory left in the middle of the timeline. */
+.lm-root .lm-gap-card {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin: 6px 0; padding: 10px 12px;
+    border: 1px dashed var(--lm-warn-color); border-radius: 12px;
+    background: var(--lm-warn-soft); color: var(--lm-text);
+}
+.lm-root .lm-gap-card > svg { flex: 0 0 auto; width: 18px; height: 18px; color: var(--lm-warn-color); }
+.lm-root .lm-gap-text { flex: 1 1 200px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.lm-root .lm-gap-text b { font-size: 14px; }
+.lm-root .lm-gap-text span { font-size: 12.5px; line-height: 1.5; color: var(--lm-muted); }
+.lm-root .lm-gap-card .lm-fill-gap { flex: 0 0 auto; }

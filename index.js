@@ -5217,10 +5217,24 @@ function stillSameChat(chatId) {
     return ctx().getCurrentChatId() === chatId;
 }
 
-async function runCompress({ all = false, auto = false } = {}) {
+async function runCompress({ all = false, auto = false, skipGaps = false } = {}) {
     if (busy) return auto ? undefined : toastr.warning('이미 작업 중입니다.');
     if (!hasChat()) return auto ? undefined : toastr.warning('채팅을 먼저 열어주세요.');
     const s = getSettings();
+    // A pressed 압축 offers the gaps a deleted memory left; auto compress never fills them on its own.
+    if (!auto && !skipGaps) {
+        const gaps = summaryGaps(getMemory(false));
+        if (gaps.length) {
+            const fill = await ctx().Popup.show.confirm('요약이 빠진 구간',
+                `중간에 요약이 빠진 구간이 있어요: ${gapLabel(gaps)}. 기억을 지웠을 때 생겨요.<br><br>이 구간을 먼저 다시 요약할까요?`,
+                { okButton: '빈 구간 먼저 요약', cancelButton: '뒤쪽만 압축' });
+            if (fill) {
+                await runFillGaps({ asked: true });
+                if (summaryGaps(getMemory(false)).length) return;
+            }
+            return runCompress({ all, auto, skipGaps: true });
+        }
+    }
     const { start, end, count } = unsummarizedRange();
     if (count <= 0) return auto ? undefined : toastr.info(`압축할 메시지가 없습니다. (최근 ${s.keepRecent}개는 원본 유지)`);
 
@@ -5436,6 +5450,129 @@ async function previewEpisode(summary, batch) {
 }
 
 // ---------------------------------------------------------------- re-summarize one memory
+
+// ---------------------------------------------------------------- gaps: summarized parts with no memory
+// Compress only continues after the cursor. Deleting a memory in the middle (#22-#39 of
+// #0-#61) shows its originals again but leaves the cursor at #61, so nothing ever summarized
+// that part again and there was no button for it. A gap is a run of story messages before the
+// cursor that no memory covers.
+function summaryGaps(memory) {
+    const { chat } = ctx();
+    if (!memory || memory.cursor < 0) return [];
+    const start = memory.saga.text && memory.saga.coversTo >= 0 ? memory.saga.coversTo + 1 : 0;
+    const end = Math.min(memory.cursor, chat.length - 1);
+    const gaps = [];
+    let cur = null;
+    for (let i = start; i <= end; i++) {
+        const m = chat[i];
+        if (m?.extra?.lm_owner) {
+            if (cur) gaps.push(cur);
+            cur = null;
+            continue;
+        }
+        const story = m && !isQrMessage(m) && String(m.mes ?? '').trim() && (isSummarizable(m) || m.extra?.lm_hidden);
+        if (!story) continue;
+        if (!cur) cur = { from: i, to: i, count: 0 };
+        cur.to = i;
+        cur.count++;
+    }
+    if (cur) gaps.push(cur);
+    return gaps;
+}
+
+function gapLabel(gaps) {
+    return gaps.map(g => `#${g.from}~#${g.to}`).join(', ');
+}
+
+// Summarizes the gaps and puts each new episode in story order. Ledger, foreshadowing and voice
+// updates are left out: they would overwrite what the story has moved on to since.
+// Memories in story order with a card for each gap where it belongs.
+function timelineCards(memory) {
+    const gaps = summaryGaps(memory);
+    if (!gaps.length) return memory.timeline.map(nodeCard).join('');
+    const items = [
+        ...memory.timeline.map(n => ({ from: n.from, html: nodeCard(n) })),
+        ...gaps.map(g => ({ from: g.from, html: `<div class="lm-gap-card" data-gap-from="${g.from}" data-gap-to="${g.to}">${icon('alert')}<div class="lm-gap-text"><b>#${g.from}~#${g.to} 요약 없음</b><span>이 구간의 기억이 지워졌어요. 다시 요약하면 이 자리에 들어가요.</span></div><button type="button" class="lm-chipbtn lm-fill-gap">${icon('sparkle')}<span>다시 요약</span></button></div>` })),
+    ];
+    // Stable: a memory and a gap never share a start.
+    return items.sort((a, b) => a.from - b.from).map(x => x.html).join('');
+}
+
+async function runFillGaps({ asked = false } = {}) {
+    if (busy) return toastr.warning('이미 작업 중입니다.');
+    if (!hasChat()) return toastr.warning('채팅을 먼저 열어주세요.');
+    const memory = getMemory(false);
+    const gaps = summaryGaps(memory);
+    if (!gaps.length) return toastr.info('요약이 빠진 구간이 없어요.');
+    if (!asked) {
+        const ok = await ctx().Popup.show.confirm('빈 구간 다시 요약',
+            `요약이 빠진 구간이 있어요: ${gapLabel(gaps)}.<br><br>지금 다시 요약할까요? 요약한 뒤 원본은 다른 구간처럼 숨겨요. 되돌리기로 되돌릴 수 있어요.`);
+        if (!ok) return;
+    }
+    const s = getSettings();
+    const { chat } = ctx();
+    const chatId = ctx().getCurrentChatId();
+    const batches = gaps.flatMap(g => planBatches(g.from, g.to));
+    if (!batches.length) return toastr.info('요약할 내용이 없어요.');
+    busy = true;
+    abortController = new AbortController();
+    setBusyUI(true);
+    const undoMark = beginUndoGroup(memory);
+    let added = 0;
+    try {
+        for (const batch of batches) {
+            if (abortController.signal.aborted || !stillSameChat(chatId)) break;
+            setProgress(`빈 구간 요약 중 ${added + 1}/${batches.length} (#${batch.from}~#${batch.to})`);
+            let summary = await summarizeBatch(memory, batch);
+            summary = await verifyAfterSummary(memory, batch, summary);
+            if (!stillSameChat(chatId) || getMemory(false) !== memory) break;
+            const { node, events } = summary;
+            markStarredNode(node, batch);
+            pushHistory(memory, `빈 구간 요약 #${batch.from}-#${batch.to}`);
+            const episodeId = newId();
+            addEvents(memory, events, batch, episodeId);
+            const fresh = {
+                id: episodeId, tier: 'episode', from: batch.from, to: batch.to,
+                title: node.title, when: node.when || '', text: node.text,
+                importance: node.importance, keywords: node.keywords,
+                pinned: false, condensed: 0, includeHidden: false,
+                stale: !!node.stale, starred: !!node.starred, review: node.review || null, verified: !!node.verified,
+                msgCount: batch.to - batch.from + 1,
+            };
+            const at = memory.timeline.findIndex(n => n.from > batch.from);
+            if (at < 0) memory.timeline.push(fresh); else memory.timeline.splice(at, 0, fresh);
+            tagMessages(rangeIndices(batch.from, batch.to), episodeId);
+            if (s.hideSummarized) {
+                const toHide = batch.indices.filter(i => !chat[i]?.is_system);
+                setHidden(toHide, true);
+                for (const i of toHide) {
+                    memory.hiddenRanges = addRange(memory.hiddenRanges, i, i);
+                    chat[i].extra.lm_hidden = true;
+                }
+            }
+            memory.rev = (memory.rev || 0) + 1;
+            added++;
+        }
+        if (added && stillSameChat(chatId)) {
+            await persistChat();
+            const left = summaryGaps(memory);
+            toastr.success(`빈 구간을 에피소드 ${added}개로 채웠어요.${left.length ? ` 남은 구간: ${gapLabel(left)}` : ''}`, APP_NAME);
+            logActivity('compress', `빈 구간 요약: 에피소드 ${added}개`);
+            syncAfter();
+        }
+    } catch (err) {
+        if (String(err?.message) === 'aborted') toastr.info('중지했습니다.');
+        else reportError('빈 구간 요약 실패', err);
+    } finally {
+        endUndoGroup(stillSameChat(chatId) ? getMemory(false) : null, undoMark, added ? `빈 구간 요약 (${added}개)` : '');
+        busy = false;
+        abortController = null;
+        setBusyUI(false);
+        setProgress('');
+        refreshInjection();
+        updateStatus();
+    }
+}
 
 async function resummarizeNode(nodeId, { notes = '' } = {}) {
     if (busy) return toastr.warning('이미 작업 중입니다.');
@@ -9833,8 +9970,8 @@ function managerHtml(memory) {
       <div class="lm-field-text"><span class="lm-field-label">지금까지의 이야기</span><span class="lm-hint">오래된 챕터가 합쳐지면 여기에 쌓여요</span></div>
       <textarea class="text_pole" id="lm_saga" rows="${memory.saga.text ? 6 : 2}" placeholder="아직 비어 있어요.">${esc(memory.saga.text)}</textarea>
     </div>
-    ${memory.timeline.length ? bulkBar('timeline', `<label class="lm-restore" title="기억을 지울 때 그 기억에 들어 있던 원본 메시지를 어떻게 할지 골라요. 가장 최근 기억을 지우면 어느 쪽이든 그 구간을 다시 압축할 수 있어요"><span>지운 기억의 원본</span><select id="lm_restore_mode" class="text_pole lm-quiet"><option value="hidden">숨긴 채로 두기</option><option value="show">다시 보이기</option></select></label>`) : ''}
-    <div id="lm_timeline" class="lm-timeline lm-list">${memory.timeline.map(nodeCard).join('') || '<div class="lm-empty">아직 기억한 이야기가 없어요. 패널에서 압축을 누르면 여기에 차곡차곡 쌓여요.</div>'}</div>
+    ${memory.timeline.length ? bulkBar('timeline', `<label class="lm-restore" title="기억을 지울 때 그 기억에 들어 있던 원본 메시지를 어떻게 할지 골라요. 어느 쪽이든 그 구간은 다시 요약할 수 있어요. 가장 최근 기억이면 압축으로, 중간 기억이면 타임라인의 '요약 없음' 칸에서요"><span>지운 기억의 원본</span><select id="lm_restore_mode" class="text_pole lm-quiet"><option value="hidden">숨긴 채로 두기</option><option value="show">다시 보이기</option></select></label>`) : ''}
+    <div id="lm_timeline" class="lm-timeline lm-list">${timelineCards(memory) || '<div class="lm-empty">아직 기억한 이야기가 없어요. 패널에서 압축을 누르면 여기에 차곡차곡 쌓여요.</div>'}</div>
   </section>
 
   <section class="lm-pane" data-lm-pane="ledger" role="tabpanel">
@@ -10431,6 +10568,14 @@ async function openManager({ focusOwner = null, tab: startTab = null } = {}) {
             hookDone.closest('.lm-hook').classList.toggle('lm-hook-done', hookDone.checked);
             return;
         }
+        if (event.target.closest('.lm-fill-gap')) {
+            // Keeps edits made so far, fills the gaps, then comes back to the timeline.
+            await saveThen(async () => {
+                await runFillGaps({ asked: true });
+                openManager({ tab: 'timeline' });
+            });
+            return;
+        }
         const resum = event.target.closest('[data-resum]');
         if (resum) {
             const id = resum.dataset.resum;
@@ -10650,14 +10795,26 @@ async function saveManagerEditsImpl({ root, memory, chatId }) {
     for (const key of ['frame', 'cast', 'saga', 'timeline', 'ledger', 'events', 'archive', 'wiki', 'hooks']) current[key] = edited[key];
     // A hand edit should show up in the memory block itself, not as a "changed since" note.
     current.rev = (current.rev || 0) + 1;
+    const shown = root.querySelector('#lm_restore_mode')?.value === 'show';
     if (removedIds.size) {
-        restoreSources(current, removedIds, { show: root.querySelector('#lm_restore_mode')?.value === 'show' });
+        restoreSources(current, removedIds, { show: shown });
     }
     await persistChat();
     refreshInjection();
     updateStatus();
     toastr.success('기억을 저장했습니다.');
     syncAfter();
+    // Deleting a memory in the middle leaves a part compress won't go back to: offer to summarize it now.
+    const gaps = removedIds.size ? summaryGaps(current) : [];
+    if (gaps.length) {
+        setTimeout(async () => {
+            if (!stillSameChat(chatId) || busy) return;
+            const ok = await ctx().Popup.show.confirm('지운 구간 다시 요약',
+                `지운 기억이 있던 구간(${gapLabel(gaps)})은 이제 요약 없이 원본만 남아 있어요. 압축은 뒤쪽만 이어서 하기 때문에 이 구간은 저절로 다시 요약되지 않아요.<br><br>지금 다시 요약할까요? 나중에 하려면 기억장 → 타임라인의 '요약 없음' 칸에서 할 수 있어요.`,
+                { okButton: '지금 다시 요약', cancelButton: '나중에' });
+            if (ok) await runFillGaps({ asked: true });
+        }, 400);
+    }
     return true;
 }
 
