@@ -2359,3 +2359,18 @@
 .lm-root .lm-gap-text b { font-size: 14px; }
 .lm-root .lm-gap-text span { font-size: 12.5px; line-height: 1.5; color: var(--lm-muted); }
 .lm-root .lm-gap-card .lm-fill-gap { flex: 0 0 auto; }
+
+/* A gap a deleted memory left: warning hatch in the bar and its legend swatch. */
+.lm-seg-gap { background: repeating-linear-gradient(135deg, var(--lm-warn-color) 0 3px, var(--lm-warn-soft) 3px 6px); }
+.lm-root .lm-facts .lm-fill-gap-status { color: var(--lm-warn-color); border-color: var(--lm-warn-color); }
+
+/* The live rows stack label over detail on narrow screens (@media 600px above); the grid has to
+   switch with them, or the detail is squeezed into the 68px label column ("답변마다 약 / 376토큰을"). */
+@media (max-width: 600px) {
+    .lm-root .lm-live-row { grid-template-columns: 8px minmax(0, 1fr) auto; }
+    .lm-root .lm-live-row .lm-live-detail { grid-column: 2 / -1; }
+}
+/* The status header keeps each label whole; when the drawer is narrow the links move to a second line. */
+.lm-root .lm-live-head { flex-wrap: wrap; row-gap: 2px; }
+.lm-root .lm-live-title,
+.lm-root .lm-live-head .lm-link-btn { white-space: nowrap; }

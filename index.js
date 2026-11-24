@@ -7701,6 +7701,11 @@ function spineSegments(memory, total, keepRecent) {
         if (node.from < 0) continue;
         segments.push({ kind: node.tier, from: node.from, to: node.to, label: node.title });
     }
+    // A memory deleted in the middle leaves a hole the bar must show; otherwise its neighbours
+    // close up and the bar looks fully summarized.
+    for (const g of memory ? summaryGaps(memory) : []) {
+        segments.push({ kind: 'gap', from: g.from, to: g.to, label: '요약 없음 (지운 기억) · 다시 요약할 수 있어요' });
+    }
     const cursor = memory?.cursor ?? -1;
     const recentStart = Math.max(cursor + 1, total - keepRecent);
     if (recentStart > cursor + 1) segments.push({ kind: 'pending', from: cursor + 1, to: recentStart - 1, label: '아직 요약 안 됨' });
@@ -8572,6 +8577,7 @@ function bindSettings(root) {
         if (fallback.value && fallback.value === s.profileId) toastr.info('요약 모델과 같은 프로필이에요. 다른 회사 모델을 고르면 효과가 있어요.');
     });
     root.querySelector('#lm_btn_compress').addEventListener('click', () => runCompress({ all: false }));
+    root.querySelector('#lm_status')?.addEventListener('click', (e) => { if (e.target.closest('.lm-fill-gap-status')) runFillGaps(); });
     root.querySelector('#lm_btn_all').addEventListener('click', () => runCompress({ all: true }));
     root.querySelector('#lm_btn_compact').addEventListener('click', () => runCompact());
     root.querySelector('#lm_btn_manager').addEventListener('click', () => openManager());
@@ -9084,6 +9090,8 @@ function updateStatus() {
     const over = tokens > s.memoryBudget;
     const pct = Math.min(100, Math.round((tokens / Math.max(1, s.memoryBudget)) * 100));
     const segments = spineSegments(memory, total, s.keepRecent);
+    const gaps = memory ? summaryGaps(memory) : [];
+    const gapMsgs = gaps.reduce((n, g) => n + g.count, 0);
     const spine = segments.length
         ? segments.map(seg => `<span class="lm-seg lm-seg-${seg.kind}" style="flex-grow:${seg.to - seg.from + 1}" title="${esc(seg.label)} (#${seg.from}~#${seg.to})"></span>`).join('')
         : '<span class="lm-seg lm-seg-empty" style="flex-grow:1"></span>';
@@ -9094,6 +9102,7 @@ function updateStatus() {
         memory?.saga.text ? { kind: 'saga', text: '지금까지의 이야기' } : null,
         chapters ? { kind: 'chapter', text: `챕터 ${chapters}` } : null,
         episodes ? { kind: 'episode', text: `에피소드 ${episodes}` } : null,
+        gaps.length ? { kind: 'gap', text: `빈 구간 ${gapLabel(gaps)}` } : null,
         count ? { kind: 'pending', text: `미요약 ${count.toLocaleString()}` } : null,
         recent ? { kind: 'recent', text: `최근 원본 ${recent}` } : null,
     ].filter(Boolean).map(l => `<span class="lm-legend-item"><i class="lm-swatch lm-seg-${l.kind}"></i>${l.text}</span>`).join('');
@@ -9123,17 +9132,20 @@ function updateStatus() {
         <span>사건 ${(memory?.events?.length ?? 0).toLocaleString()}개</span>
         <span>기록 ${memory?.ledger.entries.length ?? 0}개</span>
         <span>보관 ${memory?.archive.length ?? 0}개</span>
+        ${gaps.length ? `<button type="button" class="lm-chipbtn lm-fill-gap-status" title="지운 기억이 있던 ${gapLabel(gaps)}을(를) 다시 요약해서 제자리에 넣어요">${icon('sparkle')}<span>빈 구간 다시 요약</span></button>` : ''}
         ${memory?.timeline.some(n => n.stale) ? `<span class="lm-warn">다시 요약 필요 ${memory.timeline.filter(n => n.stale).length}개</span>` : ''}
         ${memory?.timeline.some(n => n.from === -1) ? '<span>이전 채팅에서 이어받음</span>' : ''}
       </div>`;
     const sub = document.getElementById('lm_head_sub');
-    if (sub) sub.textContent = cursor >= 0 ? `메시지 ${total.toLocaleString()}개 중 #${cursor.toLocaleString()}까지 기억` : `메시지 ${total.toLocaleString()}개 · 아직 기억 없음`;
+    if (sub) sub.textContent = cursor >= 0 ? `메시지 ${total.toLocaleString()}개 중 #${cursor.toLocaleString()}까지 기억${gaps.length ? ` · 빈 구간 ${gaps.length}곳` : ''}` : `메시지 ${total.toLocaleString()}개 · 아직 기억 없음`;
     renderLive();
     const badge = document.getElementById('lm_badge');
     if (badge) {
-        badge.hidden = count <= 0;
-        badge.textContent = count > 999 ? '999+' : String(count);
-        badge.title = `미요약 ${count}개`;
+        // Pressing 압축 offers the gaps first, so they count toward the badge too.
+        const shown = count + gapMsgs;
+        badge.hidden = shown <= 0;
+        badge.textContent = shown > 999 ? '999+' : String(shown);
+        badge.title = gapMsgs ? `미요약 ${count}개 + 빈 구간 ${gapMsgs}개` : `미요약 ${count}개`;
     }
     const chatId = ctx().getCurrentChatId();
     if (s.remindAt > 0 && count >= s.remindAt && remindedFor !== chatId && !busy) {
