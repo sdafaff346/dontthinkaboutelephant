@@ -2374,3 +2374,201 @@
 .lm-root .lm-live-head { flex-wrap: wrap; row-gap: 2px; }
 .lm-root .lm-live-title,
 .lm-root .lm-live-head .lm-link-btn { white-space: nowrap; }
+
+/* ---------- v1.9.76–77: drama-style relationship chart and the 관계·변화 tab ----------
+ * Kind colors are earthy so they sit with the ivory/bronze (day) and charcoal/gold (night) base. */
+.lm-root {
+    --lm-tone-love: #B4506A;
+    --lm-tone-crush: #C57A8F;
+    --lm-tone-family: #6F8240;
+    --lm-tone-friend: #4A7F9E;
+    --lm-tone-ally: #3D8170;
+    --lm-tone-rival: #B5722C;
+    --lm-tone-hostile: #A8443A;
+    --lm-tone-work: #696C85;
+    --lm-tone-complicated: #84609C;
+    --lm-tone-other: #8A8590;
+}
+.lm-root[data-lm-mode="night"] {
+    --lm-tone-love: #E390A2;
+    --lm-tone-crush: #EAADBB;
+    --lm-tone-family: #B3C283;
+    --lm-tone-friend: #8DBDD8;
+    --lm-tone-ally: #85C7B5;
+    --lm-tone-rival: #E6AA6A;
+    --lm-tone-hostile: #EE8578;
+    --lm-tone-work: #ADB0CA;
+    --lm-tone-complicated: #C4A2DE;
+    --lm-tone-other: #A29DAB;
+}
+.lm-root .tone-love { --lm-tone: var(--lm-tone-love); }
+.lm-root .tone-crush { --lm-tone: var(--lm-tone-crush); }
+.lm-root .tone-family { --lm-tone: var(--lm-tone-family); }
+.lm-root .tone-friend { --lm-tone: var(--lm-tone-friend); }
+.lm-root .tone-ally { --lm-tone: var(--lm-tone-ally); }
+.lm-root .tone-rival { --lm-tone: var(--lm-tone-rival); }
+.lm-root .tone-hostile { --lm-tone: var(--lm-tone-hostile); }
+.lm-root .tone-work { --lm-tone: var(--lm-tone-work); }
+.lm-root .tone-complicated { --lm-tone: var(--lm-tone-complicated); }
+.lm-root .tone-other { --lm-tone: var(--lm-tone-other); }
+
+/* "Fill in from older memories": one quiet bronze card instead of a loud button. */
+.lm-root .lm-callout { display: flex; align-items: center; gap: 12px; margin: 2px 0 14px; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--lm-accent) 38%, var(--lm-line)); border-radius: var(--lm-r); background: var(--lm-accent-soft); }
+.lm-root .lm-callout-icon { flex: 0 0 auto; display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; background: var(--lm-card); color: var(--lm-accent-ink); }
+.lm-root .lm-callout-text { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.lm-root .lm-callout-text b { font-size: 14px; color: var(--lm-text); }
+.lm-root .lm-callout-text span { font-size: 12.5px; line-height: 1.5; color: var(--lm-muted); }
+.lm-root .lm-callout .lm-toolbtn { flex: 0 0 auto; }
+
+/* Three views inside the tab. */
+.lm-root .lm-seg-tabs { display: flex; gap: 4px; margin: 4px 0 14px; padding: 4px; border: 1px solid var(--lm-line); border-radius: 12px; background: var(--lm-sunken); }
+.lm-root .lm-seg-btn { flex: 1 1 0; display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 38px; padding: 0 8px; border: 0; border-radius: 9px; background: transparent; color: var(--lm-muted); font-family: var(--lm-font); font-size: 14px; font-weight: 600; cursor: pointer; white-space: nowrap; transition: background .15s, color .15s; }
+.lm-root .lm-seg-btn:hover { color: var(--lm-text); }
+.lm-root .lm-seg-btn.on { background: var(--lm-card); color: var(--lm-text); box-shadow: var(--lm-shadow); }
+.lm-root .lm-seg-btn.on .lm-count { background: var(--lm-accent-soft); color: var(--lm-accent-ink); }
+.lm-root .lm-seg-btn:focus-visible { outline: none; box-shadow: var(--lm-ring); }
+.lm-root .lm-shift-viewhead { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.lm-root .lm-shift-viewhead .lm-hint { flex: 1 1 auto; margin: 0; }
+
+/* Person chips: easier to tap than the names inside the drawing. */
+.lm-root .lm-rel-people,
+.lm-root .lm-chip-row { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; padding: 2px 1px 6px; margin-bottom: 4px; }
+.lm-root .lm-rel-people::-webkit-scrollbar,
+.lm-root .lm-chip-row::-webkit-scrollbar { display: none; }
+.lm-root .lm-person-chip { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 0 12px; border: 1px solid var(--lm-line); border-radius: 999px; background: var(--lm-card); color: var(--lm-text); font-family: var(--lm-font); font-size: 13px; font-weight: 600; cursor: pointer; white-space: nowrap; transition: background .15s, border-color .15s; }
+.lm-root .lm-person-chip:hover { background: var(--lm-hover); }
+.lm-root .lm-person-chip:disabled { opacity: .45; cursor: default; }
+.lm-root .lm-person-chip.on { border-color: var(--lm-accent); background: var(--lm-accent-soft); color: var(--lm-accent-ink); }
+.lm-root .lm-person-chip:focus-visible { outline: none; box-shadow: var(--lm-ring); }
+
+/* The drawing: fits the width by default; + makes it bigger and it scrolls inside its frame. */
+.lm-root .lm-rel-frame { margin: 6px 0 8px; }
+.lm-root .lm-rel-frame .lm-rel-stage { margin: 0; overflow: auto; max-height: 70vh; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+.lm-root .lm-rel-svg { width: calc(100% * var(--lm-zoom, 1)); max-width: none; min-width: 0; }
+.lm-root .lm-rel-stage:not(.zoomed) .lm-rel-svg { max-width: 760px; }
+.lm-root .lm-rel-under { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 6px; }
+.lm-root .lm-rel-under .lm-rel-legend { flex: 1 1 auto; margin: 4px 2px 0; }
+.lm-root .lm-rel-zoom { flex: 0 0 auto; margin-left: auto; display: flex; gap: 2px; padding: 3px; border: 1px solid var(--lm-line); border-radius: 10px; background: var(--lm-card); }
+.lm-root .lm-rel-zoom .lm-icon-btn { width: 32px; height: 30px; font-size: 16px; font-weight: 700; color: var(--lm-text); font-family: var(--lm-font); }
+.lm-root .lm-rel-zoom .lm-rel-zoom-fit { width: auto; padding: 0 8px; font-size: 12px; }
+.lm-root .lm-rel-zoom .lm-icon-btn:disabled { opacity: .35; cursor: default; }
+.lm-root .lm-rel-mk { color: var(--lm-tone); }
+.lm-root .lm-rel-edge .lm-rel-line { stroke: var(--lm-tone); opacity: .85; stroke-width: 2; }
+.lm-root .lm-rel-edge.tone-crush .lm-rel-line { stroke-dasharray: 6 4; }
+.lm-root .lm-rel-edge.imp-4 .lm-rel-line,
+.lm-root .lm-rel-edge.imp-5 .lm-rel-line { stroke-width: 3; opacity: 1; }
+.lm-root .lm-rel-edge.closed .lm-rel-line { stroke-dasharray: 3 5; opacity: .4; }
+.lm-root .lm-rel-edge.dim .lm-rel-line { opacity: .08; }
+.lm-root .lm-rel-edge.lit .lm-rel-line { opacity: 1; stroke-width: 3.6; }
+.lm-root .lm-rel-tag { cursor: pointer; transition: opacity .2s; }
+.lm-root .lm-rel-tag rect { fill: color-mix(in srgb, var(--lm-tone) 14%, var(--lm-card)); stroke: var(--lm-tone); stroke-width: 1.2; }
+.lm-root .lm-rel-tag text { fill: color-mix(in srgb, var(--lm-tone) 78%, var(--lm-text)); font-size: 14px; font-weight: 700; letter-spacing: -0.02em; }
+.lm-root .lm-rel-tag.closed { opacity: .55; }
+.lm-root .lm-rel-tag.dim { opacity: .1; }
+.lm-root .lm-rel-tag.lit rect { fill: var(--lm-tone); }
+.lm-root .lm-rel-tag.lit text { fill: var(--lm-card); }
+.lm-root .lm-rel-node rect { fill: var(--lm-card); stroke: var(--lm-line-strong); stroke-width: 1.5; filter: drop-shadow(0 1px 2px rgba(28, 24, 36, .12)); transition: fill .2s, stroke .2s; }
+.lm-root .lm-rel-node.me rect { fill: var(--lm-primary); stroke: var(--lm-primary); }
+.lm-root .lm-rel-node.me .lm-rel-name { fill: var(--lm-on-primary); }
+.lm-root .lm-rel-node.picked rect,
+.lm-root .lm-rel-node:focus-visible rect { stroke: var(--lm-accent); stroke-width: 3; }
+.lm-root .lm-rel-node .lm-rel-name { stroke: none; font-size: 15.5px; font-weight: 700; }
+.lm-root .lm-rel-filter { margin: 0 0 8px; }
+.lm-root .lm-rel-filter[hidden] { display: none; }
+
+.lm-root .lm-rel-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin: 0 2px 6px; font-size: 12.5px; color: var(--lm-muted); }
+.lm-root .lm-rel-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.lm-root .lm-rel-legend i { width: 18px; height: 3px; border-radius: 2px; background: var(--lm-tone); }
+.lm-root .lm-subhead .lm-count { margin-left: 4px; vertical-align: 1px; }
+
+/* "관계 한눈에": A ──caption──▶ B rows, the readable version of the chart on any width. */
+.lm-root .lm-rel-list { gap: 10px; }
+.lm-root .lm-rel-card { display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border-left: 4px solid var(--lm-tone, var(--lm-line)); }
+.lm-root .lm-rel-card[hidden] { display: none; }
+.lm-root .lm-rel-pair { flex-wrap: nowrap; gap: 8px; margin: 0; }
+.lm-root .lm-rel-pair > b { flex: 0 1 auto; min-width: 0; overflow-wrap: anywhere; font-size: 15px; }
+.lm-root .lm-rel-wire { flex: 1 1 auto; display: flex; align-items: center; gap: 4px; min-width: 70px; color: var(--lm-tone); }
+.lm-root .lm-rel-wire-line { flex: 1 1 8px; height: 2px; min-width: 8px; background: currentColor; border-radius: 1px; opacity: .75; }
+.lm-root .lm-rel-card.tone-crush .lm-rel-wire-line { background: repeating-linear-gradient(90deg, currentColor 0 5px, transparent 5px 8px); }
+.lm-root .lm-rel-wire-tag { flex: 0 1 auto; padding: 2px 10px; border: 1.2px solid currentColor; border-radius: 999px; background: color-mix(in srgb, var(--lm-tone) 12%, var(--lm-card)); color: color-mix(in srgb, var(--lm-tone) 78%, var(--lm-text)); font-size: 13px; font-weight: 700; line-height: 1.45; text-align: center; word-break: keep-all; }
+.lm-root .lm-rel-wire-head { font-size: 11px; line-height: 1; }
+.lm-root .lm-rel-card p { font-size: 13.5px; line-height: 1.65; }
+.lm-root .lm-rel-foot { display: flex; align-items: center; gap: 6px; min-height: 24px; }
+.lm-root .lm-rel-kind { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 600; color: var(--lm-muted); }
+.lm-root .lm-rel-kind::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--lm-tone); }
+.lm-root .lm-rel-edit-btn { padding: 2px 6px; }
+
+/* Ledger: caption and kind of a relation entry. */
+.lm-root .lm-rel-edit { display: flex; gap: 6px; margin-top: 6px; padding-left: 8px; border-left: 3px solid var(--lm-accent-soft); }
+.lm-root .lm-rel-edit { align-items: center; }
+.lm-root .lm-rel-edit-cap { flex: 0 0 auto; font-size: 12px; font-weight: 600; color: var(--lm-accent-ink); }
+.lm-root .lm-rel-edit .lm-rlabel { flex: 1 1 auto; }
+.lm-root .lm-rel-edit .lm-rtone { flex: 0 0 auto; width: auto; min-width: 7.5em; }
+.lm-root .lm-entry.lm-flash { animation: lm-flash 1.6s ease-out; }
+@keyframes lm-flash { 0%, 30% { box-shadow: 0 0 0 3px var(--lm-accent); } 100% { box-shadow: 0 0 0 0 transparent; } }
+
+/* Jump-to-message ranges look like the plain ranges but are tappable. */
+.lm-root button.lm-range { padding: 2px 6px; border: 1px solid var(--lm-line); border-radius: 6px; background: var(--lm-card); font-family: var(--lm-font); cursor: pointer; }
+.lm-root button.lm-range:hover { border-color: var(--lm-accent); color: var(--lm-accent-ink); }
+
+/* A change: before → after, with the cause underneath. */
+.lm-root .lm-shift { --lm-shift: var(--lm-line-strong); padding: 12px 14px; border: 1px solid var(--lm-line); border-left: 4px solid var(--lm-shift); border-radius: var(--lm-r); background: var(--lm-card); }
+.lm-root .lm-shift[hidden] { display: none; }
+.lm-root .lm-shift-relation { --lm-shift: var(--lm-tone-love); }
+.lm-root .lm-shift-emotion { --lm-shift: var(--lm-accent); }
+.lm-root .lm-shift-change { --lm-shift: var(--lm-tone-friend); }
+.lm-root .lm-shift-growth { --lm-shift: var(--lm-sage); }
+.lm-root .lm-shift.lm-deleted { opacity: .45; }
+.lm-root .lm-shift.lm-deleted .lm-shift-line { text-decoration: line-through; }
+.lm-root .lm-shift-top,
+.lm-root .lm-emo-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; font-size: 13px; }
+.lm-root .lm-shift-kind { display: inline-flex; align-items: center; padding: 1px 8px; border-radius: 999px; background: color-mix(in srgb, var(--lm-shift) 15%, var(--lm-card)); color: color-mix(in srgb, var(--lm-shift) 75%, var(--lm-text)); font-size: 12px; font-weight: 700; }
+.lm-root .lm-shift-who { font-size: 14.5px; }
+.lm-root .lm-shift-toward { color: var(--lm-muted); font-weight: 600; }
+.lm-root .lm-shift-line { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 8px; font-size: 15px; line-height: 1.5; }
+.lm-root .lm-shift-from { color: var(--lm-muted); }
+.lm-root .lm-shift-arrow { color: var(--lm-shift, var(--lm-accent)); font-weight: 700; }
+.lm-root .lm-shift-to { font-weight: 700; color: var(--lm-text); }
+.lm-root .lm-shift-why { margin: 6px 0 0; padding-top: 6px; border-top: 1px dashed var(--lm-line); font-size: 13px; line-height: 1.6; color: var(--lm-muted); }
+.lm-root .lm-shift-text { margin: 0; padding: 0; border: 0; font-size: 14px; color: var(--lm-text); }
+.lm-root .lm-shift-list { display: flex; flex-direction: column; gap: 8px; }
+.lm-root .lm-shift-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-bottom: 10px; }
+.lm-root .lm-shift-filters .lm-chip-row { flex: 1 1 auto; margin: 0; }
+.lm-root .lm-shift-person-wrap { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--lm-muted); }
+.lm-root .lm-shift-person { width: auto; min-width: 8em; margin: 0; }
+.lm-root .lm-shift-none { margin: 4px 0 10px; font-size: 13px; color: var(--lm-muted); text-align: center; }
+.lm-root .lm-shift-empty { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 26px 14px; border: 1px dashed var(--lm-line-strong); border-radius: var(--lm-r); }
+.lm-root .lm-shift-empty p { margin: 0; font-size: 13.5px; line-height: 1.6; }
+
+/* 감정 변화: a card per person; the latest feeling up top, the steps joined by a line below. */
+.lm-root .lm-emo-person { margin-bottom: 10px; border: 1px solid var(--lm-line); border-radius: var(--lm-r); background: var(--lm-card); }
+.lm-root .lm-emo-person > summary { display: flex; align-items: center; gap: 10px; padding: 12px 14px; cursor: pointer; list-style: none; }
+.lm-root .lm-emo-person > summary::-webkit-details-marker { display: none; }
+.lm-root .lm-emo-person > summary::after { content: ''; flex: 0 0 auto; width: 7px; height: 7px; margin-left: 2px; border-right: 2px solid var(--lm-muted); border-bottom: 2px solid var(--lm-muted); transform: rotate(45deg) translateY(-2px); transition: transform .2s; }
+.lm-root .lm-emo-person[open] > summary::after { transform: rotate(-135deg) translateY(-1px); }
+.lm-root .lm-emo-name { flex: 0 0 auto; font-size: 15.5px; font-weight: 700; }
+.lm-root .lm-emo-now { flex: 1 1 auto; min-width: 0; font-size: 13px; color: var(--lm-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lm-root .lm-emo-now b { color: var(--lm-accent-ink); }
+.lm-root .lm-emo-steps { list-style: none; margin: 0 14px 14px 22px; padding: 2px 0 0 18px; border-left: 2px solid var(--lm-line); display: flex; flex-direction: column; gap: 10px; }
+.lm-root .lm-emo-step { --lm-shift: var(--lm-accent); position: relative; padding: 10px 12px; border-radius: var(--lm-r-sm); background: var(--lm-sunken); }
+.lm-root .lm-emo-step.lm-shift-relation { --lm-shift: var(--lm-tone-love); }
+.lm-root .lm-emo-step::before { content: ''; position: absolute; left: -25px; top: 16px; width: 10px; height: 10px; border-radius: 50%; background: var(--lm-shift); box-shadow: 0 0 0 3px var(--lm-card); }
+.lm-root .lm-emo-step .lm-shift-why { border-top-color: var(--lm-line-strong); }
+
+@media (max-width: 600px) {
+    .lm-root .lm-rel-pair { flex-wrap: wrap; }
+    .lm-root .lm-rel-wire { min-width: 90px; }
+    .lm-root .lm-rel-stage { padding: 2px; }
+    .lm-root .lm-seg-btn { font-size: 13px; padding: 0 4px; gap: 4px; }
+    .lm-root .lm-shift-viewhead { flex-direction: column; align-items: stretch; }
+    .lm-root .lm-shift-viewhead .lm-toolbtn { align-self: flex-start; }
+    .lm-root .lm-shift-person-wrap { flex: 1 1 100%; }
+    .lm-root .lm-shift-person { flex: 1 1 auto; }
+    .lm-root .lm-callout { flex-wrap: wrap; }
+    .lm-root .lm-callout-text { flex-basis: calc(100% - 44px); }
+    .lm-root .lm-callout .lm-toolbtn { margin-left: 44px; }
+    .lm-root .lm-emo-steps { margin-left: 16px; margin-right: 10px; }
+    .lm-root .lm-emo-person > summary { flex-wrap: wrap; row-gap: 2px; }
+    .lm-root .lm-emo-now { order: 5; flex-basis: 100%; white-space: normal; }
+    .lm-root .lm-emo-person > summary .lm-count { margin-left: auto; }
+}
