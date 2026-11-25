@@ -246,8 +246,16 @@ function emptyFrame() {
         mode: 'original', work: '', characters: '', au: '', notes: '',
         era: '', eraDetail: '', culture: '', cultureCustom: '', storyLanguage: '', nameStyle: '',
         medium: 'auto',
+        cardKind: 'auto',
     };
 }
+
+// Whether the character card is one person or plays many (다인봇, simulation, RPG game master).
+const CARD_KINDS = {
+    auto: '자동으로 알아보기',
+    single: '한 인물 (보통 캐릭터 카드)',
+    ensemble: '여러 인물 (다인·시뮬레이션·RPG)',
+};
 
 // How the story is told: face to face, through a messenger app, or by phone. Messenger and
 // phone stories need different summaries and checks (people are in different places, time
@@ -1751,6 +1759,10 @@ function frameText(frame) {
     if (medium) parts.push(medium);
     if (f.characters.trim()) parts.push(`Character notes (written by the user):\n${f.characters.trim()}`);
     if (f.notes.trim()) parts.push(`Additional notes (written by the user):\n${f.notes.trim()}`);
+    // Every task (summaries, checks, wiki, answers, the chat itself) should know this.
+    const memory = getMemory(false);
+    const narrator = memory ? ensembleCardName({ ...memory, frame: f }) : '';
+    if (narrator) parts.push(`"${narrator}" is not a character: it is the narrator / game master that voices several characters. The people of the story are the characters named in the text.`);
     return parts.join('\n\n');
 }
 
@@ -4653,6 +4665,8 @@ function mergeCast(memory, list, { overwrite = false } = {}) {
 
 function speakerSamples(maxPerSpeaker = 30) {
     const { chat, name1 } = ctx();
+    // A card that plays many people: its messages mix everyone's voices, so they are no one's sample.
+    const narrator = normName(ensembleCardName(getMemory(false)) || '');
     const by = new Map();
     chat.forEach((m, i) => {
         if (!m || m.is_user || m.extra?.isSmallSys || m.extra?.type === 'narrator') return;
@@ -4660,7 +4674,7 @@ function speakerSamples(maxPerSpeaker = 30) {
         // Originals we hid after summarizing (lm_hidden) still count.
         if ((m.is_system && !m.extra?.lm_hidden) || isQrMessage(m)) return;
         const name = String(m.name || '').trim();
-        if (!name || normName(name) === normName(name1)) return;
+        if (!name || normName(name) === normName(name1) || (narrator && normName(name) === narrator)) return;
         const text = stripMessage(m.mes);
         if (text.length < 8) return;
         const k = normName(name);
@@ -5009,15 +5023,25 @@ function castHealthHtml(memory) {
 // A single card that voices several people (다인봇, simulation, RPG): its name labels every AI
 // message but is not a character. Recognised when the cast lists two or more characters and none
 // of them is the card's name. Group chats are not this case: there each card is one speaker.
+// The user can say so in 작품 설정; otherwise "auto" looks at what the card described and the cast.
 function ensembleCardName(memory) {
     const c = ctx();
     if (c.groupId || !memory) return '';
     const card = String(c.name2 || '').trim();
     if (!card) return '';
+    const kind = memory.frame?.cardKind || 'auto';
+    if (kind === 'single') return '';
+    if (kind === 'ensemble') return card;
     const norm = (x) => String(x || '').trim().toLowerCase();
+    // Reading the card found several people and none of them was the card itself.
+    if (memory.ensembleSeen && norm(memory.ensembleSeen) === norm(card)) return card;
     const others = (memory.cast || []).map(m => norm(m.name)).filter(n => n && n !== norm(c.name1));
-    if (others.length < 2 || others.includes(norm(card))) return '';
-    return card;
+    // A cast entry named after the card that has no personality from the card was made by
+    // collecting voices from the card's messages: it does not make the card one person.
+    const cardMember = (memory.cast || []).find(m => norm(m.name) === norm(card));
+    const cardIsPerson = cardMember && String(cardMember.core || '').trim();
+    if (cardIsPerson) return '';
+    return others.filter(n => n !== norm(card)).length >= 2 ? card : '';
 }
 
 async function maybeSeedCast(chatId) {
@@ -5030,6 +5054,9 @@ async function maybeSeedCast(chatId) {
         setProgress('캐릭터 카드에서 캐해 정리 중…');
         const list = await extractCast(memory);
         if (!stillSameChat(chatId)) return;
+        const card = String(ctx().name2 || '').trim().toLowerCase();
+        const named = list.map(x => String(x?.name || '').trim().toLowerCase()).filter(Boolean);
+        if (!ctx().groupId && card && named.length >= 2 && !named.includes(card)) memory.ensembleSeen = ctx().name2;
         const n = mergeCast(memory, list);
         await ctx().saveMetadata();
         logActivity('compress', `캐해 정리: ${list.map(x => x.name).join(', ')} (${n}명)`);
@@ -10408,6 +10435,10 @@ function managerHtml(memory) {
         <div class="lm-field-text"><span class="lm-field-label">대화 방식</span><span class="lm-hint">톡·문자·전화로 진행하는 채팅이면 요약과 검사를 그에 맞게 해요. 자동이면 최근 메시지로 알아봐요 (지금: ${esc(MEDIUMS[storyMedium({ medium: 'auto' })])})</span></div>
         <select class="text_pole" id="lm_f_medium">${selectOptions(MEDIUMS, f.medium || 'auto')}</select>
       </div>
+      ${ctx().groupId ? '' : `<div class="lm-field lm-field-stack lm-span-2">
+        <div class="lm-field-text"><span class="lm-field-label">이 카드가 연기하는 인물</span><span class="lm-hint">다인봇·시뮬레이션·RPG처럼 카드 하나가 여러 인물을 연기하면, 카드 이름을 인물로 기록하지 않고 대사마다 실제 인물에게 붙여요 (지금: ${ensembleCardName(memory) ? '여러 인물' : '한 인물'})</span></div>
+        <select class="text_pole" id="lm_f_cardkind">${selectOptions(CARD_KINDS, f.cardKind || 'auto')}</select>
+      </div>`}
       <div class="lm-field lm-field-stack">
         <div class="lm-field-text"><span class="lm-field-label">시대</span></div>
         <select class="text_pole" id="lm_f_era">${selectOptions(ERAS, f.era)}</select>
@@ -10552,6 +10583,7 @@ function collectManager(root, memory) {
         storyLanguage: root.querySelector('#lm_f_lang').value,
         nameStyle: root.querySelector('#lm_f_names').value,
         medium: root.querySelector('#lm_f_medium')?.value || 'auto',
+        cardKind: root.querySelector('#lm_f_cardkind')?.value || memory.frame?.cardKind || 'auto',
     };
     out.saga.text = root.querySelector('#lm_saga').value;
     const byId = new Map(memory.timeline.map(n => [n.id, n]));
