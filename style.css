@@ -2445,7 +2445,8 @@
 .lm-root .lm-rel-frame { margin: 6px 0 8px; }
 .lm-root .lm-rel-frame .lm-rel-stage { margin: 0; overflow: auto; max-height: 70vh; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
 .lm-root .lm-rel-svg { width: calc(100% * var(--lm-zoom, 1)); max-width: none; min-width: 0; }
-.lm-root .lm-rel-stage:not(.zoomed) .lm-rel-svg { max-width: 760px; }
+.lm-root .lm-rel-svg { display: block; margin: 0 auto; }
+.lm-root .lm-rel-stage:not(.zoomed) .lm-rel-svg { max-width: min(760px, var(--lm-rel-max, 760px)); }
 .lm-root .lm-rel-under { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 6px; }
 .lm-root .lm-rel-under .lm-rel-legend { flex: 1 1 auto; margin: 4px 2px 0; }
 .lm-root .lm-rel-zoom { flex: 0 0 auto; margin-left: auto; display: flex; gap: 2px; padding: 3px; border: 1px solid var(--lm-line); border-radius: 10px; background: var(--lm-card); }
@@ -2490,7 +2491,7 @@
 .lm-root .lm-rel-wire { flex: 1 1 auto; display: flex; align-items: center; gap: 4px; min-width: 70px; color: var(--lm-tone); }
 .lm-root .lm-rel-wire-line { flex: 1 1 8px; height: 2px; min-width: 8px; background: currentColor; border-radius: 1px; opacity: .75; }
 .lm-root .lm-rel-card.tone-crush .lm-rel-wire-line { background: repeating-linear-gradient(90deg, currentColor 0 5px, transparent 5px 8px); }
-.lm-root .lm-rel-wire-tag { flex: 0 1 auto; padding: 2px 10px; border: 1.2px solid currentColor; border-radius: 999px; background: color-mix(in srgb, var(--lm-tone) 12%, var(--lm-card)); color: color-mix(in srgb, var(--lm-tone) 78%, var(--lm-text)); font-size: 13px; font-weight: 700; line-height: 1.45; text-align: center; word-break: keep-all; }
+.lm-root .lm-rel-wire-tag { flex: 0 1 auto; min-width: 0; white-space: normal; overflow: visible; overflow-wrap: anywhere; padding: 2px 10px; border: 1.2px solid currentColor; border-radius: 999px; background: color-mix(in srgb, var(--lm-tone) 12%, var(--lm-card)); color: color-mix(in srgb, var(--lm-tone) 78%, var(--lm-text)); font-size: 13px; font-weight: 700; line-height: 1.45; text-align: center; word-break: keep-all; }
 .lm-root .lm-rel-wire-head { font-size: 11px; line-height: 1; }
 .lm-root .lm-rel-card p { font-size: 13.5px; line-height: 1.65; }
 .lm-root .lm-rel-foot { display: flex; align-items: center; gap: 6px; min-height: 24px; }

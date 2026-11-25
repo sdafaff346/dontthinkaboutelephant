@@ -5162,7 +5162,7 @@ The ledger is a structured fact sheet (shown as <current_ledger>). Operations:
 {"op":"set","cat":"<category>","key":"<entity or short label>","value":"<concise current fact>","importance":<1-5>}
   Creates or replaces the entry with this cat + key. Write the complete updated value, merging old and new information.
   Optional fields: "knownBy":["names"] for secrets and hidden facts (exactly who knows it; update it whenever someone learns the truth), "due":"<in-story deadline>" for threads with a deadline.${s.changesEnabled ? `
-  For cat "relation" also give "label": what A is to B in 2-5 words, like a caption on a TV drama relationship chart (e.g. "secret crush", "childhood rival", "contract fiancée", "sworn enemy"), written in the summary language, and "tone": one of ${Object.keys(REL_TONES).join(', ')}. The current label is in [brackets] after the key in <current_ledger>: repeat it unchanged unless the relationship itself changed.` : ''}
+  For cat "relation" also give "label": what A is to B in 1-4 words (short enough to fit on a line in a chart), like a caption on a TV drama relationship chart (e.g. "secret crush", "childhood rival", "contract fiancée", "sworn enemy"), written in the summary language, and "tone": one of ${Object.keys(REL_TONES).join(', ')}. The current label is in [brackets] after the key in <current_ledger>: repeat it unchanged unless the relationship itself changed.` : ''}
 {"op":"close","cat":"thread","key":"<key>"}  Marks a thread or promise as resolved.
 {"op":"delete","cat":"<category>","key":"<key>"}  Removes an entry that is no longer true or relevant.
 {"op":"scene","time":"...","place":"...","present":"...","mood":"..."}  The situation at the END of this transcript.
@@ -5261,7 +5261,7 @@ function relationKey(raw) {
 // The short caption and kind of a relation entry, for the 관계·변화 chart.
 function relationTag(cat, op) {
     if (cat !== 'relation' || !op) return {};
-    const label = typeof op.label === 'string' ? op.label.replace(/["“”]/g, '').replace(/\s+/g, ' ').trim().slice(0, 30) : '';
+    const label = typeof op.label === 'string' ? op.label.replace(/["“”]/g, '').replace(/\s+/g, ' ').trim().slice(0, 60) : '';
     const tone = String(op.tone || '').toLowerCase().trim();
     return { label, tone: REL_TONES[tone] ? tone : '' };
 }
@@ -9745,7 +9745,7 @@ function entryRow(entry) {
   <textarea class="text_pole lm-val lm-quiet" rows="2" placeholder="내용" aria-label="내용">${esc(entry.value)}</textarea>
   ${['fact', 'note', 'item'].includes(entry.cat) ? `<input class="text_pole lm-known lm-quiet" value="${esc((entry.knownBy || []).join(', '))}" placeholder="아는 인물 · 쉼표로 구분, 비우면 모두 앎" aria-label="아는 인물">` : ''}
   ${entry.cat === 'thread' ? `<input class="text_pole lm-due lm-quiet" value="${esc(entry.due || '')}" placeholder="작중 기한 (예: 보름달 밤까지)" aria-label="기한">` : ''}
-  ${entry.cat === 'relation' ? `<div class="lm-rel-edit"><span class="lm-rel-edit-cap">관계도</span><input class="text_pole lm-rlabel lm-quiet" value="${esc(entry.label || '')}" placeholder="관계도에 쓸 사이 (예: 짝사랑, 오랜 앙숙)" aria-label="관계도에 쓸 사이" maxlength="30"><select class="text_pole lm-rtone lm-quiet-select" aria-label="관계 종류"><option value="">종류</option>${selectOptions(REL_TONES, entry.tone || '').replace(/<option value=""[^>]*>[^<]*<\/option>/, '')}</select></div>` : ''}
+  ${entry.cat === 'relation' ? `<div class="lm-rel-edit"><span class="lm-rel-edit-cap">관계도</span><input class="text_pole lm-rlabel lm-quiet" value="${esc(entry.label || '')}" placeholder="관계도에 쓸 사이 (예: 짝사랑, 오랜 앙숙)" aria-label="관계도에 쓸 사이" maxlength="60"><select class="text_pole lm-rtone lm-quiet-select" aria-label="관계 종류"><option value="">종류</option>${selectOptions(REL_TONES, entry.tone || '').replace(/<option value=""[^>]*>[^<]*<\/option>/, '')}</select></div>` : ''}
 </div>`;
 }
 
@@ -10586,7 +10586,7 @@ function collectManager(root, memory) {
                 pinned: row.querySelector('.lm-pin').checked,
                 knownBy: row.querySelector('.lm-known') ? toList(row.querySelector('.lm-known').value) : (original.knownBy || []),
                 due: row.querySelector('.lm-due') ? row.querySelector('.lm-due').value.trim() : (original.due || ''),
-                label: row.querySelector('.lm-rlabel') ? row.querySelector('.lm-rlabel').value.trim().slice(0, 30) : (original.label || ''),
+                label: row.querySelector('.lm-rlabel') ? row.querySelector('.lm-rlabel').value.trim().slice(0, 60) : (original.label || ''),
                 tone: row.querySelector('.lm-rtone') ? row.querySelector('.lm-rtone').value : (original.tone || ''),
             };
         })
@@ -11726,6 +11726,36 @@ function edgeLabel(e) {
     return v.length > 12 ? `${v.slice(0, 11)}…` : v;
 }
 
+// A caption short enough for a line in the chart (about 12 Hangul or 20 Latin letters).
+function fitLabel(text, max = 170) {
+    const t = String(text || '').trim();
+    if (labelWidth(t) <= max) return t;
+    let out = '';
+    for (const ch of t) {
+        if (labelWidth(`${out}${ch}…`) > max) break;
+        out += ch;
+    }
+    return `${out.trimEnd()}…`;
+}
+
+// After a translation swaps caption text: shorten again and resize each caption's pill.
+function fitRelationTags(root) {
+    root.querySelectorAll('.lm-rel-tag').forEach(g => {
+        const text = g.querySelector('text');
+        const rect = g.querySelector('rect');
+        if (!text || !rect) return;
+        const full = text.textContent;
+        const short = fitLabel(full);
+        text.textContent = short;
+        const title = g.querySelector('title');
+        if (title) title.textContent = full;
+        const w = labelWidth(short) + 18;
+        const cx = Number(text.getAttribute('x'));
+        rect.setAttribute('x', (cx - w / 2).toFixed(1));
+        rect.setAttribute('width', w.toFixed(1));
+    });
+}
+
 // Rough width of a label in SVG units at 14px: wide for Hangul/CJK, narrow for Latin.
 function labelWidth(text) {
     let w = 0;
@@ -11750,6 +11780,13 @@ function relationLayout(graph, size) {
     const list = [...graph.nodes].sort((a, b) => b.deg - a.deg);
     if (!list.length) return pos;
     const c = size / 2;
+    // Two people: side by side with room for a caption on each line, which reads better than
+    // one above the other on a narrow phone.
+    if (list.length === 2) {
+        pos.set(list[0].key, { x: c - 170, y: c });
+        pos.set(list[1].key, { x: c + 170, y: c });
+        return pos;
+    }
     const me = normName(ctx().name1 || '');
     const hub = list.find(n => n.key === me && n.deg >= 2) || (list.length > 3 && list[0].deg >= 3 ? list[0] : null);
     const ring = list.filter(n => n !== hub);
@@ -11848,7 +11885,8 @@ function relationSvg(graph) {
         const uy = dy / len;
         // A->B and B->A both drawn: bend each to its own side so the two captions don't collide.
         const twin = !e.both && directed.has(pairKey(e.kb, e.ka));
-        const bend = e.both ? 0 : twin ? 44 : 12;
+        // Wider pairs bend more, so their two captions sit clearly above and below each other.
+        const bend = e.both ? 0 : twin ? Math.max(44, len * 0.22) : 12;
         const s0 = exit(p, ux, uy, boxW(names.get(e.ka) || ''));
         const e0 = exit(q, -ux, -uy, boxW(names.get(e.kb) || ''));
         const cx = (s0.x + e0.x) / 2 - uy * bend;
@@ -11860,12 +11898,13 @@ function relationSvg(graph) {
         if (text) {
             // On the curve: the middle, or nearer its own start when the reverse line is drawn too,
             // so the two captions of a pair sit apart along the line.
-            const t = twin ? 0.36 : 0.5;
+            const t = twin && Math.abs(ux) < 0.7 ? 0.36 : 0.5;
             const pt = (u) => ({
                 x: (1 - u) * (1 - u) * s0.x + 2 * (1 - u) * u * cx + u * u * e0.x,
                 y: (1 - u) * (1 - u) * s0.y + 2 * (1 - u) * u * cy + u * u * e0.y,
             });
-            labels.push({ i, e, tone, text, w: labelWidth(text) + 18, pt, t, ...pt(t) });
+            const short = fitLabel(text);
+            labels.push({ i, e, tone, text, short, w: labelWidth(short) + 18, pt, t, ...pt(t) });
         }
         const mk = `${marker}-${tone}`;
         return `<g class="${cls}" data-edge="${i}" data-a="${esc(e.ka)}" data-b="${esc(e.kb)}"><path class="lm-rel-hit" d="${d}"/><path class="lm-rel-line" d="${d}" marker-end="url(#${mk})"${e.both ? ` marker-start="url(#${mk})"` : ''}/></g>`;
@@ -11885,7 +11924,9 @@ function relationSvg(graph) {
         }
         placed.push({ x: l.x, y: l.y, w: l.w, h: H });
     }
-    const tags = labels.map(({ i, e, tone, text, w, x, y }) => `<g class="lm-rel-tag tone-${tone}${e.closed ? ' closed' : ''}" data-edge="${i}" data-a="${esc(e.ka)}" data-b="${esc(e.kb)}"><rect x="${(x - w / 2).toFixed(1)}" y="${(y - H / 2).toFixed(1)}" width="${w.toFixed(1)}" height="${H}" rx="12"/><text x="${x.toFixed(1)}" y="${(y + 5).toFixed(1)}" text-anchor="middle" data-tr>${esc(text)}</text></g>`);
+    // The full caption stays in data-orig (translation reads it) and in a tooltip; the drawing
+    // shows a shortened one so a long caption can't stretch the chart.
+    const tags = labels.map(({ i, e, tone, text, short, w, x, y }) => `<g class="lm-rel-tag tone-${tone}${e.closed ? ' closed' : ''}" data-edge="${i}" data-a="${esc(e.ka)}" data-b="${esc(e.kb)}"><title>${esc(text)}</title><rect x="${(x - w / 2).toFixed(1)}" y="${(y - H / 2).toFixed(1)}" width="${w.toFixed(1)}" height="${H}" rx="12"/><text x="${x.toFixed(1)}" y="${(y + 5).toFixed(1)}" text-anchor="middle" data-tr data-orig="${esc(text)}">${esc(short)}</text></g>`);
     const nodes = graph.nodes.map(nd => {
         const p = pos.get(nd.key);
         if (!p) return '';
@@ -11897,13 +11938,20 @@ function relationSvg(graph) {
   <title>${esc(nd.name)}</title>
 </g>`;
     }).join('');
-    const xs = [...pos.values()].map(v => v.x);
-    const ys = [...pos.values()].map(v => v.y);
-    const left = Math.min(...xs) - 90;
-    const top = Math.min(...ys) - 50;
-    const width = Math.max(...xs) - left + 90;
-    const height = Math.max(...ys) - top + 50;
-    return `<svg class="lm-rel-svg" viewBox="${left.toFixed(0)} ${top.toFixed(0)} ${width.toFixed(0)} ${height.toFixed(0)}" style="--lm-rel-w:${Math.round(width)}px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="인물 관계도">
+    // Frame everything drawn: name boxes and captions, with a little air. A floor on the size
+    // keeps a two-person chart from being blown up to fill the whole screen.
+    const rects = [...boxes.map(b => ({ x: b.x, y: b.y, w: b.w, h: b.h })), ...labels.map(l => ({ x: l.x, y: l.y, w: l.w, h: H }))];
+    let left = Math.min(...rects.map(r => r.x - r.w / 2)) - 24;
+    let right = Math.max(...rects.map(r => r.x + r.w / 2)) + 24;
+    let top = Math.min(...rects.map(r => r.y - r.h / 2)) - 24;
+    let bottom = Math.max(...rects.map(r => r.y + r.h / 2)) + 24;
+    const MIN_W = 420;
+    const MIN_H = 200;
+    if (right - left < MIN_W) { const pad = (MIN_W - (right - left)) / 2; left -= pad; right += pad; }
+    if (bottom - top < MIN_H) { const pad = (MIN_H - (bottom - top)) / 2; top -= pad; bottom += pad; }
+    const width = right - left;
+    const height = bottom - top;
+    return `<svg class="lm-rel-svg" viewBox="${left.toFixed(0)} ${top.toFixed(0)} ${width.toFixed(0)} ${height.toFixed(0)}" style="--lm-rel-max:${Math.round(width * 1.25)}px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="인물 관계도">
 <defs>${tones.map(t => `<marker id="${marker}-${t}" class="lm-rel-mk tone-${t}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="currentColor"/></marker>`).join('')}</defs>
 ${edges}${tags.join('')}${nodes}</svg>`;
 }
@@ -12171,6 +12219,7 @@ async function toggleTranslation(root, btn) {
     const label = btn.querySelector('span');
     if (btn.dataset.state === 'ko') {
         els.forEach(el => { if (el.dataset.orig !== undefined) el.textContent = el.dataset.orig; });
+        fitRelationTags(root);
         btn.dataset.state = '';
         label.textContent = '한국어로 보기';
         return;
@@ -12189,6 +12238,7 @@ async function toggleTranslation(root, btn) {
             if (el.dataset.orig === undefined) el.dataset.orig = el.textContent;
             el.textContent = out[i];
         });
+        fitRelationTags(root);
         btn.dataset.state = 'ko';
         label.textContent = '원문 보기';
     } catch (err) {
