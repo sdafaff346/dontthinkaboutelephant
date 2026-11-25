@@ -4860,8 +4860,9 @@ Write the <changes> block now. Go through the notes in order; use [] if none of 
             const system = `For each relationship below, give a caption for a TV drama relationship chart.
 Reply with only:
 <labels>
-[{"id":"R1","label":"<what A is to B in 2-5 words, e.g. secret crush, childhood rival, contract fiancée, sworn enemy>","tone":"<one of ${Object.keys(REL_TONES).join(', ')}>"}]
+[{"id":"R1","label":"<caption>","tone":"<kind>"}]
 </labels>
+${RELATION_LABEL_GUIDE.replace('as the story so far shows it, not just this scene', 'as its description shows it')}
 Base it only on the description. Keep names out of the label.`;
             const user = chunk.map((e, k) => `R${k + 1}: ${e.key}: ${e.value}`).join('\n');
             let out = '';
@@ -5077,6 +5078,9 @@ const REL_TONES = {
 };
 const SHIFT_KINDS = { relation: '관계', emotion: '감정', change: '변화' };
 
+// How to caption a relation for the chart. Shared by summaries and the backfill tool.
+const RELATION_LABEL_GUIDE = `"label" is what A is to B in 1-4 words, short enough for a line on a TV drama relationship chart, written in the summary language. Name the emotional core of the whole relationship as the story so far shows it, not just this scene: read what A says, does, avoids and hides. When the feelings are mixed, say both sides in one phrase (e.g. "reluctant attraction", "resentful dependence", "jealous admiration", "hate laced with longing", "contract fiancée", "secret crush", "childhood rival"). State it plainly from the evidence: no hedging words (maybe, possibly, unclear), no question marks, no "unknown". "tone" is one of ${Object.keys(REL_TONES).join(', ')}; use complicated for mixed feelings. Record relationships between the people in the story (including NPCs, party members and leaders of groups), never with a narrator, system, game master or the card itself.`;
+
 const CHANGES_FORMAT = `
 <changes>
 [JSON array of lasting changes this transcript clearly shows; [] if none]
@@ -5162,7 +5166,7 @@ The ledger is a structured fact sheet (shown as <current_ledger>). Operations:
 {"op":"set","cat":"<category>","key":"<entity or short label>","value":"<concise current fact>","importance":<1-5>}
   Creates or replaces the entry with this cat + key. Write the complete updated value, merging old and new information.
   Optional fields: "knownBy":["names"] for secrets and hidden facts (exactly who knows it; update it whenever someone learns the truth), "due":"<in-story deadline>" for threads with a deadline.${s.changesEnabled ? `
-  For cat "relation" also give "label": what A is to B in 1-4 words (short enough to fit on a line in a chart), like a caption on a TV drama relationship chart (e.g. "secret crush", "childhood rival", "contract fiancée", "sworn enemy"), written in the summary language, and "tone": one of ${Object.keys(REL_TONES).join(', ')}. The current label is in [brackets] after the key in <current_ledger>: repeat it unchanged unless the relationship itself changed.` : ''}
+  For cat "relation" also give "label" and "tone". ${RELATION_LABEL_GUIDE} The current label is in [brackets] after the key in <current_ledger>: repeat it unchanged unless the relationship itself changed.` : ''}
 {"op":"close","cat":"thread","key":"<key>"}  Marks a thread or promise as resolved.
 {"op":"delete","cat":"<category>","key":"<key>"}  Removes an entry that is no longer true or relevant.
 {"op":"scene","time":"...","place":"...","present":"...","mood":"..."}  The situation at the END of this transcript.
@@ -5261,7 +5265,9 @@ function relationKey(raw) {
 // The short caption and kind of a relation entry, for the 관계·변화 chart.
 function relationTag(cat, op) {
     if (cat !== 'relation' || !op) return {};
-    const label = typeof op.label === 'string' ? op.label.replace(/["“”]/g, '').replace(/\s+/g, ' ').trim().slice(0, 60) : '';
+    const label = typeof op.label === 'string'
+        ? op.label.replace(/["“”]/g, '').replace(/\s*[?？]+/g, '').replace(/^(unknown|none|n\/a|unclear|모름|불명|없음)$/i, '').replace(/\s+/g, ' ').trim().slice(0, 60)
+        : '';
     const tone = String(op.tone || '').toLowerCase().trim();
     return { label, tone: REL_TONES[tone] ? tone : '' };
 }
@@ -11771,8 +11777,42 @@ function relationGraph(memory) {
         nodes.get(key).deg++;
         return key;
     };
-    const edges = relationPairs(memory).map(p => ({ ...p, ka: add(p.a), kb: add(p.b) }));
+    // {{user}} / {{char}} written literally, and the narrator of a group / simulation / RPG card,
+    // are not people in the chart.
+    const c = ctx();
+    const macro = (name) => String(name).replace(/\{\{user\}\}/gi, c.name1 || 'User').replace(/\{\{char\}\}/gi, c.name2 || 'Char').trim();
+    const narrator = normName(ensembleCardName(memory) || '');
+    const pairs = relationPairs(memory)
+        .map(p => ({ ...p, a: macro(p.a), b: macro(p.b) }))
+        .filter(p => !narrator || (normName(p.a) !== narrator && normName(p.b) !== narrator));
+    const edges = pairs.map((p, idx) => ({ ...p, idx, ka: add(p.a), kb: add(p.b) }));
     return { nodes: [...nodes.values()], edges };
+}
+
+// How many people the whole-cast chart draws: fewer on a phone so names stay readable.
+function relChartMax() {
+    return typeof window !== 'undefined' && window.innerWidth && window.innerWidth < 600 ? 9 : 14;
+}
+
+// A big cast (RPG parties, simulation casts) is unreadable as one ring: draw the best-connected
+// people, and the rest one at a time through their chip.
+function trimGraph(graph, max = relChartMax()) {
+    if (graph.nodes.length <= max) return { ...graph, hidden: 0 };
+    const me = normName(ctx().name1 || '');
+    const keep = new Set([...graph.nodes].sort((a, b) => (b.key === me) - (a.key === me) || b.deg - a.deg).slice(0, max).map(n => n.key));
+    return {
+        nodes: graph.nodes.filter(n => keep.has(n.key)),
+        edges: graph.edges.filter(e => keep.has(e.ka) && keep.has(e.kb)),
+        hidden: graph.nodes.length - keep.size,
+    };
+}
+
+// One person in the middle with only their own relationships around them.
+function egoGraph(graph, key) {
+    const edges = graph.edges.filter(e => e.ka === key || e.kb === key);
+    const keys = new Set([key, ...edges.flatMap(e => [e.ka, e.kb])]);
+    const nodes = graph.nodes.filter(n => keys.has(n.key)).map(n => ({ ...n, deg: n.key === key ? 999 : n.deg }));
+    return { nodes, edges, center: key };
 }
 
 function relationLayout(graph, size) {
@@ -11788,7 +11828,7 @@ function relationLayout(graph, size) {
         return pos;
     }
     const me = normName(ctx().name1 || '');
-    const hub = list.find(n => n.key === me && n.deg >= 2) || (list.length > 3 && list[0].deg >= 3 ? list[0] : null);
+    const hub = (graph.center && list.find(n => n.key === graph.center)) || list.find(n => n.key === me && n.deg >= 2) || (list.length > 3 && list[0].deg >= 3 ? list[0] : null);
     const ring = list.filter(n => n !== hub);
     if (hub) pos.set(hub.key, { x: c, y: c });
     // Neighbours of the previous node go next to it so lines stay short.
@@ -11874,7 +11914,8 @@ function relationSvg(graph) {
     };
     const names = new Map(graph.nodes.map(nd => [nd.key, nd.name]));
     const labels = [];
-    const edges = graph.edges.map((e, i) => {
+    const edges = graph.edges.map((e, k) => {
+        const i = e.idx ?? k;
         const p = pos.get(e.ka);
         const q = pos.get(e.kb);
         if (!p || !q || e.ka === e.kb) return '';
@@ -12001,13 +12042,16 @@ function bindRelationChart(root, graph) {
     const focusNode = (key) => {
         focused = key || null;
         const name = graph.nodes.find(nd => nd.key === key)?.name || key;
+        // Picking a person redraws the chart around them; "전체" brings the whole chart back.
+        const stage = root.querySelector('.lm-rel-stage');
+        if (stage) stage.innerHTML = relationSvg(key ? egoGraph(graph, key) : trimGraph(graph));
+        const more = root.querySelector('.lm-rel-more');
+        if (more) more.hidden = !!key;
         root.querySelectorAll('.lm-rel-node').forEach(g => g.classList.toggle('picked', !!key && g.dataset.node === key));
         root.querySelectorAll('.lm-person-chip').forEach(b => b.classList.toggle('on', (b.dataset.person || null) === focused));
-        root.querySelectorAll('.lm-rel-edge, .lm-rel-tag, .lm-rel-card').forEach(el => {
-            const hit = !key || el.dataset.a === key || el.dataset.b === key;
-            el.classList.toggle('dim', !hit);
+        root.querySelectorAll('.lm-rel-card').forEach(el => {
             el.classList.remove('lit');
-            if (el.classList.contains('lm-rel-card')) el.hidden = !hit;
+            el.hidden = !!key && el.dataset.a !== key && el.dataset.b !== key;
         });
         const bar = root.querySelector('.lm-rel-filter');
         if (bar) {
@@ -12038,8 +12082,9 @@ function bindRelationChart(root, graph) {
         }
         const edge = event.target.closest('.lm-rel-edge, .lm-rel-tag');
         if (edge) {
-            focusNode(null);
             const i = edge.dataset.edge;
+            // Make sure the card is shown even when another person is picked.
+            root.querySelector(`.lm-rel-card[data-edge="${i}"]`)?.removeAttribute('hidden');
             root.querySelectorAll('.lm-rel-edge, .lm-rel-tag').forEach(g => g.classList.toggle('lit', g.dataset.edge === i));
             const card = root.querySelector(`.lm-rel-card[data-edge="${i}"]`);
             root.querySelectorAll('.lm-rel-card').forEach(el => el.classList.toggle('lit', el === card));
@@ -12059,8 +12104,9 @@ function relationChartHtml(graph, { editable = false } = {}) {
     return `
   ${relationPeople(graph)}
   <div class="lm-rel-frame">
-    <div class="lm-rel-stage">${relationSvg(graph)}</div>
+    <div class="lm-rel-stage">${relationSvg(trimGraph(graph))}</div>
   </div>
+  ${trimGraph(graph).hidden ? `<p class="lm-hint lm-rel-more">인물이 많아서 관계가 많은 ${relChartMax()}명만 그렸어요. 위 칩에서 다른 인물을 누르면 그 사람 중심으로 다시 그려요.</p>` : ''}
   <div class="lm-rel-under">
     ${relationLegend(graph)}
     <div class="lm-rel-zoom" role="group" aria-label="관계도 크기">
