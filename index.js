@@ -1606,7 +1606,7 @@ function extractTag(text, tag) {
 
 function extractAllTags(text, tag) {
     const out = [];
-    const re = new RegExp(`<${tag}\\s+id\\s*=\\s*"([^"]+)"\\s*>([\\s\\S]*?)</${tag}>`, 'gi');
+    const re = new RegExp(`<${tag}\\s+id\\s*=\\s*["']?([^"'>\\s]+)["']?[^>]*>([\\s\\S]*?)</${tag}>`, 'gi');
     let m;
     while ((m = re.exec(text)) !== null) out.push({ id: m[1].trim(), text: m[2].trim() });
     return out;
@@ -1655,6 +1655,32 @@ function parseNodeBlock(block) {
     };
 }
 
+// Top-level {...} objects inside a (possibly unfinished) JSON array, found by matching braces
+// outside of strings.
+function completeObjects(text) {
+    const out = [];
+    let depth = 0;
+    let start = -1;
+    let inStr = false;
+    let esc = false;
+    const body = text.trimStart().startsWith('[') ? text.trimStart().slice(1) : text;
+    for (let i = 0; i < body.length; i++) {
+        const ch = body[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (ch === '\\') esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') inStr = true;
+        else if (ch === '{') { if (depth++ === 0) start = i; }
+        else if (ch === '}' && depth > 0 && --depth === 0) {
+            try { out.push(JSON.parse(body.slice(start, i + 1))); } catch { /* skip a broken one */ }
+        }
+    }
+    return out;
+}
+
 function parseJsonLenient(str) {
     if (!str) return null;
     let s = str.replace(/```[a-zA-Z]*/g, '').trim();
@@ -1680,6 +1706,9 @@ function parseJsonLenient(str) {
             // try next variant
         }
     }
+    // A reply cut off by the output limit: keep every object that did finish.
+    const whole = completeObjects(tidy);
+    if (whole.length) return whole;
     // Last resort: parse one object per line
     const ops = [];
     for (const line of s.split('\n')) {
@@ -1940,7 +1969,7 @@ function mergeCastMembers(a, b) {
     for (const q of b.quotes || []) if (!seen.has(normQuote(q.text))) { a.quotes.push(q); seen.add(normQuote(q.text)); }
     const pinned = a.quotes.filter(q => q.pinned);
     const rest = a.quotes.filter(q => !q.pinned).sort((x, y) => (x.at ?? -1) - (y.at ?? -1));
-    a.quotes = [...pinned, ...rest.slice(-Math.max(0, keep - pinned.length))];
+    a.quotes = [...pinned, ...lastN(rest, keep - pinned.length)];
     a.growth = [...(a.growth || []), ...(b.growth || [])].sort((x, y) => (x.at ?? -1) - (y.at ?? -1)).slice(-8);
 }
 
@@ -2099,7 +2128,8 @@ function ledgerText(ledger, { includeClosed = false } = {}) {
             if (e.knownBy?.length) extra.push(`known only by: ${e.knownBy.join(', ')}`);
             if (e.due) extra.push(`due: ${e.due}`);
             if (e.status === 'closed') extra.push('resolved');
-            return `- ${e.key}: ${e.value}${extra.length ? ` (${extra.join('; ')})` : ''}`;
+            const tag = e.cat === 'relation' && e.label ? ` [${e.label}]` : '';
+            return `- ${e.key}${tag}: ${e.value}${extra.length ? ` (${extra.join('; ')})` : ''}`;
         }).join('\n')}`);
     }
     return lines.join('\n\n');
@@ -2166,14 +2196,14 @@ function validCanon(memory) {
     return (memory.canon?.facts || []).filter(f => f?.text && Array.isArray(f.cites) && f.cites.some(id => ids.has(id)));
 }
 
-function parseCanon(out, validIds, max) {
+function parseCanon(out, validIds, max, normId = (x) => x) {
     const body = extractTag(out, 'facts') ?? out;
     const facts = [];
     const seen = new Set();
     for (const raw of String(body).split('\n')) {
         const m = raw.match(/^\s*(?:[-*•]|\d+[.)])?\s*\[([^\]]+)\]\s*(.+?)\s*$/);
         if (!m) continue;
-        const cites = m[1].split(/[,\s]+/).map(x => x.trim()).filter(x => validIds.has(x));
+        const cites = m[1].split(/[,\s]+/).map(x => normId(x.trim())).filter(x => validIds.has(x));
         if (!cites.length) continue; // a fact that rests on nothing would be permanent again
         let text = m[2].replace(/^[-:–—]\s*/, '').trim();
         const words = text.split(/\s+/);
@@ -2189,7 +2219,13 @@ function parseCanon(out, validIds, max) {
 
 async function pickCanon(memory, { signal = null } = {}) {
     const s = getSettings();
-    const rows = canonIndex(memory);
+    // Records are numbered R1, R2... for the model (long ids get mistyped) and mapped back.
+    let k = 0;
+    const rows = canonIndex(memory).map(r => {
+        if (r.id === 'saga') return { ...r, alias: 'saga' };
+        const alias = `R${++k}`;
+        return { ...r, alias, text: r.text.replace(`[${r.id}]`, `[${alias}]`) };
+    });
     if (rows.length < 2) return false;
     const n = Math.max(3, Math.min(20, Number(s.canonCount) || 10));
     const system = `${baseArchivistRules()}
@@ -2199,11 +2235,15 @@ Each fact is one plain sentence (at most 25 words) with concrete names, written 
 ${languageRule()}
 Output only:
 <facts>
-- [record-id, record-id] fact
-</facts>`;
+- [R3, R7] fact
+</facts>
+Use the record numbers exactly as shown in square brackets (R1, R2, ... or saga).`;
     const user = `<story_record>\n${rows.map(r => r.text).join('\n')}\n</story_record>`;
     const out = await callModel(system, user, { task: 'character', writesMemory: true, retries: 1, expectTag: 'facts', signal });
-    const facts = parseCanon(out, new Set(rows.map(r => r.id)), n);
+    // A model that copies a real id anyway is fine too.
+    const byAlias = new Map([...rows.map(r => [r.id.toLowerCase(), r.id]), ...rows.map(r => [r.alias.toLowerCase(), r.id])]);
+    const facts = parseCanon(out, new Set(byAlias.keys()), n, (x) => x.toLowerCase())
+        .map(f => ({ ...f, cites: [...new Set(f.cites.map(c => byAlias.get(c)))].filter(Boolean) }));
     if (!facts.length) throw new Error('핵심 사실을 해석하지 못했어요.');
     memory.canon = { facts, pickedAt: Date.now(), nodesAtPick: memory.timeline.length + (memory.saga?.text ? 1 : 0) };
     logActivity('compact', `핵심 사실 ${facts.length}개를 골랐어요`);
@@ -2371,6 +2411,20 @@ function buildStableMemoryText(memory) {
     ].join('\n');
 }
 
+// The newest recorded feeling of each person toward each other person, for those in the scene
+// (or the most recent few when the scene is unknown). Short: it rides along with every reply.
+function latestFeelings(memory, max = 4) {
+    if (!getSettings().changesEnabled) return '';
+    const shifts = (memory.shifts || []).filter(x => (x.kind === 'emotion' || x.kind === 'relation') && x.toward && x.after);
+    if (!shifts.length) return '';
+    const latest = new Map();
+    for (const x of [...shifts].sort((a, b) => (a.end ?? -1) - (b.end ?? -1))) latest.set(`${normName(x.who)}|${normName(x.toward)}`, x);
+    let list = [...latest.values()].sort((a, b) => (b.end ?? -1) - (a.end ?? -1));
+    const present = new Set(presentNames(memory));
+    if (present.size) list = list.filter(x => present.has(normName(x.who)) || present.has(normName(x.toward)));
+    return list.slice(0, max).map(x => `${x.who} → ${x.toward}: ${x.after}`).join('; ');
+}
+
 // The volatile part, placed near the newest messages.
 function buildNowText(memory) {
     const s = getSettings();
@@ -2396,6 +2450,8 @@ function buildNowText(memory) {
             if (samples.length) lines.push(`Voice samples (match the voice, never repeat them): ${samples.join(' | ')}`);
         }
     }
+    const feelings = latestFeelings(memory);
+    if (feelings) lines.push(`Where feelings stand now (show them through behaviour; they keep changing only as the story does): ${feelings}`);
     const threads = memory.ledger.entries.filter(e => e.cat === 'thread' && e.status !== 'closed').sort((a, b) => b.importance - a.importance).slice(0, 6).map(e => e.key);
     if (threads.length) lines.push(`Open threads: ${threads.join('; ')}`);
     const divergences = memory.ledger.entries.filter(e => e.cat === 'divergence').slice(0, 4).map(e => e.key);
@@ -2433,6 +2489,8 @@ function buildAnchorText(memory) {
         .slice(0, 6)
         .map(e => e.key);
     if (threads.length) bits.push(`Open threads: ${threads.join('; ')}`);
+    const feelings = latestFeelings(memory);
+    if (feelings) bits.push(`Feelings now: ${feelings}`);
     const divergences = memory.ledger.entries.filter(e => e.cat === 'divergence').slice(0, 4).map(e => e.key);
     if (divergences.length) bits.push(`Story overrides canon on: ${divergences.join('; ')}`);
     if (getSettings().voiceEnabled) {
@@ -5068,6 +5126,15 @@ Kang found Rin at the harbor warehouse and gave back the letter he had taken. Ri
     return parts.join('\n');
 }
 
+// Said right under the English example so it does not pull the summary into English.
+function exampleLanguageNote() {
+    const lang = fixedSummaryLanguage();
+    const what = `the summary, ledger values${getSettings().changesEnabled ? ', relation labels, changes' : ''} and events`;
+    return lang
+        ? `Write ${what} in ${lang}.`
+        : `Write ${what} in the language of the transcript, not in English (unless the transcript itself is in English).`;
+}
+
 function summarySystemPrompt() {
     const s = getSettings();
     const blocks = summaryBlocks();
@@ -5095,7 +5162,7 @@ The ledger is a structured fact sheet (shown as <current_ledger>). Operations:
 {"op":"set","cat":"<category>","key":"<entity or short label>","value":"<concise current fact>","importance":<1-5>}
   Creates or replaces the entry with this cat + key. Write the complete updated value, merging old and new information.
   Optional fields: "knownBy":["names"] for secrets and hidden facts (exactly who knows it; update it whenever someone learns the truth), "due":"<in-story deadline>" for threads with a deadline.${s.changesEnabled ? `
-  For cat "relation" also give "label": what A is to B in 2-5 words, like a caption on a TV drama relationship chart (e.g. "secret crush", "childhood rival", "contract fiancée", "sworn enemy"), written in the summary language, and "tone": one of ${Object.keys(REL_TONES).join(', ')}.` : ''}
+  For cat "relation" also give "label": what A is to B in 2-5 words, like a caption on a TV drama relationship chart (e.g. "secret crush", "childhood rival", "contract fiancée", "sworn enemy"), written in the summary language, and "tone": one of ${Object.keys(REL_TONES).join(', ')}. The current label is in [brackets] after the key in <current_ledger>: repeat it unchanged unless the relationship itself changed.` : ''}
 {"op":"close","cat":"thread","key":"<key>"}  Marks a thread or promise as resolved.
 {"op":"delete","cat":"<category>","key":"<key>"}  Removes an entry that is no longer true or relevant.
 {"op":"scene","time":"...","place":"...","present":"...","mood":"..."}  The situation at the END of this transcript.
@@ -5105,6 +5172,7 @@ ${getPrompt('ledger')}
 === EXAMPLE OF THE SHAPE ===
 Invented people, shown only for the format. Never copy its names or content.
 ${summaryExample()}
+The example is in English only to show the shape. ${exampleLanguageNote()}
 
 === COMMON MISTAKES (avoid all of them) ===
 1. Continuing the story or writing new dialogue. You only record what the transcript already shows.
@@ -5152,6 +5220,44 @@ function summaryChecklist(batch) {
 - [ ] Names are spelled exactly as in the transcript.`;
 }
 
+// Names small models use instead of the ones asked for.
+const LEDGER_CAT_ALIASES = {
+    characters: 'character', person: 'character', people: 'character', npc: 'character',
+    relations: 'relation', relationship: 'relation', relationships: 'relation',
+    threads: 'thread', plot: 'thread', goal: 'thread', goals: 'thread', promise: 'thread', promises: 'thread', quest: 'thread',
+    facts: 'fact', world: 'fact', secret: 'fact', secrets: 'fact', lore: 'fact',
+    items: 'item', object: 'item', objects: 'item',
+    divergences: 'divergence',
+};
+const LEDGER_OP_ALIASES = {
+    set: 'set', update: 'set', add: 'set', upsert: 'set', create: 'set', modify: 'set', change: 'set', new: 'set', edit: 'set',
+    close: 'close', resolve: 'close', resolved: 'close', complete: 'close', done: 'close', finish: 'close',
+    delete: 'delete', remove: 'delete', drop: 'delete',
+    scene: 'scene',
+};
+
+function ledgerCat(raw) {
+    const c = String(raw || '').toLowerCase().trim();
+    return LEDGER_CAT_ALIASES[c] || c;
+}
+
+function ledgerOpKind(op) {
+    const k = String(op.op ?? op.action ?? '').toLowerCase().trim();
+    if (LEDGER_OP_ALIASES[k]) return LEDGER_OP_ALIASES[k];
+    // {"cat":..., "key":..., "value":...} with no op at all means set.
+    if (!k && op.key && op.value) return 'set';
+    return k;
+}
+
+// "깡→린", "깡->린", "깡 - > 린" are one relation: written as "A -> B" (or "A <-> B").
+function relationKey(raw) {
+    const key = String(raw || '').replace(/\s+/g, ' ').trim();
+    const both = /\s*(?:<->|<=>|↔|⇔)\s*/;
+    if (both.test(key)) return key.split(both).map(x => x.trim()).filter(Boolean).join(' <-> ');
+    const parts = key.split(/\s*(?:-\s*->|-\s*>|=>|→|⇒|➔|➜|>>)\s*/).map(x => x.trim()).filter(Boolean);
+    return parts.length === 2 ? `${parts[0]} -> ${parts[1]}` : key;
+}
+
 // The short caption and kind of a relation entry, for the 관계·변화 chart.
 function relationTag(cat, op) {
     if (cat !== 'relation' || !op) return {};
@@ -5164,19 +5270,21 @@ function applyLedgerOps(memory, ops, atIndex) {
     if (!Array.isArray(ops)) return 0;
     let applied = 0;
     const entries = memory.ledger.entries;
-    const find = (cat, key) => entries.find(e => e.cat === cat && e.key.toLowerCase() === String(key).toLowerCase());
+    const same = (cat, a, b) => (cat === 'relation' ? relationKey(a) : String(a)).toLowerCase() === String(b).toLowerCase();
+    const find = (cat, key) => entries.find(e => e.cat === cat && same(cat, e.key, key));
     for (const op of ops) {
         if (!op || typeof op !== 'object') continue;
-        const kind = String(op.op || '').toLowerCase();
+        const kind = ledgerOpKind(op);
         if (kind === 'scene') {
             for (const field of ['time', 'place', 'present', 'mood']) {
-                if (typeof op[field] === 'string' && op[field].trim()) memory.ledger.scene[field] = op[field].trim();
+                const v = Array.isArray(op[field]) ? op[field].map(String).join(', ') : op[field];
+                if (typeof v === 'string' && v.trim()) memory.ledger.scene[field] = v.trim();
             }
             applied++;
             continue;
         }
-        const cat = String(op.cat || '').toLowerCase();
-        const key = String(op.key || '').trim();
+        const cat = ledgerCat(op.cat ?? op.category);
+        const key = cat === 'relation' ? relationKey(op.key) : String(op.key || '').trim();
         if (!CATEGORIES[cat] || cat === 'note' || !key) continue;
         const existing = find(cat, key);
         const knownBy = Array.isArray(op.knownBy) ? toList(op.knownBy) : null;
@@ -5231,14 +5339,17 @@ function applyLedgerOps(memory, ops, atIndex) {
 // (before/after of the touched entries and the scene) and is tagged on the message
 // (extra.lm_turn). When the tagged reply is no longer in the chat, the change is rolled back,
 // newest first, but only where nothing later changed the same entry again.
-const ledgerKey = (cat, key) => `${String(cat).toLowerCase()}|${String(key).trim().toLowerCase()}`;
+const ledgerKey = (cat, key) => {
+    const c = ledgerCat(cat);
+    return `${c}|${(c === 'relation' ? relationKey(key) : String(key).trim()).toLowerCase()}`;
+};
 
 function ledgerSnapshot(memory, ops) {
     const entries = {};
     for (const op of ops || []) {
-        const kind = String(op?.op || '').toLowerCase();
-        if (kind === 'scene' || !op?.cat || !op?.key) continue;
-        const k = ledgerKey(op.cat, op.key);
+        const kind = op && typeof op === 'object' ? ledgerOpKind(op) : '';
+        if (kind === 'scene' || !(op?.cat ?? op?.category) || !op?.key) continue;
+        const k = ledgerKey(op.cat ?? op.category, op.key);
         if (k in entries) continue;
         const e = memory.ledger.entries.find(x => ledgerKey(x.cat, x.key) === k);
         entries[k] = e ? structuredClone(e) : null;
@@ -5524,6 +5635,11 @@ async function summarizeBatchOnce(memory, batch) {
         voices = parseJsonLenient(extractTag(out, 'voices') || '');
         hooks = getSettings().hooksEnabled ? parseJsonLenient(extractTag(out, 'hooks') || '') : null;
         changes = parseChanges(extractTag(out, 'changes'));
+        const blocks = summaryBlocks();
+        const last = blocks.filter(b => new RegExp(`<${b}>`, 'i').test(out)).pop();
+        if (node && last && !new RegExp(`</${last}>`, 'i').test(out)) {
+            logActivity('compress', `#${batch.from}~#${batch.to} 요약 답이 중간에 잘렸어요. 완성된 부분만 저장했어요. 자주 그러면 설정 → 고급의 '최대 출력 토큰'을 늘려 주세요.`, 'warn');
+        }
     }
     if (!node) throw new Error('요약 응답을 해석하지 못했습니다.');
     // The status bars written in the messages give the exact in-story time.
@@ -7253,10 +7369,16 @@ function compactSystemPrompt(task) {
 ${task}${extraRules()}`;
 }
 
+// The last n items; none for 0 (slice(-0) would be all of them, so "protect 0" protected everything).
+function lastN(list, n) {
+    n = Number(n) || 0;
+    return n > 0 ? list.slice(-n) : [];
+}
+
 async function stepCondense(memory, { allowImportant = false, allowAll = false, allowRecent = false } = {}) {
     const s = getSettings();
     const episodes = memory.timeline.filter(n => n.tier === 'episode');
-    const protectedIds = new Set(episodes.slice(-(allowRecent ? 1 : s.protectRecent)).map(n => n.id));
+    const protectedIds = new Set(lastN(episodes, allowRecent ? 1 : s.protectRecent).map(n => n.id));
     // Models rate most scenes 4, so when nothing else is left, importance 4 notes get one light pass too.
     const fits = (n) => (n.importance <= 3 && (n.condensed || 0) < 2)
         || (allowImportant && n.importance === 4 && !(n.condensed || 0))
@@ -7269,16 +7391,19 @@ async function stepCondense(memory, { allowImportant = false, allowAll = false, 
     if (!candidates.length) return false;
     const task = `${getPrompt('condense')}
 
-Reply with one block per note, using the same id, and nothing else:
-<note id="ID">condensed text</note>`;
+Reply with one block per note, using the same id (N1, N2, ...), and nothing else:
+<note id="N1">condensed text</note>`;
+    // Short ids (N1, N2...): small models mistype long ones, and a miss used to mark the notes
+    // as "will not shorten" for good.
     const user = candidates
-        .map(n => `<note id="${n.id}" importance="${n.importance}" messages="#${n.from}-#${n.to}">\n${n.text}\n</note>`)
+        .map((n, i) => `<note id="N${i + 1}" importance="${n.importance}" messages="#${n.from}-#${n.to}">\n${n.text}\n</note>`)
         .join('\n\n');
     const out = await callModel(compactSystemPrompt(task), user, { task: 'tidy', writesMemory: true, expectTag: 'note' });
     const results = extractAllTags(out, 'note');
     let changed = 0;
     for (const { id, text } of results) {
-        const node = memory.timeline.find(n => n.id === id);
+        const k = String(id || '').match(/^N?(\d+)$/i);
+        const node = k ? candidates[Number(k[1]) - 1] : memory.timeline.find(n => n.id === id);
         if (!node || !text || text.length >= node.text.length) continue;
         if (!node.condensed) archiveNode(memory, node, 'timeline', node.id);
         node.text = text;
@@ -7296,7 +7421,7 @@ async function stepChapter(memory, force) {
     const s = getSettings();
     const episodes = memory.timeline.filter(n => n.tier === 'episode');
     if (!force && episodes.length <= s.maxEpisodes) return false;
-    const protectedIds = new Set(episodes.slice(-s.protectRecent).map(n => n.id));
+    const protectedIds = new Set(lastN(episodes, s.protectRecent).map(n => n.id));
     let run = [];
     for (const node of memory.timeline) {
         const usable = node.tier === 'episode' && !node.pinned && !protectedIds.has(node.id);
@@ -7330,6 +7455,7 @@ summary:
     const runIds = run.map(n => n.id);
     retagOwners(runIds, chapterId);
     for (const e of memory.events) if (runIds.includes(e.episodeId)) e.episodeId = chapterId;
+    for (const x of memory.shifts || []) if (runIds.includes(x.episodeId)) x.episodeId = chapterId;
     for (const a of memory.archive) if (runIds.includes(a.ownerId)) a.ownerId = chapterId;
     const chapter = {
         id: chapterId,
@@ -7345,6 +7471,8 @@ summary:
         keywords: [...new Set([...parsed.keywords, ...run.flatMap(n => n.keywords || [])])].slice(0, 24),
         pinned: false,
         condensed: 0,
+        // Already looked through for relation/emotion changes when every part was.
+        ...(run.every(n => n.shiftScan) ? { shiftScan: true } : {}),
     };
     const firstIdx = memory.timeline.indexOf(run[0]);
     memory.timeline.splice(firstIdx, run.length, chapter);
@@ -7360,7 +7488,7 @@ async function stepSaga(memory, force) {
     // must not block folding: take the oldest chapters and unprotected episodes, and step over
     // pinned ones (they stay in the timeline).
     const episodes = memory.timeline.filter(n => n.tier === 'episode');
-    const protectedIds = new Set(episodes.slice(-s.protectRecent).map(n => n.id));
+    const protectedIds = new Set(lastN(episodes, s.protectRecent).map(n => n.id));
     for (const node of memory.timeline) {
         if (run.length >= 3) break;
         // ★ episodes stay in the timeline like pinned ones (a chapter holding one is still folded).
@@ -7379,14 +7507,29 @@ Reply with exactly this block and nothing else:
         `<story_so_far>\n${memory.saga.text.trim() || '(empty)'}\n</story_so_far>`,
         ...run.map(n => `<chapter messages="#${n.from}-#${n.to}" title="${esc(n.title)}">\n${n.text}\n</chapter>`),
     ].join('\n\n');
-    const out = await callModel(compactSystemPrompt(task), user, { task: 'tidy', writesMemory: true, expectTag: 'saga' });
-    const saga = extractTag(out, 'saga');
+    const oldSaga = memory.saga.text.trim();
+    let saga = extractTag(await callModel(compactSystemPrompt(task), user, { task: 'tidy', writesMemory: true, expectTag: 'saga' }), 'saga');
     if (!saga) throw new Error('전체 줄거리 갱신 응답을 해석하지 못했습니다.');
+    // Small models sometimes return only the new chapters and drop the old story. The result
+    // folds in more than the old text, so far shorter than it means content was lost: ask once
+    // more, then keep everything as it was rather than lose the start of the story.
+    const tooShort = (text) => oldSaga.length > 400 && text.length < oldSaga.length * 0.45;
+    if (tooShort(saga)) {
+        const strict = `${task}
+
+IMPORTANT: your result must keep everything in <story_so_far> (compressed if needed) and then add the chapters. Do not drop the earlier story.`;
+        const again = extractTag(await callModel(compactSystemPrompt(strict), user, { task: 'tidy', writesMemory: true, expectTag: 'saga' }).catch(() => ''), 'saga');
+        if (again && !tooShort(again)) saga = again;
+        else throw new Error('새 줄거리가 이전 줄거리를 많이 빠뜨려서 바꾸지 않았어요.');
+    }
     const runIds = run.map(n => n.id);
     for (const n of run) archiveNode(memory, n, 'timeline', SAGA_OWNER);
     retagOwners(runIds, SAGA_OWNER);
     for (const e of memory.events) if (runIds.includes(e.episodeId)) e.episodeId = SAGA_OWNER;
+    for (const x of memory.shifts || []) if (runIds.includes(x.episodeId)) x.episodeId = SAGA_OWNER;
     for (const a of memory.archive) if (runIds.includes(a.ownerId)) a.ownerId = SAGA_OWNER;
+    // The version being replaced stays findable by recall, like the chapters folded into it.
+    if (oldSaga) archiveNode(memory, { id: newId(), title: 'Story so far, earlier version', text: oldSaga, keywords: [], importance: 4, from: -1, to: memory.saga.coversTo ?? -1 }, 'timeline', SAGA_OWNER);
     memory.saga = { text: saga, coversTo: run[run.length - 1].to };
     memory.timeline = memory.timeline.filter(n => !runIds.includes(n.id));
     return true;
@@ -11232,7 +11375,7 @@ function hooksFormat() {
 
 Foreshadowing operations (open setups are listed in <open_hooks>):
 {"op":"add","kind":"hint|mystery|promise|object|secret","text":"<the setup in one or two self-contained sentences, naming the characters>","keywords":["..."],"importance":<1-5>}
-{"op":"resolve","id":"<id from <open_hooks>>","how":"<how it was paid off or explained>"}
+{"op":"resolve","id":"<the number from <open_hooks>, like H2>","how":"<how it was paid off or explained>"}
 ${getPrompt('hooks')}
 `;
 }
@@ -11241,16 +11384,27 @@ function openHooks(memory) {
     return (memory?.hooks || []).filter(h => h.status !== 'resolved');
 }
 
+// The open hooks shown to the summary model, numbered H1, H2... Small models mistype long ids,
+// so the model answers with these short numbers and applyHookOps maps them back.
+function shownHooks(memory, limit = 30) {
+    return openHooks(memory).slice(-limit);
+}
+
 function openHooksText(memory, limit = 30) {
-    return openHooks(memory)
-        .slice(-limit)
-        .map(h => `[${h.id}] (${h.kind || 'hint'}, ${h.from >= 0 ? `set up at #${h.from}` : 'set up earlier'}) ${h.text}`)
+    return shownHooks(memory, limit)
+        .map((h, i) => `[H${i + 1}] (${h.kind || 'hint'}, ${h.from >= 0 ? `set up at #${h.from}` : 'set up earlier'}) ${h.text}`)
         .join('\n');
 }
 
 function applyHookOps(memory, ops, batch) {
     if (!Array.isArray(ops)) return 0;
     memory.hooks = memory.hooks || [];
+    const shown = shownHooks(memory);
+    const hookById = (raw) => {
+        const id = String(raw || '').trim().replace(/^\[|\]$/g, '');
+        const k = id.match(/^H(\d+)$/i);
+        return k ? shown[Number(k[1]) - 1] : memory.hooks.find(x => x.id === id);
+    };
     let n = 0;
     for (const op of ops) {
         if (!op || typeof op !== 'object') continue;
@@ -11271,7 +11425,7 @@ function applyHookOps(memory, ops, batch) {
             });
             n++;
         } else if (kind === 'resolve') {
-            const h = memory.hooks.find(x => x.id === String(op.id || '').trim());
+            const h = hookById(op.id);
             if (!h || h.status === 'resolved') continue;
             h.status = 'resolved';
             h.how = String(op.how || '').trim().slice(0, 300);

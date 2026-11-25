@@ -16,9 +16,17 @@ const { load } = require('./harness');
     assert.strictEqual(parsed.length, 2, 'uncited and duplicate facts are refused');
     assert.strictEqual(JSON.stringify(parsed[0].cites), JSON.stringify(['n0', 'n2']));
 
-    h.state.reply = '<facts>\n- [n1] Rin owes the guild 300 gold.\n- [n2] Kai is Rin\'s half-brother.\n- [n3] They swore to meet at dawn.\n- [n0] Extra one.\n</facts>';
+    // The model sees short record numbers (R1 = n0 ...) and may answer with them or the real ids.
+    h.state.reply = (args) => {
+        assert.ok(JSON.stringify(args).includes('[R2]'), 'records are numbered for the model');
+        return '<facts>\n- [R2] Rin owes the guild 300 gold.\n- [r3, n3] Kai is Rin\'s half-brother.\n- [n3] They swore to meet at dawn.\n- [R1] Extra one.\n</facts>';
+    };
     await T.pickCanon(m);
     assert.strictEqual(m.canon.facts.length, 3, 'exactly N kept');
+    assert.strictEqual(m.canon.facts[0].cites[0], 'n1', 'R2 maps back to its record');
+    assert.strictEqual(JSON.stringify(m.canon.facts[1].cites), JSON.stringify(['n2', 'n3']), 'mixed short and real ids');
+    h.state.reply = '<facts>\n- [n1] Rin owes the guild 300 gold.\n- [n2] Kai is Rin\'s half-brother.\n- [n3] They swore to meet at dawn.\n</facts>';
+    await T.pickCanon(m);
     T.refreshInjection();
     const main = h.prompts[T.PROMPT_KEY_MAIN];
     assert.ok(main.includes('[Established facts the story rests on]') && main.indexOf('Established facts') < main.indexOf('[Timeline'), 'facts sit above the timeline');
