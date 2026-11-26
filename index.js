@@ -5671,7 +5671,7 @@ async function summarizeBatchOnce(memory, batch) {
         const blocks = summaryBlocks();
         const last = blocks.filter(b => new RegExp(`<${b}>`, 'i').test(out)).pop();
         if (node && last && !new RegExp(`</${last}>`, 'i').test(out)) {
-            logActivity('compress', `#${batch.from}~#${batch.to} 요약 답이 중간에 잘렸어요. 완성된 부분만 저장했어요. 자주 그러면 설정 → 고급의 '최대 출력 토큰'을 늘려 주세요.`, 'warn');
+            logActivity('compress', `#${batch.from}~#${batch.to} 요약 답이 중간에 잘렸어요. 완성된 부분만 저장했어요. 자주 그러면 설정 → 고급 설정의 '응답 최대 토큰'을 늘려 주세요.`, 'warn');
         }
     }
     if (!node) throw new Error('요약 응답을 해석하지 못했습니다.');
